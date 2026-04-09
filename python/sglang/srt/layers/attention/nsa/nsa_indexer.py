@@ -1249,6 +1249,144 @@ class Indexer(MultiPlatformOp):
             )
         return topk_result
 
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        return_indices: bool = True,
+    ) -> Optional[torch.Tensor]:
+        """torch.compile-friendly prefill-only forward for the NSA indexer.
+
+        Flattened single-stream path using native PyTorch ops where possible.
+        Operations that rely on hand-written kernels are called as-is and
+        marked with "# [custom kernel]" — register them via
+        torch.library.custom_op for full torch.compile tracing.
+
+        Compared to forward_cuda this method:
+        * is prefill-only (extend mode) — no decode / speculative paths,
+        * drops multi-stream / dual-stream overlap (not compile-safe),
+        * drops the context-parallelism (CP) prefill path,
+        * replaces the DeepGEMM bf16 GEMM in weights_proj with the plain
+          nn.Linear forward,
+        * avoids the .data_ptr() alias check in _update_rope_guarded
+          (graph break) and does an unconditional slice-assign instead.
+        """
+        from sglang.srt.layers.attention.nsa.triton_kernel import (
+            act_quant,  # [custom kernel]
+        )
+
+        if TYPE_CHECKING:
+            assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
+
+        x_meta = x[0] if isinstance(x, tuple) else x
+
+        metadata = forward_batch.attn_backend.get_indexer_metadata(
+            layer_id, forward_batch
+        )
+        if metadata is None:
+            return None
+
+        # --- fast path: skip logits when all seqs are short enough ---
+        # NOTE: .item() on a CPU tensor is a graph break for torch.compile;
+        # guard this block with torch.compiler.is_compiling() if needed.
+        if forward_batch.seq_lens_cpu is not None:
+            max_kv_len = forward_batch.seq_lens_cpu.max().item()
+            if max_kv_len <= self.index_topk:
+                return self._forward_cuda_k_only(
+                    x,
+                    positions,
+                    forward_batch,
+                    layer_id,
+                    act_quant,
+                    False,
+                    metadata,
+                    return_indices,
+                )
+
+        # ---- Phase 1: Q / K projection + RoPE + Hadamard ----
+
+        # Q low-rank up-projection (native nn.Linear)
+        query, _ = self.wq_b(q_lora)
+        query = query.view(-1, self.n_heads, self.head_dim)
+        q_rope, _ = query.split(
+            [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+        )
+
+        # K projection + norm (native nn.Linear + LayerNorm)
+        key, _ = self.wk(x)
+        key = self.k_norm(key)
+        k_rope, _ = key.split(
+            [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+        )
+
+        # RoPE (dispatches through its own MultiPlatformOp)
+        q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
+        # Unconditional write-back (avoids data_ptr graph break)
+        query[..., : self.rope_head_dim] = q_rope
+        key[..., : self.rope_head_dim] = k_rope
+
+        # Hadamard rotation  [custom kernel]
+        query = rotate_activation(query)
+        key = rotate_activation(key)
+
+        # ---- Phase 2: FP8 quantise Q  +  store K cache ----
+
+        q_fp8, q_scale = act_quant(
+            query, self.block_size, self.scale_fmt
+        )  # [custom kernel]
+
+        self._store_index_k_cache(  # [custom kernel]
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            key=key,
+            act_quant=act_quant,
+        )
+
+        # ---- Phase 3: head-gate weights (native) ----
+        # Dequantise hidden states when upstream fused FP8 RMSNorm+quant
+        # passes x as (x_fp8, x_scale[, y]).
+        if isinstance(x, tuple):
+            x_q, x_s = x[0], x[1]
+            if (
+                x_s is not None
+                and x_q.dim() == 2
+                and x_s.dim() == 2
+                and x_q.shape[0] == x_s.shape[0]
+            ):
+                m, n = x_q.shape
+                ng = x_s.shape[1]
+                if ng > 0 and n % ng == 0:
+                    group = n // ng
+                    x_for_gate = (
+                        x_q.to(torch.float32)
+                        .view(m, ng, group)
+                        .mul_(x_s.to(torch.float32).unsqueeze(-1))
+                        .view(m, n)
+                        .to(torch.bfloat16)
+                    )
+                else:
+                    x_for_gate = x_q.to(torch.bfloat16)
+            else:
+                x_for_gate = x_q.to(torch.bfloat16)
+        else:
+            x_for_gate = x
+
+        # Plain nn.Linear weights_proj (avoids DeepGEMM gemm_nt_bf16bf16f32).
+        weights, _ = self.weights_proj(x_for_gate)
+        weights = weights.float()
+        weights = weights * self.n_heads**-0.5
+        weights = weights.unsqueeze(-1) * q_scale * self.softmax_scale
+
+        # ---- Phase 4: ragged top-k block selection (prefill path) ----
+        topk_result = self._get_topk_ragged(
+            False, forward_batch, layer_id, q_fp8, weights, metadata
+        )
+
+        return topk_result
+
     def forward_npu(
         self,
         x: torch.Tensor,
