@@ -20,6 +20,7 @@ from sglang.jit_kernel.utils import (
     make_cpp_args,
 )
 from sglang.kernel_api_logging import debug_kernel_api
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -103,3 +104,14 @@ def fused_store_index_k_cache(
 
     module = _jit_nsa_fused_store_module(key.dtype, out_cache_loc.dtype, page_size)
     module.fused_store_index_k_cache(key, index_k_with_scale, out_cache_loc)
+
+
+@register_custom_op(mutates_args=["index_k_with_scale"])
+def fused_store_index_k_cache_op(
+    key: torch.Tensor,
+    index_k_with_scale: torch.Tensor,
+    out_cache_loc: torch.Tensor,
+    page_size: int = 64,
+) -> None:
+    """torch.compile-opaque wrapper around the JIT fused store kernel."""
+    fused_store_index_k_cache(key, index_k_with_scale, out_cache_loc, page_size)

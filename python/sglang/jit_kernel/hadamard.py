@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable
 import torch
 
 from sglang.jit_kernel.utils import KERNEL_PATH, cache_once, load_jit, make_cpp_args
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -79,3 +80,9 @@ def hadamard_transform_28n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
 def hadamard_transform_40n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     module = _jit_hadamard_module(x.dtype)
     return _hadamard_transform_impl(x, scale, 4 * 40, module.hadamard_transform_40n)
+
+
+@register_custom_op(out_shape=0)
+def hadamard_transform_op(x: torch.Tensor, scale: float) -> torch.Tensor:
+    """torch.compile-opaque wrapper around the JIT hadamard kernel."""
+    return hadamard_transform(x, scale)

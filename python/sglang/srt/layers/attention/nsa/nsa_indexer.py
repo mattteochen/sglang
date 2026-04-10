@@ -748,6 +748,178 @@ class Indexer(MultiPlatformOp):
         )
         return metadata.topk_transform(dummy_logits, self.index_topk)
 
+    # ------------------------------------------------------------------ #
+    #  torch.compile-friendly ("native") variants of the k-only path     #
+    # ------------------------------------------------------------------ #
+
+    def _get_k_bf16_native(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        """K projection using forward_native for norm / RoPE and a custom op
+        for the Hadamard transform.  Avoids graph-breaking .data_ptr() check
+        in _update_rope_guarded by doing an unconditional slice-assign."""
+        from sglang.jit_kernel.hadamard import hadamard_transform_op
+
+        key, _ = self.wk(x)
+        key = self.k_norm.forward_native(key)
+        k_rope, _ = key.split(
+            [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+        )
+        _, k_rope = self.rotary_emb.forward_native(positions, k_rope, k_rope)
+        key[..., : self.rope_head_dim] = k_rope
+        key = hadamard_transform_op(key, key.size(-1) ** -0.5)
+        return key
+
+    @staticmethod
+    def _act_quant_native(
+        x: torch.Tensor, block_size: int = 128, scale_fmt: Optional[str] = None
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """Per-token-group FP8 quantisation in pure torch.
+
+        Equivalent to triton_kernel.act_quant but fully traceable by
+        torch.compile (elementwise + amax reduction → auto-fused Triton).
+        """
+        FP8_MAX = 448.0
+        shape = x.shape
+        x_groups = x.view(-1, block_size).float()
+        # No keepdim — avoids stride (1, N) that breaks view.dtype in inductor
+        amax = x_groups.abs().amax(dim=-1).clamp(min=1e-4)
+        if scale_fmt is not None:
+            scale = torch.exp2(torch.ceil(torch.log2(amax / FP8_MAX)))
+        else:
+            scale = amax / FP8_MAX
+        y = (x_groups / scale.unsqueeze(-1)).clamp(-FP8_MAX, FP8_MAX)
+        y = y.to(torch.float8_e4m3fn).view(shape)
+        scale = scale.view(*shape[:-1], shape[-1] // block_size)
+        return y, scale
+
+    def _store_index_k_cache_native(
+        self,
+        key: torch.Tensor,
+        buf: torch.Tensor,
+        loc: torch.Tensor,
+        page_size: int,
+    ) -> None:
+        """Store indexer K cache via fused_store_index_k_cache custom op.
+
+        Single kernel: bf16 key → FP8 quantise + paged scatter (K + scale).
+        Registered as torch.ops.sglang.fused_store_index_k_cache so
+        torch.compile sees it as an opaque in-place mutation on the buffer.
+
+        The caller must hoist the buffer lookup (get_index_k_with_scale_buffer)
+        outside the torch.compile boundary so that all layers share the same
+        compiled graph.
+        """
+        from sglang.jit_kernel.fused_store_index_cache import (
+            fused_store_index_k_cache_op,
+        )
+
+        fused_store_index_k_cache_op(key, buf, loc, page_size)
+
+    def _topk_dummy_native(
+        self,
+        metadata: BaseIndexerMetadata,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Generate dummy topk indices in pure torch when all seqs <= index_topk.
+
+        Replicates the three topk_transform variants (UNFUSED / PAGED / RAGGED)
+        without calling any sgl_kernel function.
+        """
+        seq_lens = metadata.get_seqlens_expanded()
+        num_tokens = seq_lens.shape[0]
+        topk = self.index_topk
+
+        col_idx = torch.arange(topk, dtype=torch.int32, device=device)
+        valid = col_idx.unsqueeze(0) < seq_lens.unsqueeze(1)
+        neg_one = torch.tensor(-1, dtype=torch.int32, device=device)
+        base_indices = torch.where(
+            valid, col_idx.unsqueeze(0).expand(num_tokens, -1), neg_one
+        )
+
+        fuse_topk = envs.SGLANG_NSA_FUSE_TOPK.get()
+        force_unfused = getattr(metadata, "force_unfused_topk", False)
+        if not fuse_topk or force_unfused:
+            return base_indices
+
+        topk_method = getattr(metadata, "topk_transform_method", None)
+        if topk_method is None:
+            return base_indices
+
+        from sglang.srt.layers.attention.nsa_backend import TopkTransformMethod
+
+        if topk_method == TopkTransformMethod.PAGED:
+            page_table_1 = metadata.get_page_table_1()
+            batch_idx = metadata.get_token_to_batch_idx()
+            safe_idx = base_indices.clamp(min=0).long()
+            batch_idx_2d = batch_idx.unsqueeze(1).expand_as(safe_idx)
+            mapped = page_table_1[batch_idx_2d, safe_idx]
+            return torch.where(valid, mapped.to(torch.int32), neg_one)
+
+        if topk_method == TopkTransformMethod.RAGGED:
+            attn_meta = getattr(metadata, "attn_metadata", None)
+            if attn_meta is not None:
+                offset = attn_meta.topk_indices_offset
+                if offset.ndim == 1:
+                    offset = offset.unsqueeze(1)
+                return torch.where(
+                    valid,
+                    base_indices + offset.to(base_indices.dtype),
+                    neg_one,
+                )
+
+        return base_indices
+
+    @torch.compile(
+        dynamic=True,
+        options={
+            "triton.enable_pdl": True,
+            "combo_kernels": True,
+            "cpp_wrapper": True,
+            "trace.enabled": True,
+        },
+    )
+    def _forward_native_k_only(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        index_k_buf: torch.Tensor,
+        out_cache_loc: torch.Tensor,
+        page_size: int,
+        metadata: BaseIndexerMetadata,
+        return_indices: bool = True,
+    ) -> Optional[torch.Tensor]:
+        """torch.compile-friendly fast path when all seqs <= index_topk.
+
+        Compared to _forward_cuda_k_only this method:
+        * uses forward_native for LayerNorm and RoPE,
+        * calls hadamard_transform via its registered custom op,
+        * decomposes the fused K-cache store into act_quant + torch scatter,
+        * generates dummy topk indices in pure torch (no sgl_kernel call),
+        * avoids the .data_ptr() graph break in _update_rope_guarded.
+
+        The KV buffer (index_k_buf) and out_cache_loc are passed in as
+        arguments so that all layers share a single compiled graph — the
+        buffer lookup is hoisted outside the torch.compile boundary.
+        """
+        x_meta = x[0] if isinstance(x, tuple) else x
+
+        key = self._get_k_bf16_native(x, positions)
+
+        self._store_index_k_cache_native(
+            key=key,
+            buf=index_k_buf,
+            loc=out_cache_loc,
+            page_size=page_size,
+        )
+
+        if not return_indices:
+            return None
+
+        return self._topk_dummy_native(metadata, x_meta.device)
+
     def _get_topk_ragged_with_cp(
         self,
         forward_batch: ForwardBatch,
@@ -1041,6 +1213,14 @@ class Indexer(MultiPlatformOp):
         layer_id: int,
         return_indices: bool = True,
     ) -> Optional[torch.Tensor]:
+        if (
+            envs.SGLANG_TORCH_COMPILE_INDEXER.get()
+            and forward_batch.forward_mode.is_extend()
+        ):
+            return self.forward_native(
+                x, q_lora, positions, forward_batch, layer_id, return_indices
+            )
+
         if _is_hip:
             from sglang.srt.layers.attention.nsa.tilelang_kernel import act_quant
         elif not _is_npu:
@@ -1295,13 +1475,22 @@ class Indexer(MultiPlatformOp):
         if forward_batch.seq_lens_cpu is not None:
             max_kv_len = forward_batch.seq_lens_cpu.max().item()
             if max_kv_len <= self.index_topk:
-                return self._forward_cuda_k_only(
+                # Hoist buffer lookup outside torch.compile so all layers
+                # share the same compiled graph (same symbolic shapes).
+                index_k_buf = (
+                    forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                        layer_id=layer_id
+                    )
+                )
+                out_cache_loc = forward_batch.out_cache_loc
+                if not out_cache_loc.is_contiguous():
+                    out_cache_loc = out_cache_loc.contiguous()
+                return self._forward_native_k_only(
                     x,
                     positions,
-                    forward_batch,
-                    layer_id,
-                    act_quant,
-                    False,
+                    index_k_buf,
+                    out_cache_loc,
+                    forward_batch.token_to_kv_pool.page_size,
                     metadata,
                     return_indices,
                 )

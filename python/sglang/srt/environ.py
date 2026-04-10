@@ -361,6 +361,7 @@ class Envs:
 
     # Torch Compile
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
+    SGLANG_TORCH_COMPILE_INDEXER = EnvBool(False)
 
     # EPLB
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT = EnvBool(False)
