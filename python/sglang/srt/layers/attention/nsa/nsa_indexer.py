@@ -154,6 +154,38 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
+def quantize_index_k_fp8(
+    key: torch.Tensor,
+    block_size: int = 128,
+) -> Tuple[torch.Tensor, torch.Tensor]:
+    """Per-row FP8 E4M3 quantisation matching the JIT fused_store_index_k_cache formula.
+
+    Intended to be paired with the existing paged scatter
+    (``set_index_k_scale_buffer`` / ``SetKAndS``) so that torch.compile
+    can attempt to fuse the two.
+
+    Args:
+        key: (N, head_dim) bf16 — head_dim must be divisible by *block_size*.
+        block_size: quantisation group width (default 128, one group per row).
+
+    Returns:
+        key_fp8:  (N, head_dim) float8_e4m3fn
+        scale:    (N, head_dim // block_size) float32
+    """
+    FP8_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
+    shape = key.shape
+    key_f32 = key.view(-1, block_size).float()
+
+    abs_max = key_f32.abs().amax(dim=-1).clamp(min=1e-4)
+    scale = abs_max / FP8_MAX
+    inv_scale = 1.0 / scale
+
+    key_fp8 = (key_f32 * inv_scale.unsqueeze(-1)).clamp(-FP8_MAX, FP8_MAX)
+    key_fp8 = key_fp8.to(torch.float8_e4m3fn).view(shape)
+    scale = scale.view(*shape[:-1], shape[-1] // block_size)
+    return key_fp8, scale
+
+
 class Indexer(MultiPlatformOp):
     def __init__(
         self,
@@ -771,29 +803,6 @@ class Indexer(MultiPlatformOp):
         key[..., : self.rope_head_dim] = k_rope
         key = hadamard_transform_op(key, key.size(-1) ** -0.5)
         return key
-
-    @staticmethod
-    def _act_quant_native(
-        x: torch.Tensor, block_size: int = 128, scale_fmt: Optional[str] = None
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """Per-token-group FP8 quantisation in pure torch.
-
-        Equivalent to triton_kernel.act_quant but fully traceable by
-        torch.compile (elementwise + amax reduction → auto-fused Triton).
-        """
-        FP8_MAX = 448.0
-        shape = x.shape
-        x_groups = x.view(-1, block_size).float()
-        # No keepdim — avoids stride (1, N) that breaks view.dtype in inductor
-        amax = x_groups.abs().amax(dim=-1).clamp(min=1e-4)
-        if scale_fmt is not None:
-            scale = torch.exp2(torch.ceil(torch.log2(amax / FP8_MAX)))
-        else:
-            scale = amax / FP8_MAX
-        y = (x_groups / scale.unsqueeze(-1)).clamp(-FP8_MAX, FP8_MAX)
-        y = y.to(torch.float8_e4m3fn).view(shape)
-        scale = scale.view(*shape[:-1], shape[-1] // block_size)
-        return y, scale
 
     def _store_index_k_cache_native(
         self,
