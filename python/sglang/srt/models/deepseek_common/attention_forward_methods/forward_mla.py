@@ -217,7 +217,9 @@ if _is_cuda:
         base_indices = col_idx.unsqueeze(0).expand(num_tokens_topk, -1)
 
         if topk_method == 1:  # PAGED
-            safe_idx = base_indices.clamp(min=0).long()
+            safe_idx = base_indices.clamp(
+                min=0, max=topk_page_table_1.shape[1] - 1
+            ).long()
             batch_idx_2d = topk_token_to_batch_idx.unsqueeze(1).expand_as(safe_idx)
             mapped = topk_page_table_1[batch_idx_2d, safe_idx]
             topk_indices = torch.where(valid, mapped.to(torch.int32), neg_one)
