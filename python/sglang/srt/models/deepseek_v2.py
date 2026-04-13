@@ -1554,6 +1554,22 @@ class DeepseekV2AttentionMLA(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
         assert self.q_lora_rank is not None
+        # Eagerly dequantize FP8 weights to BF16 on first extend call when
+        # the wide-compile indexer path is active.  This MUST happen before
+        # the _fused_qkv_weight_bf16 check below so that the very first
+        # invocation (warmup) takes the same BF16-matmul path as subsequent
+        # invocations, avoiding a torch.compile guard failure + expensive
+        # recompilation during the timed benchmark / real serving prefill.
+        if (
+            not hasattr(self, "_fused_qkv_weight_bf16")
+            and not isinstance(hidden_states, tuple)
+            and forward_batch.forward_mode.is_extend()
+            and getattr(self, "use_nsa", False)
+            and envs.SGLANG_TORCH_COMPILE_INDEXER.get()
+            and hasattr(self, "fused_qkv_a_proj_with_mqa")
+            and self.fused_qkv_a_proj_with_mqa.weight.dtype == torch.float8_e4m3fn
+        ):
+            self._ensure_all_weights_bf16()
         # BF16 fast-path for the wide-compile indexer path: use the
         # pre-dequanted weight to avoid FP8 quant + DeepGEMM overhead.
         if hasattr(self, "_fused_qkv_weight_bf16") and not isinstance(
