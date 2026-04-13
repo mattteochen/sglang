@@ -125,6 +125,11 @@ if _is_cuda:
         page_size: int,
         # Indexer topk args (pre-computed outside compile boundary)
         seq_lens_expanded: torch.Tensor,
+        # Topk transform args (hoisted from metadata)
+        topk_method: int,  # 0=none, 1=PAGED, 2=RAGGED
+        topk_page_table_1: Optional[torch.Tensor],
+        topk_token_to_batch_idx: Optional[torch.Tensor],
+        topk_indices_offset: Optional[torch.Tensor],
         # Shape constants
         q_lora_rank: int,
         kv_lora_rank: int,
@@ -142,7 +147,8 @@ if _is_cuda:
         Replaces all FP8 GEMMs with BF16 matmuls, custom-op norms with
         native torch norms, and custom-op RoPE with native torch RoPE.
         The Hadamard transform and K-cache store remain as custom ops
-        (opaque leaves in the compiled graph).
+        (opaque leaves in the compiled graph).  The topk transform
+        (PAGED/RAGGED) is also inlined.
         """
         # 1. Split qkv latent
         q, latent_cache = qkv_latent.split(
@@ -203,14 +209,29 @@ if _is_cuda:
         # 5e. Store K cache (custom op)
         fused_store_index_k_cache_op(key, index_k_buf, out_cache_loc, page_size)
 
-        # 5f. Dummy topk (pure torch)
+        # 5f. Dummy topk + transform (pure torch, fused)
         num_tokens_topk = seq_lens_expanded.shape[0]
         col_idx = torch.arange(index_topk, dtype=torch.int32, device=key.device)
         valid = col_idx.unsqueeze(0) < seq_lens_expanded.unsqueeze(1)
         neg_one = torch.tensor(-1, dtype=torch.int32, device=key.device)
-        topk_indices = torch.where(
-            valid, col_idx.unsqueeze(0).expand(num_tokens_topk, -1), neg_one
-        )
+        base_indices = col_idx.unsqueeze(0).expand(num_tokens_topk, -1)
+
+        if topk_method == 1:  # PAGED
+            safe_idx = base_indices.clamp(min=0).long()
+            batch_idx_2d = topk_token_to_batch_idx.unsqueeze(1).expand_as(safe_idx)
+            mapped = topk_page_table_1[batch_idx_2d, safe_idx]
+            topk_indices = torch.where(valid, mapped.to(torch.int32), neg_one)
+        elif topk_method == 2:  # RAGGED
+            offset = topk_indices_offset
+            if offset.ndim == 1:
+                offset = offset.unsqueeze(1)
+            topk_indices = torch.where(
+                valid,
+                base_indices + offset.to(base_indices.dtype),
+                neg_one,
+            )
+        else:
+            topk_indices = torch.where(valid, base_indices, neg_one)
 
         # 6. q_nope @ w_kc (BF16 BMM)
         q_nope, q_pe = q_out.split(
@@ -629,6 +650,28 @@ class DeepseekMLAForwardMixin:
         # Hoist metadata access outside compile boundary
         seq_lens_expanded = metadata.get_seqlens_expanded()
 
+        # Hoist topk transform tensors outside compile boundary
+        fuse_topk = envs.SGLANG_NSA_FUSE_TOPK.get()
+        force_unfused = getattr(metadata, "force_unfused_topk", False)
+        topk_method_enum = getattr(metadata, "topk_transform_method", None)
+        if not fuse_topk or force_unfused or topk_method_enum is None:
+            topk_method = 0
+        else:
+            topk_method = int(topk_method_enum)
+
+        topk_page_table_1 = None
+        topk_token_to_batch_idx = None
+        topk_indices_offset = None
+        if topk_method == 1:  # PAGED
+            topk_page_table_1 = metadata.get_page_table_1()
+            topk_token_to_batch_idx = metadata.get_token_to_batch_idx()
+        elif topk_method == 2:  # RAGGED
+            attn_meta = getattr(metadata, "attn_metadata", None)
+            if attn_meta is not None:
+                topk_indices_offset = attn_meta.topk_indices_offset
+            if topk_indices_offset is None:
+                topk_method = 0  # fall back to no transform
+
         q_pe, k_pe, q_nope_out, k_nope, topk_indices, llama_4_scaling = (
             _forward_absorb_prepare_native_inner(
                 qkv_latent,
@@ -659,6 +702,11 @@ class DeepseekMLAForwardMixin:
                 page_size,
                 # Indexer topk args (pre-computed outside compile boundary)
                 seq_lens_expanded,
+                # Topk transform args
+                topk_method,
+                topk_page_table_1,
+                topk_token_to_batch_idx,
+                topk_indices_offset,
                 # Shape constants
                 self.q_lora_rank,
                 self.kv_lora_rank,
@@ -671,11 +719,6 @@ class DeepseekMLAForwardMixin:
                 self.indexer.index_topk,
                 llama_4_scaling,
             )
-        )
-
-        # Apply topk transform for PAGED/RAGGED modes (outside compile boundary)
-        topk_indices = self.indexer._apply_topk_transform(
-            topk_indices, seq_lens_expanded, metadata
         )
 
         return q_pe, k_pe, q_nope_out, k_nope, topk_indices, llama_4_scaling
