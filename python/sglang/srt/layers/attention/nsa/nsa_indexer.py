@@ -10,6 +10,7 @@ from einops import rearrange
 from sglang.jit_kernel.fused_store_index_cache import (
     can_use_nsa_fused_store,
     fused_store_index_k_cache,
+    fused_store_index_k_cache_op,
 )
 from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
@@ -784,6 +785,63 @@ class Indexer(MultiPlatformOp):
     #  torch.compile-friendly ("native") variants of the k-only path     #
     # ------------------------------------------------------------------ #
 
+    def _ensure_wk_weight_bf16(self) -> None:
+        """Lazily dequantize the FP8 wk weight to bf16 on first use.
+
+        Called once; the result is stored as a non-parameter buffer so it
+        persists across forward calls without re-dequantizing.
+
+        Handles both plain float32 blockwise scales and UE8M0-packed int32
+        scales (used on Blackwell with DeepGEMM).
+        """
+        if hasattr(self, "_wk_weight_bf16"):
+            return
+        weight = self.wk.weight
+        if weight.dtype == torch.float8_e4m3fn:
+            weight_scale_inv = self.wk.weight_scale_inv
+            N, K = weight.shape
+            block_k = 128
+
+            # Decode scales to float32 (N, K // block_k) shape
+            is_ue8m0 = getattr(weight_scale_inv, "format_ue8m0", False)
+            if is_ue8m0 or weight_scale_inv.dtype == torch.int32:
+                # UE8M0 packed: (N, k_groups // 4) int32 → unpack to (N, k_groups) float32
+                k_groups = weight_scale_inv.shape[1] * 4
+                sf_u8 = (
+                    weight_scale_inv.contiguous()
+                    .flatten()
+                    .view(torch.uint8)
+                    .view(N, k_groups)
+                )
+                scale_f32 = (sf_u8.to(torch.int32) << 23).view(torch.float32)
+            else:
+                # Plain float32 blockwise scales: (ceil(N/128), ceil(K/128))
+                # Expand to per-row: (N, K // block_k)
+                scale_f32 = weight_scale_inv.float()
+                n_blocks = scale_f32.shape[0]
+                k_groups = scale_f32.shape[1]
+                if n_blocks != N:
+                    scale_f32 = scale_f32.repeat_interleave(
+                        block_k, dim=0
+                    )[:N]
+
+            # Dequant: weight_f32 * scale, per 128-element K-group
+            w_f32 = weight.to(torch.float32).reshape(N, k_groups, block_k)
+            ws = scale_f32.unsqueeze(-1)  # (N, k_groups, 1)
+            w_bf16 = (w_f32 * ws).reshape(N, K).to(torch.bfloat16)
+            self.register_buffer("_wk_weight_bf16", w_bf16)
+        else:
+            # Non-FP8: just store the weight as-is in bf16
+            self.register_buffer("_wk_weight_bf16", weight.data.to(torch.bfloat16))
+
+    def _wk_forward_native(self, x: torch.Tensor) -> torch.Tensor:
+        """torch.compile-friendly wk projection bypassing ReplicatedLinear.
+
+        Uses a pre-dequantized bf16 weight (computed once by
+        _ensure_wk_weight_bf16) so the compiled graph is a single matmul.
+        """
+        return x @ self._wk_weight_bf16.t()
+
     def _get_k_bf16_native(
         self,
         x: torch.Tensor,
@@ -794,7 +852,7 @@ class Indexer(MultiPlatformOp):
         in _update_rope_guarded by doing an unconditional slice-assign."""
         from sglang.jit_kernel.hadamard import hadamard_transform_op
 
-        key, _ = self.wk(x)
+        key = self._wk_forward_native(x)
         key = self.k_norm.forward_native(key)
         k_rope, _ = key.split(
             [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
@@ -811,20 +869,12 @@ class Indexer(MultiPlatformOp):
         loc: torch.Tensor,
         page_size: int,
     ) -> None:
-        """Store indexer K cache via fused_store_index_k_cache custom op.
+        """Fused FP8 quantise + paged scatter via the JIT CUDA custom op.
 
-        Single kernel: bf16 key → FP8 quantise + paged scatter (K + scale).
-        Registered as torch.ops.sglang.fused_store_index_k_cache so
-        torch.compile sees it as an opaque in-place mutation on the buffer.
-
-        The caller must hoist the buffer lookup (get_index_k_with_scale_buffer)
-        outside the torch.compile boundary so that all layers share the same
-        compiled graph.
+        Uses fused_store_index_k_cache_op which is registered with
+        mutates_args=["index_k_with_scale"], so inductor treats it as an
+        opaque in-place mutation — no buffer clone, no Triton JIT overhead.
         """
-        from sglang.jit_kernel.fused_store_index_cache import (
-            fused_store_index_k_cache_op,
-        )
-
         fused_store_index_k_cache_op(key, buf, loc, page_size)
 
     def _topk_dummy_native(
@@ -1225,6 +1275,7 @@ class Indexer(MultiPlatformOp):
         if (
             envs.SGLANG_TORCH_COMPILE_INDEXER.get()
             and forward_batch.forward_mode.is_extend()
+            and self.wk.weight.dtype == torch.float8_e4m3fn
         ):
             return self.forward_native(
                 x, q_lora, positions, forward_batch, layer_id, return_indices
@@ -1494,6 +1545,7 @@ class Indexer(MultiPlatformOp):
                 out_cache_loc = forward_batch.out_cache_loc
                 if not out_cache_loc.is_contiguous():
                     out_cache_loc = out_cache_loc.contiguous()
+                self._ensure_wk_weight_bf16()
                 return self._forward_native_k_only(
                     x,
                     positions,
