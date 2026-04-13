@@ -69,6 +69,49 @@ if TYPE_CHECKING:
 DUAL_STREAM_TOKEN_THRESHOLD = 1024 if _is_cuda else 0
 
 
+def dequant_fp8_weight_to_bf16(
+    weight: torch.Tensor,
+    weight_scale_inv: torch.Tensor,
+    block_k: int = 128,
+) -> torch.Tensor:
+    """Dequantize an FP8 weight tensor to bf16 using blockwise scales.
+
+    Handles both plain float32 blockwise scales and UE8M0-packed int32
+    scales (used on Blackwell with DeepGEMM).
+
+    Args:
+        weight: (N, K) float8_e4m3fn weight tensor.
+        weight_scale_inv: blockwise scale tensor — either
+            (ceil(N/128), ceil(K/128)) float32 or (N, k_groups//4) int32 (UE8M0).
+        block_k: quantisation group width (default 128).
+
+    Returns:
+        (N, K) bfloat16 dequantized weight.
+    """
+    N, K = weight.shape
+
+    is_ue8m0 = getattr(weight_scale_inv, "format_ue8m0", False)
+    if is_ue8m0 or weight_scale_inv.dtype == torch.int32:
+        k_groups = weight_scale_inv.shape[1] * 4
+        sf_u8 = (
+            weight_scale_inv.contiguous()
+            .flatten()
+            .view(torch.uint8)
+            .view(N, k_groups)
+        )
+        scale_f32 = (sf_u8.to(torch.int32) << 23).view(torch.float32)
+    else:
+        scale_f32 = weight_scale_inv.float()
+        n_blocks = scale_f32.shape[0]
+        k_groups = scale_f32.shape[1]
+        if n_blocks != N:
+            scale_f32 = scale_f32.repeat_interleave(block_k, dim=0)[:N]
+
+    w_f32 = weight.to(torch.float32).reshape(N, k_groups, block_k)
+    ws = scale_f32.unsqueeze(-1)
+    return (w_f32 * ws).reshape(N, K).to(torch.bfloat16)
+
+
 class BaseIndexerMetadata(ABC):
     @abstractmethod
     def get_seqlens_int32(self) -> torch.Tensor:
@@ -798,37 +841,7 @@ class Indexer(MultiPlatformOp):
             return
         weight = self.wk.weight
         if weight.dtype == torch.float8_e4m3fn:
-            weight_scale_inv = self.wk.weight_scale_inv
-            N, K = weight.shape
-            block_k = 128
-
-            # Decode scales to float32 (N, K // block_k) shape
-            is_ue8m0 = getattr(weight_scale_inv, "format_ue8m0", False)
-            if is_ue8m0 or weight_scale_inv.dtype == torch.int32:
-                # UE8M0 packed: (N, k_groups // 4) int32 → unpack to (N, k_groups) float32
-                k_groups = weight_scale_inv.shape[1] * 4
-                sf_u8 = (
-                    weight_scale_inv.contiguous()
-                    .flatten()
-                    .view(torch.uint8)
-                    .view(N, k_groups)
-                )
-                scale_f32 = (sf_u8.to(torch.int32) << 23).view(torch.float32)
-            else:
-                # Plain float32 blockwise scales: (ceil(N/128), ceil(K/128))
-                # Expand to per-row: (N, K // block_k)
-                scale_f32 = weight_scale_inv.float()
-                n_blocks = scale_f32.shape[0]
-                k_groups = scale_f32.shape[1]
-                if n_blocks != N:
-                    scale_f32 = scale_f32.repeat_interleave(
-                        block_k, dim=0
-                    )[:N]
-
-            # Dequant: weight_f32 * scale, per 128-element K-group
-            w_f32 = weight.to(torch.float32).reshape(N, k_groups, block_k)
-            ws = scale_f32.unsqueeze(-1)  # (N, k_groups, 1)
-            w_bf16 = (w_f32 * ws).reshape(N, K).to(torch.bfloat16)
+            w_bf16 = dequant_fp8_weight_to_bf16(weight, self.wk.weight_scale_inv)
             self.register_buffer("_wk_weight_bf16", w_bf16)
         else:
             # Non-FP8: just store the weight as-is in bf16
@@ -908,6 +921,55 @@ class Indexer(MultiPlatformOp):
             return base_indices
 
         from sglang.srt.layers.attention.nsa_backend import TopkTransformMethod
+
+        if topk_method == TopkTransformMethod.PAGED:
+            page_table_1 = metadata.get_page_table_1()
+            batch_idx = metadata.get_token_to_batch_idx()
+            safe_idx = base_indices.clamp(min=0).long()
+            batch_idx_2d = batch_idx.unsqueeze(1).expand_as(safe_idx)
+            mapped = page_table_1[batch_idx_2d, safe_idx]
+            return torch.where(valid, mapped.to(torch.int32), neg_one)
+
+        if topk_method == TopkTransformMethod.RAGGED:
+            attn_meta = getattr(metadata, "attn_metadata", None)
+            if attn_meta is not None:
+                offset = attn_meta.topk_indices_offset
+                if offset.ndim == 1:
+                    offset = offset.unsqueeze(1)
+                return torch.where(
+                    valid,
+                    base_indices + offset.to(base_indices.dtype),
+                    neg_one,
+                )
+
+        return base_indices
+
+    def _apply_topk_transform(
+        self,
+        base_indices: torch.Tensor,
+        seq_lens: torch.Tensor,
+        metadata: BaseIndexerMetadata,
+    ) -> torch.Tensor:
+        """Apply PAGED/RAGGED topk transform to base dummy indices.
+
+        Called outside the torch.compile boundary for the wide-compile path.
+        Mirrors the post-processing logic in _topk_dummy_native.
+        """
+        fuse_topk = envs.SGLANG_NSA_FUSE_TOPK.get()
+        force_unfused = getattr(metadata, "force_unfused_topk", False)
+        if not fuse_topk or force_unfused:
+            return base_indices
+
+        topk_method = getattr(metadata, "topk_transform_method", None)
+        if topk_method is None:
+            return base_indices
+
+        from sglang.srt.layers.attention.nsa_backend import TopkTransformMethod
+
+        topk = self.index_topk
+        col_idx = torch.arange(topk, dtype=torch.int32, device=base_indices.device)
+        valid = col_idx.unsqueeze(0) < seq_lens.unsqueeze(1)
+        neg_one = torch.tensor(-1, dtype=torch.int32, device=base_indices.device)
 
         if topk_method == TopkTransformMethod.PAGED:
             page_table_1 = metadata.get_page_table_1()

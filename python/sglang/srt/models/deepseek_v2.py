@@ -1554,6 +1554,12 @@ class DeepseekV2AttentionMLA(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
         assert self.q_lora_rank is not None
+        # BF16 fast-path for the wide-compile indexer path: use the
+        # pre-dequanted weight to avoid FP8 quant + DeepGEMM overhead.
+        if hasattr(self, "_fused_qkv_weight_bf16") and not isinstance(
+            hidden_states, tuple
+        ):
+            return hidden_states @ self._fused_qkv_weight_bf16.t()
         if (
             (not isinstance(hidden_states, tuple))
             and hidden_states.shape[0] >= 1
