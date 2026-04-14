@@ -82,6 +82,11 @@ if _use_aiter_gfx95:
 #  Compiled wide-boundary forward_absorb_prepare (FP8 k-only path)   #
 # ------------------------------------------------------------------ #
 
+# Module-level CUDA graph cache — survives model recreation in benchmarks.
+# Key: (layer_id, num_tokens, topk_method)
+# Value: dict with graph, static buffers, and output tensors.
+_cg_cache: dict = {}
+
 if _is_cuda:
     from sglang.jit_kernel.fused_store_index_cache import fused_store_index_k_cache_op
     from sglang.jit_kernel.hadamard import hadamard_transform_op
@@ -718,122 +723,87 @@ class DeepseekMLAForwardMixin:
             )
 
         num_tokens = qkv_latent.shape[0]
+        # Key includes weight data_ptr so cache invalidates on model recreation.
+        w_ptr = self._q_b_proj_weight_bf16.data_ptr()
+        cg_key = (self.layer_id, num_tokens, topk_method, w_ptr)
 
         # -------------------------------------------------------------- #
         #  Manual CUDA graph: replay if captured for this shape            #
         # -------------------------------------------------------------- #
-        cg = getattr(self, "_cg_graph", None)
-        if cg is not None and num_tokens == self._cg_num_tokens:
-            print(">>>>> replay cuda graph")
+        entry = _cg_cache.get(cg_key)
+        if entry is not None and entry.get("graph") is not None:
             # Copy dynamic inputs into static buffers
-            self._cg_static_qkv_latent.copy_(qkv_latent)
-            self._cg_static_hidden_states.copy_(hidden_states)
-            self._cg_static_positions.copy_(positions)
-            self._cg_static_seq_lens_expanded.copy_(seq_lens_expanded)
-            if topk_page_table_1 is not None and self._cg_static_topk_pt1 is not None:
-                self._cg_static_topk_pt1.copy_(topk_page_table_1)
-            if topk_token_to_batch_idx is not None and self._cg_static_topk_ttbi is not None:
-                self._cg_static_topk_ttbi.copy_(topk_token_to_batch_idx)
-            if topk_indices_offset is not None and self._cg_static_topk_tio is not None:
-                self._cg_static_topk_tio.copy_(topk_indices_offset)
+            entry["qkv_latent"].copy_(qkv_latent)
+            entry["hidden_states"].copy_(hidden_states)
+            entry["positions"].copy_(positions)
+            entry["seq_lens_expanded"].copy_(seq_lens_expanded)
+            if topk_page_table_1 is not None and entry.get("topk_pt1") is not None:
+                entry["topk_pt1"].copy_(topk_page_table_1)
+            if topk_token_to_batch_idx is not None and entry.get("topk_ttbi") is not None:
+                entry["topk_ttbi"].copy_(topk_token_to_batch_idx)
+            if topk_indices_offset is not None and entry.get("topk_tio") is not None:
+                entry["topk_tio"].copy_(topk_indices_offset)
 
-            cg.replay()
+            entry["graph"].replay()
 
-            q_pe, k_pe, q_nope_out, k_nope, topk_indices, _, key = self._cg_output
+            q_pe, k_pe, q_nope_out, k_nope, topk_indices, _, key = entry["output"]
             fused_store_index_k_cache_op(key, index_k_buf, out_cache_loc, page_size)
             return q_pe, k_pe, q_nope_out, k_nope, topk_indices, llama_4_scaling
 
         # -------------------------------------------------------------- #
-        #  Warmup: first call goes through compiled fn eagerly             #
+        #  Capture: first call for this key → warmup + record CUDA graph   #
         # -------------------------------------------------------------- #
-        if not getattr(self, "_cg_warmup_done", False):
-            print(">>>>> warmup cuda graph")
-            self._cg_warmup_done = True
-            self._cg_num_tokens = num_tokens
-            self._cg_topk_method = topk_method
+        # Allocate static input buffers (clone to get same shape/dtype)
+        static_qkv = qkv_latent.clone()
+        static_hs = hidden_states.clone()
+        static_pos = positions.clone()
+        static_sle = seq_lens_expanded.clone()
+        static_pt1 = topk_page_table_1.clone() if topk_page_table_1 is not None else None
+        static_ttbi = (
+            topk_token_to_batch_idx.clone()
+            if topk_token_to_batch_idx is not None
+            else None
+        )
+        static_tio = (
+            topk_indices_offset.clone()
+            if topk_indices_offset is not None
+            else None
+        )
 
-            args = _build_inner_args(
-                qkv_latent, hidden_states, positions,
-                seq_lens_expanded,
-                topk_page_table_1, topk_token_to_batch_idx,
-                topk_indices_offset,
-            )
-            q_pe, k_pe, q_nope_out, k_nope, topk_indices, _, key = (
-                _forward_absorb_prepare_native_inner(*args)
-            )
-            fused_store_index_k_cache_op(key, index_k_buf, out_cache_loc, page_size)
-            return q_pe, k_pe, q_nope_out, k_nope, topk_indices, llama_4_scaling
-
-        # -------------------------------------------------------------- #
-        #  Capture: second call with same shape → record CUDA graph        #
-        # -------------------------------------------------------------- #
-        if (
-            num_tokens == self._cg_num_tokens
-            and topk_method == self._cg_topk_method
-            and getattr(self, "_cg_graph", None) is None
-        ):
-            # Allocate static input buffers (clone to get same shape/dtype)
-            self._cg_static_qkv_latent = qkv_latent.clone()
-            self._cg_static_hidden_states = hidden_states.clone()
-            self._cg_static_positions = positions.clone()
-            self._cg_static_seq_lens_expanded = seq_lens_expanded.clone()
-            self._cg_static_topk_pt1 = (
-                topk_page_table_1.clone() if topk_page_table_1 is not None else None
-            )
-            self._cg_static_topk_ttbi = (
-                topk_token_to_batch_idx.clone()
-                if topk_token_to_batch_idx is not None
-                else None
-            )
-            self._cg_static_topk_tio = (
-                topk_indices_offset.clone()
-                if topk_indices_offset is not None
-                else None
-            )
-
-            args = _build_inner_args(
-                self._cg_static_qkv_latent,
-                self._cg_static_hidden_states,
-                self._cg_static_positions,
-                self._cg_static_seq_lens_expanded,
-                self._cg_static_topk_pt1,
-                self._cg_static_topk_ttbi,
-                self._cg_static_topk_tio,
-            )
-
-            # Warmup the compiled fn once more with static buffers
-            _forward_absorb_prepare_native_inner(*args)
-
-            # Capture
-            graph = torch.cuda.CUDAGraph()
-            pool = torch.cuda.graph_pool_handle()
-            s = torch.cuda.Stream()
-            s.wait_stream(torch.cuda.current_stream())
-            with torch.cuda.stream(s):
-                with torch.cuda.graph(graph, pool=pool, stream=s):
-                    output = _forward_absorb_prepare_native_inner(*args)
-            torch.cuda.current_stream().wait_stream(s)
-
-            self._cg_graph = graph
-            self._cg_output = output
-
-            # Output is already populated from the capture run
-            q_pe, k_pe, q_nope_out, k_nope, topk_indices, _, key = output
-            fused_store_index_k_cache_op(key, index_k_buf, out_cache_loc, page_size)
-            return q_pe, k_pe, q_nope_out, k_nope, topk_indices, llama_4_scaling
-
-        # -------------------------------------------------------------- #
-        #  Fallback: different shape or topk_method → compiled fn only     #
-        # -------------------------------------------------------------- #
         args = _build_inner_args(
-            qkv_latent, hidden_states, positions,
-            seq_lens_expanded,
-            topk_page_table_1, topk_token_to_batch_idx,
-            topk_indices_offset,
+            static_qkv, static_hs, static_pos, static_sle,
+            static_pt1, static_ttbi, static_tio,
         )
-        q_pe, k_pe, q_nope_out, k_nope, topk_indices, _, key = (
-            _forward_absorb_prepare_native_inner(*args)
-        )
+
+        # Warmup the compiled fn with static buffers (triggers torch.compile
+        # tracing on first ever call; stabilises kernel addresses on second).
+        _forward_absorb_prepare_native_inner(*args)
+        _forward_absorb_prepare_native_inner(*args)
+
+        # Capture
+        graph = torch.cuda.CUDAGraph()
+        pool = torch.cuda.graph_pool_handle()
+        s = torch.cuda.Stream()
+        s.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(s):
+            with torch.cuda.graph(graph, pool=pool, stream=s):
+                output = _forward_absorb_prepare_native_inner(*args)
+        torch.cuda.current_stream().wait_stream(s)
+
+        _cg_cache[cg_key] = {
+            "graph": graph,
+            "output": output,
+            "qkv_latent": static_qkv,
+            "hidden_states": static_hs,
+            "positions": static_pos,
+            "seq_lens_expanded": static_sle,
+            "topk_pt1": static_pt1,
+            "topk_ttbi": static_ttbi,
+            "topk_tio": static_tio,
+        }
+
+        # Output is already populated from the capture run
+        q_pe, k_pe, q_nope_out, k_nope, topk_indices, _, key = output
         fused_store_index_k_cache_op(key, index_k_buf, out_cache_loc, page_size)
         return q_pe, k_pe, q_nope_out, k_nope, topk_indices, llama_4_scaling
 
