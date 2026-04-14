@@ -835,11 +835,11 @@ class DeepseekMLAForwardMixin:
         _absorb_logger.info(
             "Layer %d: capturing %d CUDA graph sizes", self.layer_id, len(capture_sizes),
         )
-        for buf in (bufs.qkv_latent, bufs.hidden_states, bufs.positions,
-                    bufs.seq_lens_expanded, bufs.topk_page_table_1,
-                    bufs.topk_token_to_batch_idx, bufs.topk_indices_offset):
-            if buf is not None:
-                torch._dynamo.maybe_mark_dynamic(buf, 0)
+        # for buf in (bufs.qkv_latent, bufs.hidden_states, bufs.positions,
+        #             bufs.seq_lens_expanded, bufs.topk_page_table_1,
+        #             bufs.topk_token_to_batch_idx, bufs.topk_indices_offset):
+        #     if buf is not None:
+        #         torch._dynamo.maybe_mark_dynamic(buf, 0)
 
         def _make_full_args(n):
             """Build (dynamic_inputs..., weights...) sliced to n tokens."""
