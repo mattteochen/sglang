@@ -812,6 +812,12 @@ class DeepseekMLAForwardMixin:
         )
         # Create backend explicitly so we can extract CG entries after capture
         sglang_backend = SGLangBackend(compile_config, pool)
+        # Inject Inductor/Triton options
+        sglang_backend.inductor_config.update({
+            "triton.enable_pdl": True,
+            "max_autotune_gemm": True,
+            "combo_kernels": True,
+        })
 
         def backend_factory(gm, ex):
             return sglang_backend(gm, ex)
