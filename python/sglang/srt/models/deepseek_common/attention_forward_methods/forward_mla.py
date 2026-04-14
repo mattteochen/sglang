@@ -4,7 +4,11 @@ from typing import TYPE_CHECKING, Optional
 
 import torch
 
-from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
+from sglang.srt.compilation.piecewise_context_manager import (
+    enable_piecewise_cuda_graph,
+    is_in_piecewise_cuda_graph,
+    set_pcg_capture_stream,
+)
 from sglang.srt.environ import envs
 from sglang.srt.layers import deep_gemm_wrapper
 from sglang.srt.layers.attention.nsa.utils import nsa_use_prefill_cp
@@ -82,190 +86,250 @@ if _use_aiter_gfx95:
 #  Compiled wide-boundary forward_absorb_prepare (FP8 k-only path)   #
 # ------------------------------------------------------------------ #
 
-# Module-level CUDA graph cache — survives model recreation in benchmarks.
-# Key: (layer_id, num_tokens, topk_method)
-# Value: dict with graph, static buffers, and output tensors.
-_cg_cache: dict = {}
-
 if _is_cuda:
+    import bisect
+    import logging
+    from dataclasses import dataclass
+
     from sglang.jit_kernel.fused_store_index_cache import fused_store_index_k_cache_op
     from sglang.jit_kernel.hadamard import hadamard_transform_op
+    from sglang.srt.compilation.backend import SGLangBackend
+    from sglang.srt.compilation.compilation_config import CompilationConfig
+    from sglang.srt.compilation.compile import install_torch_compiled
+    from sglang.srt.compilation.cuda_piecewise_backend import CUDAPiecewiseBackend
     from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
-
-    @torch.no_grad()
-    @torch.compile(
-        dynamic=True,
-        options={
-            "triton.enable_pdl": True,
-            "combo_kernels": True,
-            # "cpp_wrapper": True,
-            # "max_autotune_gemm": True,
-            # "max_autotune_gemm_backends": "ATEN, TRITON, CUTLASS, CUTEDSL, NVGEMM",
-            "trace.enabled": True,
-        },
+    from sglang.srt.model_executor.cuda_graph_runner import (
+        get_global_graph_memory_pool,
     )
-    def _forward_absorb_prepare_native_inner(
-        qkv_latent: torch.Tensor,
-        hidden_states: torch.Tensor,
-        positions: torch.Tensor,
-        # Pre-dequanted BF16 weights
-        q_b_proj_weight: torch.Tensor,
-        wk_weight: torch.Tensor,
-        w_kc_bf16: torch.Tensor,
-        # Norm weights
-        q_a_ln_weight: torch.Tensor,
-        q_a_ln_eps: float,
-        kv_a_ln_weight: torch.Tensor,
-        kv_a_ln_eps: float,
-        k_norm_weight: torch.Tensor,
-        k_norm_bias: torch.Tensor,
-        k_norm_eps: float,
-        # RoPE caches
-        mla_cos_sin_cache: torch.Tensor,
-        mla_is_neox_style: bool,
-        indexer_cos_sin_cache: torch.Tensor,
-        indexer_is_neox_style: bool,
-        indexer_head_size: int,
-        indexer_rotary_dim: int,
-        # Indexer topk args (pre-computed outside compile boundary)
-        seq_lens_expanded: torch.Tensor,
-        # Topk transform args (hoisted from metadata)
-        topk_method: int,  # 0=none, 1=PAGED, 2=RAGGED
-        topk_page_table_1: Optional[torch.Tensor],
-        topk_token_to_batch_idx: Optional[torch.Tensor],
-        topk_indices_offset: Optional[torch.Tensor],
-        # Shape constants
-        q_lora_rank: int,
-        kv_lora_rank: int,
-        qk_rope_head_dim: int,
-        num_local_heads: int,
-        qk_head_dim: int,
-        qk_nope_head_dim: int,
-        indexer_rope_head_dim: int,
-        indexer_head_dim: int,
-        index_topk: int,
-        llama_4_scaling,
-    ):
-        """torch.compile-friendly wide-boundary forward_absorb_prepare.
 
-        Replaces all FP8 GEMMs with BF16 matmuls, custom-op norms with
-        native torch norms, and custom-op RoPE with native torch RoPE.
-        The Hadamard transform remains as a custom op (opaque leaf).
-        The K-cache store (mutating) is hoisted to the caller to allow
-        triton.cudagraphs.  The topk transform (PAGED/RAGGED) is inlined.
+    _absorb_logger = logging.getLogger(__name__)
+
+    @dataclass
+    class AbsorbPrepareInputBuffers:
+        """Pre-allocated static GPU tensors for CUDA graph address stability."""
+
+        qkv_latent: torch.Tensor
+        hidden_states: torch.Tensor
+        positions: torch.Tensor
+        seq_lens_expanded: torch.Tensor
+        topk_page_table_1: Optional[torch.Tensor]
+        topk_token_to_batch_idx: Optional[torch.Tensor]
+        topk_indices_offset: Optional[torch.Tensor]
+
+    class ForwardAbsorbPrepareModule(torch.nn.Module):
+        """nn.Module wrapper for the compilable forward_absorb_prepare logic.
+
+        Weights are stored as buffers (persistent=False) so Dynamo sees them
+        as module attributes with stable addresses — not graph inputs.
+        Only dynamic per-call tensors appear in the forward signature.
         """
-        # 1. Split qkv latent
-        q, latent_cache = qkv_latent.split(
-            [q_lora_rank, kv_lora_rank + qk_rope_head_dim], dim=-1
-        )
-        k_nope = latent_cache[..., :kv_lora_rank]
 
-        # 2. RMSNorm (native) — q_a_layernorm
-        q_f32 = q.float()
-        q_var = q_f32.pow(2).mean(-1, keepdim=True)
-        q = q_f32 * torch.rsqrt(q_var + q_a_ln_eps)
-        q = (q * q_a_ln_weight).to(torch.bfloat16)
-
-        # 3. RMSNorm (native) — kv_a_layernorm
-        kn_f32 = k_nope.float()
-        kn_var = kn_f32.pow(2).mean(-1, keepdim=True)
-        k_nope = kn_f32 * torch.rsqrt(kn_var + kv_a_ln_eps)
-        k_nope = (k_nope * kv_a_ln_weight).to(torch.bfloat16)
-
-        # 4. q_b_proj (BF16 matmul)
-        q_out = (q @ q_b_proj_weight.t()).view(-1, num_local_heads, qk_head_dim)
-
-        # 5. Indexer k-only path (inlined)
-        # 5a. wk projection (BF16 matmul)
-        key = hidden_states @ wk_weight.t()
-
-        # 5b. LayerNorm (native) on key
-        key_orig_dtype = key.dtype
-        key_f32 = key.to(k_norm_weight.dtype)
-        key_f32 = torch.nn.functional.layer_norm(
-            key_f32,
-            (indexer_head_dim,),
-            weight=k_norm_weight,
-            bias=k_norm_bias,
-            eps=k_norm_eps,
-        )
-        key = key_f32.to(key_orig_dtype)
-
-        # 5c. RoPE on key (native)
-        k_rope = key[..., :indexer_rope_head_dim]
-        cos_sin = indexer_cos_sin_cache.index_select(0, positions.flatten())
-        cos, sin = cos_sin.chunk(2, dim=-1)
-        num_tokens = positions.shape[0]
-        k_rope_3d = k_rope.view(num_tokens, -1, indexer_head_size)
-        k_rope_rot = k_rope_3d[..., :indexer_rotary_dim]
-        k_rope_pass = k_rope_3d[..., indexer_rotary_dim:]
-        k_rope_rot = apply_rotary_emb(k_rope_rot, cos, sin, indexer_is_neox_style)
-        k_rope_out = torch.cat((k_rope_rot, k_rope_pass), dim=-1).reshape(
-            k_rope.shape
-        )
-        key = torch.cat(
-            [k_rope_out, key[..., indexer_rope_head_dim:]], dim=-1
-        )
-
-        # 5d. Hadamard transform (custom op — opaque leaf)
-        key = hadamard_transform_op(key, indexer_head_dim**-0.5)
-
-        # 5e. K-cache store hoisted to caller (mutating op blocks cudagraphs)
-
-        # 5f. Dummy topk + transform (pure torch, fused)
-        num_tokens_topk = seq_lens_expanded.shape[0]
-        col_idx = torch.arange(index_topk, dtype=torch.int32, device=key.device)
-        valid = col_idx.unsqueeze(0) < seq_lens_expanded.unsqueeze(1)
-        neg_one = torch.tensor(-1, dtype=torch.int32, device=key.device)
-        base_indices = col_idx.unsqueeze(0).expand(num_tokens_topk, -1)
-
-        if topk_method == 1:  # PAGED
-            safe_idx = base_indices.clamp(
-                min=0, max=topk_page_table_1.shape[1] - 1
-            ).long()
-            batch_idx_2d = topk_token_to_batch_idx.unsqueeze(1).expand_as(safe_idx)
-            mapped = topk_page_table_1[batch_idx_2d, safe_idx]
-            topk_indices = torch.where(valid, mapped.to(torch.int32), neg_one)
-        elif topk_method == 2:  # RAGGED
-            offset = topk_indices_offset
-            if offset.ndim == 1:
-                offset = offset.unsqueeze(1)
-            topk_indices = torch.where(
-                valid,
-                base_indices + offset.to(base_indices.dtype),
-                neg_one,
+        def __init__(self, attn_layer, topk_method: int):
+            super().__init__()
+            # --- Weight buffers (share storage with parent, no duplication) ---
+            self.register_buffer(
+                "q_b_proj_weight", attn_layer._q_b_proj_weight_bf16, persistent=False
             )
-        else:
-            topk_indices = torch.where(valid, base_indices, neg_one)
+            self.register_buffer(
+                "wk_weight", attn_layer.indexer._wk_weight_bf16, persistent=False
+            )
+            self.register_buffer(
+                "w_kc_bf16", attn_layer._w_kc_bf16, persistent=False
+            )
+            # Norm weights
+            self.register_buffer(
+                "q_a_ln_weight", attn_layer.q_a_layernorm.weight, persistent=False
+            )
+            self.register_buffer(
+                "kv_a_ln_weight", attn_layer.kv_a_layernorm.weight, persistent=False
+            )
+            self.register_buffer(
+                "k_norm_weight", attn_layer.indexer.k_norm.weight, persistent=False
+            )
+            self.register_buffer(
+                "k_norm_bias", attn_layer.indexer.k_norm.bias, persistent=False
+            )
+            # RoPE caches
+            self.register_buffer(
+                "mla_cos_sin_cache",
+                attn_layer.rotary_emb.cos_sin_cache,
+                persistent=False,
+            )
+            self.register_buffer(
+                "indexer_cos_sin_cache",
+                attn_layer.indexer.rotary_emb.cos_sin_cache,
+                persistent=False,
+            )
+            # --- Scalar constants ---
+            self.q_a_ln_eps = attn_layer.q_a_layernorm.variance_epsilon
+            self.kv_a_ln_eps = attn_layer.kv_a_layernorm.variance_epsilon
+            self.k_norm_eps = attn_layer.indexer.k_norm.variance_epsilon
+            self.mla_is_neox_style = attn_layer.rotary_emb.is_neox_style
+            self.indexer_is_neox_style = attn_layer.indexer.rotary_emb.is_neox_style
+            self.indexer_head_size = attn_layer.indexer.rotary_emb.head_size
+            self.indexer_rotary_dim = attn_layer.indexer.rotary_emb.rotary_dim
+            self.q_lora_rank = attn_layer.q_lora_rank
+            self.kv_lora_rank = attn_layer.kv_lora_rank
+            self.qk_rope_head_dim = attn_layer.qk_rope_head_dim
+            self.num_local_heads = attn_layer.num_local_heads
+            self.qk_head_dim = attn_layer.qk_head_dim
+            self.qk_nope_head_dim = attn_layer.qk_nope_head_dim
+            self.indexer_rope_head_dim = attn_layer.indexer.rope_head_dim
+            self.indexer_head_dim = attn_layer.indexer.head_dim
+            self.index_topk = attn_layer.indexer.index_topk
+            self.topk_method = topk_method
 
-        # 6. q_nope @ w_kc (BF16 BMM)
-        q_nope, q_pe = q_out.split(
-            [qk_nope_head_dim, qk_rope_head_dim], dim=-1
-        )
-        k_pe = latent_cache[..., kv_lora_rank:].unsqueeze(1)
-        k_nope = k_nope.unsqueeze(1)
+            # Pre-create small constant tensors on the correct device so they
+            # don't trigger CPU→CUDA copies during CUDA graph capture.
+            device = attn_layer._q_b_proj_weight_bf16.device
+            self.register_buffer(
+                "_col_idx",
+                torch.arange(self.index_topk, dtype=torch.int32, device=device),
+                persistent=False,
+            )
+            self.register_buffer(
+                "_neg_one",
+                torch.tensor(-1, dtype=torch.int32, device=device),
+                persistent=False,
+            )
 
-        q_nope_out = torch.bmm(
-            q_nope.transpose(0, 1), w_kc_bf16
-        ).transpose(0, 1)
+        @torch.no_grad()
+        def forward(
+            self,
+            qkv_latent: torch.Tensor,
+            hidden_states: torch.Tensor,
+            positions: torch.Tensor,
+            seq_lens_expanded: torch.Tensor,
+            topk_page_table_1: Optional[torch.Tensor],
+            topk_token_to_batch_idx: Optional[torch.Tensor],
+            topk_indices_offset: Optional[torch.Tensor],
+        ):
+            # 1. Split qkv latent
+            q, latent_cache = qkv_latent.split(
+                [self.q_lora_rank, self.kv_lora_rank + self.qk_rope_head_dim], dim=-1
+            )
+            k_nope = latent_cache[..., : self.kv_lora_rank]
 
-        # 7. RoPE on q_pe, k_pe (native — MLA rotary)
-        mla_cos_sin = mla_cos_sin_cache.index_select(0, positions.flatten())
-        mla_cos, mla_sin = mla_cos_sin.chunk(2, dim=-1)
+            # 2. RMSNorm (native) — q_a_layernorm
+            q_f32 = q.float()
+            q_var = q_f32.pow(2).mean(-1, keepdim=True)
+            q = q_f32 * torch.rsqrt(q_var + self.q_a_ln_eps)
+            q = (q * self.q_a_ln_weight).to(torch.bfloat16)
 
-        # q_pe RoPE
-        q_pe_shape = q_pe.shape
-        q_pe_3d = q_pe.view(num_tokens, -1, q_pe.shape[-1])
-        q_pe_rot = apply_rotary_emb(q_pe_3d, mla_cos, mla_sin, mla_is_neox_style)
-        q_pe = q_pe_rot.reshape(q_pe_shape)
+            # 3. RMSNorm (native) — kv_a_layernorm
+            kn_f32 = k_nope.float()
+            kn_var = kn_f32.pow(2).mean(-1, keepdim=True)
+            k_nope = kn_f32 * torch.rsqrt(kn_var + self.kv_a_ln_eps)
+            k_nope = (k_nope * self.kv_a_ln_weight).to(torch.bfloat16)
 
-        # k_pe RoPE
-        k_pe_shape = k_pe.shape
-        k_pe_3d = k_pe.view(num_tokens, -1, k_pe.shape[-1])
-        k_pe_rot = apply_rotary_emb(k_pe_3d, mla_cos, mla_sin, mla_is_neox_style)
-        k_pe = k_pe_rot.reshape(k_pe_shape)
+            # 4. q_b_proj (BF16 matmul)
+            q_out = (q @ self.q_b_proj_weight.t()).view(
+                -1, self.num_local_heads, self.qk_head_dim
+            )
 
-        return q_pe, k_pe, q_nope_out, k_nope, topk_indices, llama_4_scaling, key
+            # 5. Indexer k-only path (inlined)
+            # 5a. wk projection (BF16 matmul)
+            key = hidden_states @ self.wk_weight.t()
+
+            # 5b. LayerNorm (native) on key
+            key_orig_dtype = key.dtype
+            key_f32 = key.to(self.k_norm_weight.dtype)
+            key_f32 = torch.nn.functional.layer_norm(
+                key_f32,
+                (self.indexer_head_dim,),
+                weight=self.k_norm_weight,
+                bias=self.k_norm_bias,
+                eps=self.k_norm_eps,
+            )
+            key = key_f32.to(key_orig_dtype)
+
+            # 5c. RoPE on key (native)
+            k_rope = key[..., : self.indexer_rope_head_dim]
+            cos_sin = self.indexer_cos_sin_cache.index_select(
+                0, positions.flatten()
+            )
+            cos, sin = cos_sin.chunk(2, dim=-1)
+            num_tokens = positions.shape[0]
+            k_rope_3d = k_rope.view(num_tokens, -1, self.indexer_head_size)
+            k_rope_rot = k_rope_3d[..., : self.indexer_rotary_dim]
+            k_rope_pass = k_rope_3d[..., self.indexer_rotary_dim :]
+            k_rope_rot = apply_rotary_emb(
+                k_rope_rot, cos, sin, self.indexer_is_neox_style
+            )
+            k_rope_out = torch.cat((k_rope_rot, k_rope_pass), dim=-1).reshape(
+                k_rope.shape
+            )
+            key = torch.cat(
+                [k_rope_out, key[..., self.indexer_rope_head_dim :]], dim=-1
+            )
+
+            # 5d. Hadamard transform (custom op — opaque leaf)
+            key = hadamard_transform_op(key, self.indexer_head_dim**-0.5)
+
+            # 5e. K-cache store hoisted to caller (mutating op blocks cudagraphs)
+
+            # 5f. Dummy topk + transform (pure torch, fused)
+            num_tokens_topk = seq_lens_expanded.shape[0]
+            col_idx = self._col_idx
+            valid = col_idx.unsqueeze(0) < seq_lens_expanded.unsqueeze(1)
+            neg_one = self._neg_one
+            base_indices = col_idx.unsqueeze(0).expand(num_tokens_topk, -1)
+
+            if self.topk_method == 1:  # PAGED
+                safe_idx = base_indices.clamp(
+                    min=0, max=topk_page_table_1.shape[1] - 1
+                ).long()
+                batch_idx_2d = topk_token_to_batch_idx.unsqueeze(1).expand_as(
+                    safe_idx
+                )
+                mapped = topk_page_table_1[batch_idx_2d, safe_idx]
+                topk_indices = torch.where(valid, mapped.to(torch.int32), neg_one)
+            elif self.topk_method == 2:  # RAGGED
+                offset = topk_indices_offset
+                if offset.ndim == 1:
+                    offset = offset.unsqueeze(1)
+                topk_indices = torch.where(
+                    valid,
+                    base_indices + offset.to(base_indices.dtype),
+                    neg_one,
+                )
+            else:
+                topk_indices = torch.where(valid, base_indices, neg_one)
+
+            # 6. q_nope @ w_kc (BF16 BMM)
+            q_nope, q_pe = q_out.split(
+                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
+            k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+            k_nope = k_nope.unsqueeze(1)
+
+            q_nope_out = torch.bmm(
+                q_nope.transpose(0, 1), self.w_kc_bf16
+            ).transpose(0, 1)
+
+            # 7. RoPE on q_pe, k_pe (native — MLA rotary)
+            mla_cos_sin = self.mla_cos_sin_cache.index_select(
+                0, positions.flatten()
+            )
+            mla_cos, mla_sin = mla_cos_sin.chunk(2, dim=-1)
+
+            # q_pe RoPE
+            q_pe_shape = q_pe.shape
+            q_pe_3d = q_pe.view(num_tokens, -1, q_pe.shape[-1])
+            q_pe_rot = apply_rotary_emb(
+                q_pe_3d, mla_cos, mla_sin, self.mla_is_neox_style
+            )
+            q_pe = q_pe_rot.reshape(q_pe_shape)
+
+            # k_pe RoPE
+            k_pe_shape = k_pe.shape
+            k_pe_3d = k_pe.view(num_tokens, -1, k_pe.shape[-1])
+            k_pe_rot = apply_rotary_emb(
+                k_pe_3d, mla_cos, mla_sin, self.mla_is_neox_style
+            )
+            k_pe = k_pe_rot.reshape(k_pe_shape)
+
+            return q_pe, k_pe, q_nope_out, k_nope, topk_indices, key
 
 
 class DeepseekMLAForwardMixin:
@@ -633,6 +697,235 @@ class DeepseekMLAForwardMixin:
             # Already bf16 (from block_quant_dequant in post_load_weights)
             self.register_buffer("_w_kc_bf16", self.w_kc.to(torch.bfloat16))
 
+    def _get_absorb_capture_sizes(self: DeepseekV2AttentionMLA):
+        """Determine capture sizes for the absorb-prepare CG from server_args."""
+        server_args = get_global_server_args()
+        sizes = server_args.piecewise_cuda_graph_tokens
+        if sizes is None:
+            # Fall back: generate capture sizes with a reasonable max
+            max_tokens = getattr(server_args, "chunked_prefill_size", 0) or 8192
+            sizes = (
+                list(range(4, 33, 4))
+                + list(range(48, 257, 16))
+                + list(range(288, 513, 32))
+                + list(range(576, 1025, 64))
+                + list(range(1280, 4097, 256))
+                + list(range(4608, max_tokens + 1, 512))
+            )
+            sizes = [s for s in sizes if s <= max_tokens]
+        return sorted(sizes)
+
+    def _init_absorb_prepare_module(
+        self: DeepseekV2AttentionMLA,
+        topk_method: int,
+        sample_qkv_latent: torch.Tensor,
+        sample_hidden_states: torch.Tensor,
+    ) -> None:
+        """Lazily initialize the piecewise-CG-backed absorb-prepare module.
+
+        Creates the ForwardAbsorbPrepareModule, pre-allocates static input
+        buffers, installs torch.compile with the SGLang backend, and runs
+        the warmup + CUDA graph capture lifecycle.
+
+        Args:
+            topk_method: topk transform method (0=none, 1=PAGED, 2=RAGGED).
+            sample_qkv_latent: a real qkv_latent tensor to derive shapes from.
+            sample_hidden_states: a real hidden_states tensor to derive shapes from.
+        """
+        # 1. Create module
+        mod = ForwardAbsorbPrepareModule(self, topk_method)
+        self._absorb_prepare_mod = mod
+
+        # 2. Capture sizes
+        capture_sizes = self._get_absorb_capture_sizes()
+        self._absorb_capture_sizes = capture_sizes
+        max_tokens = max(capture_sizes)
+
+        _absorb_logger.info(
+            "Layer %d: absorb-prepare init — topk_method=%d, "
+            "%d capture sizes (min=%d, max=%d)",
+            self.layer_id,
+            topk_method,
+            len(capture_sizes),
+            capture_sizes[0],
+            max_tokens,
+        )
+
+        # 3. Allocate static input buffers — derive shapes from real tensors
+        device = self._q_b_proj_weight_bf16.device
+        qkv_dim = sample_qkv_latent.shape[-1]
+        hs_dim = sample_hidden_states.shape[-1]
+        bufs = AbsorbPrepareInputBuffers(
+            qkv_latent=torch.zeros(
+                (max_tokens, qkv_dim), dtype=torch.bfloat16, device=device
+            ),
+            hidden_states=torch.zeros(
+                (max_tokens, hs_dim), dtype=torch.bfloat16, device=device
+            ),
+            positions=torch.zeros((max_tokens,), dtype=torch.int64, device=device),
+            seq_lens_expanded=torch.zeros(
+                (max_tokens,), dtype=torch.int32, device=device
+            ),
+            topk_page_table_1=None,
+            topk_token_to_batch_idx=None,
+            topk_indices_offset=None,
+        )
+        # Allocate topk buffers based on method
+        if topk_method == 1:  # PAGED
+            bufs.topk_page_table_1 = torch.zeros(
+                (max_tokens, max_tokens), dtype=torch.int32, device=device
+            )
+            bufs.topk_token_to_batch_idx = torch.zeros(
+                (max_tokens,), dtype=torch.int32, device=device
+            )
+        elif topk_method == 2:  # RAGGED
+            bufs.topk_indices_offset = torch.zeros(
+                (max_tokens, 1), dtype=torch.int32, device=device
+            )
+        self._absorb_static_bufs = bufs
+
+        # 4. Graph pool
+        pool = get_global_graph_memory_pool()
+        if pool is None:
+            pool = torch.cuda.graph_pool_handle()
+            _absorb_logger.debug(
+                "Layer %d: no global graph pool available, created local pool",
+                self.layer_id,
+            )
+
+        # 5. Install torch.compile with SGLang backend (Inductor for fused kernels)
+        dyn_dims = {
+            "qkv_latent": 0,
+            "hidden_states": 0,
+            "positions": 0,
+            "seq_lens_expanded": 0,
+        }
+        if topk_method == 1:
+            dyn_dims["topk_page_table_1"] = 0
+            dyn_dims["topk_token_to_batch_idx"] = 0
+        elif topk_method == 2:
+            dyn_dims["topk_indices_offset"] = 0
+
+        compile_config = CompilationConfig(
+            capture_sizes=capture_sizes,
+            compiler="inductor",
+        )
+        # Create backend explicitly so we can extract CG entries after capture
+        sglang_backend = SGLangBackend(compile_config, pool)
+
+        def backend_factory(gm, ex):
+            return sglang_backend(gm, ex)
+
+        install_torch_compiled(
+            mod,
+            dynamic_arg_dims=dyn_dims,
+            backend_factory=backend_factory,
+            compile_config=compile_config,
+            graph_pool=pool,
+        )
+        _absorb_logger.info(
+            "Layer %d: install_torch_compiled done (compiler=inductor)",
+            self.layer_id,
+        )
+
+        # 6. Warmup + capture lifecycle
+        _absorb_logger.info(
+            "Layer %d: absorb-prepare piecewise CG init — %d capture sizes",
+            self.layer_id,
+            len(capture_sizes),
+        )
+
+        def _make_args(n):
+            """Build static-buffer args sliced to n tokens."""
+            return (
+                bufs.qkv_latent[:n],
+                bufs.hidden_states[:n],
+                bufs.positions[:n],
+                bufs.seq_lens_expanded[:n],
+                bufs.topk_page_table_1[:n] if bufs.topk_page_table_1 is not None else None,
+                bufs.topk_token_to_batch_idx[:n] if bufs.topk_token_to_batch_idx is not None else None,
+                bufs.topk_indices_offset[:n] if bufs.topk_indices_offset is not None else None,
+            )
+
+        with enable_piecewise_cuda_graph():
+            # Each layer compiles its own module instance, which Dynamo counts
+            # against the same bytecode cache. Raise the recompile limit to
+            # accommodate all layers (default is 8, models can have 60+).
+            prev_limit = torch._dynamo.config.recompile_limit
+            torch._dynamo.config.recompile_limit = max(prev_limit, 128)
+
+            # First call: triggers Dynamo tracing via _ensure_compiled + first_run_finished
+            first_size = capture_sizes[0]
+            _absorb_logger.info(
+                "Layer %d: triggering Dynamo tracing (first_size=%d)",
+                self.layer_id,
+                first_size,
+            )
+            mod(*_make_args(first_size))
+            _absorb_logger.info(
+                "Layer %d: Dynamo tracing complete", self.layer_id
+            )
+
+            # Capture phase: 2 calls per size (warmup + capture)
+            stream = torch.cuda.Stream()
+            stream.wait_stream(torch.cuda.current_stream())
+            with set_pcg_capture_stream(stream):
+                for i, size in enumerate(reversed(capture_sizes)):
+                    _absorb_logger.debug(
+                        "Layer %d: capturing size %d (%d/%d)",
+                        self.layer_id,
+                        size,
+                        i + 1,
+                        len(capture_sizes),
+                    )
+                    mod(*_make_args(size))  # warmup
+                    mod(*_make_args(size))  # capture
+            torch.cuda.current_stream().wait_stream(stream)
+
+            torch._dynamo.config.recompile_limit = prev_limit
+
+        _absorb_logger.info(
+            "Layer %d: absorb-prepare piecewise CG capture complete", self.layer_id
+        )
+
+        # 7. Extract CUDA graph entries for direct replay (bypass Dynamo at runtime)
+        # After capture, PiecewiseCompileInterpreter replaces the split_gm's
+        # submodules (stored in __dict__, not as nn.Module children) with
+        # CUDAPiecewiseBackend instances. Walk __dict__ to find them.
+        cg_map = {}  # size -> (cudagraph, output)
+        general_shape_callable = None
+        for attr_name, attr_val in sglang_backend.split_gm.__dict__.items():
+            if isinstance(attr_val, CUDAPiecewiseBackend):
+                general_shape_callable = attr_val.compiled_graph_for_general_shape
+                for size, entry in attr_val.concrete_size_entries.items():
+                    if entry.cudagraph is not None:
+                        cg_map[size] = (entry.cudagraph, entry.output)
+                _absorb_logger.info(
+                    "Layer %d: found CUDAPiecewiseBackend '%s' with %d entries, "
+                    "%d have cudagraphs",
+                    self.layer_id,
+                    attr_name,
+                    len(attr_val.concrete_size_entries),
+                    sum(1 for e in attr_val.concrete_size_entries.values()
+                        if e.cudagraph is not None),
+                )
+                break  # only one piecewise backend (no split ops in our graph)
+
+        if not cg_map:
+            _absorb_logger.warning(
+                "Layer %d: no CUDA graphs captured — will use compiled fallback",
+                self.layer_id,
+            )
+        else:
+            _absorb_logger.info(
+                "Layer %d: extracted %d CUDA graph entries for direct replay",
+                self.layer_id,
+                len(cg_map),
+            )
+
+        self._absorb_cg_map = cg_map
+        self._absorb_general_shape_callable = general_shape_callable
+
     def _forward_absorb_prepare_native(
         self: DeepseekV2AttentionMLA,
         qkv_latent: torch.Tensor,
@@ -646,12 +939,13 @@ class DeepseekMLAForwardMixin:
         metadata,
         llama_4_scaling,
     ):
-        """Dispatch wrapper with manual CUDA graph capture/replay.
+        """Dispatch wrapper using piecewise CUDA graph infrastructure.
 
         Hoists all buffer lookups and Python-level decisions outside
-        the torch.compile boundary, then wraps the compiled
-        _forward_absorb_prepare_native_inner in a manually captured
-        CUDA graph to eliminate torch.compile dispatch overhead.
+        the compile boundary, copies dynamic inputs into static buffers,
+        dispatches through the ForwardAbsorbPrepareModule (whose forward
+        is managed by CUDAPiecewiseBackend for CG capture/replay), then
+        calls the mutating fused_store_index_k_cache_op outside the CG.
         """
         # Hoist metadata access outside compile boundary
         seq_lens_expanded = metadata.get_seqlens_expanded()
@@ -678,133 +972,101 @@ class DeepseekMLAForwardMixin:
             if topk_indices_offset is None:
                 topk_method = 0  # fall back to no transform
 
-        # Helper: build the full args tuple for the compiled inner fn.
-        # Dynamic inputs are either the real tensors or static buffers.
-        def _build_inner_args(
-            qkv, hs, pos, sle, tp1, ttbi, tio,
-        ):
-            return (
-                qkv, hs, pos,
-                # Pre-dequanted BF16 weights (stable data_ptr)
-                self._q_b_proj_weight_bf16,
-                self.indexer._wk_weight_bf16,
-                self._w_kc_bf16,
-                # Norm weights
-                self.q_a_layernorm.weight,
-                self.q_a_layernorm.variance_epsilon,
-                self.kv_a_layernorm.weight,
-                self.kv_a_layernorm.variance_epsilon,
-                self.indexer.k_norm.weight,
-                self.indexer.k_norm.bias,
-                self.indexer.k_norm.variance_epsilon,
-                # RoPE caches
-                self.rotary_emb.cos_sin_cache,
-                self.rotary_emb.is_neox_style,
-                self.indexer.rotary_emb.cos_sin_cache,
-                self.indexer.rotary_emb.is_neox_style,
-                self.indexer.rotary_emb.head_size,
-                self.indexer.rotary_emb.rotary_dim,
-                # Indexer topk args
-                sle,
-                # Topk transform args
-                topk_method,
-                tp1, ttbi, tio,
-                # Shape constants
-                self.q_lora_rank,
-                self.kv_lora_rank,
-                self.qk_rope_head_dim,
-                self.num_local_heads,
-                self.qk_head_dim,
-                self.qk_nope_head_dim,
-                self.indexer.rope_head_dim,
-                self.indexer.head_dim,
-                self.indexer.index_topk,
-                llama_4_scaling,
+        # Lazy init on first call — pass real tensors so buffers match actual shapes
+        if not hasattr(self, "_absorb_prepare_mod"):
+            self._init_absorb_prepare_module(
+                topk_method, qkv_latent, hidden_states,
             )
 
+        bufs = self._absorb_static_bufs
         num_tokens = qkv_latent.shape[0]
-        # Key includes weight data_ptr so cache invalidates on model recreation.
-        w_ptr = self._q_b_proj_weight_bf16.data_ptr()
-        cg_key = (self.layer_id, num_tokens, topk_method, w_ptr)
 
-        # -------------------------------------------------------------- #
-        #  Manual CUDA graph: replay if captured for this shape            #
-        # -------------------------------------------------------------- #
-        entry = _cg_cache.get(cg_key)
-        if entry is not None and entry.get("graph") is not None:
-            # Copy dynamic inputs into static buffers
-            entry["qkv_latent"].copy_(qkv_latent)
-            entry["hidden_states"].copy_(hidden_states)
-            entry["positions"].copy_(positions)
-            entry["seq_lens_expanded"].copy_(seq_lens_expanded)
-            if topk_page_table_1 is not None and entry.get("topk_pt1") is not None:
-                entry["topk_pt1"].copy_(topk_page_table_1)
-            if topk_token_to_batch_idx is not None and entry.get("topk_ttbi") is not None:
-                entry["topk_ttbi"].copy_(topk_token_to_batch_idx)
-            if topk_indices_offset is not None and entry.get("topk_tio") is not None:
-                entry["topk_tio"].copy_(topk_indices_offset)
+        # Round up to next capture size for CG hit
+        capture_sizes = self._absorb_capture_sizes
+        idx = bisect.bisect_left(capture_sizes, num_tokens)
+        if idx < len(capture_sizes):
+            static_n = capture_sizes[idx]
+        else:
+            # Exceeds all capture sizes — dynamic-shape fallback (no CG)
+            static_n = num_tokens
+            _absorb_logger.debug(
+                "Layer %d: num_tokens=%d exceeds max capture size %d, "
+                "falling back to dynamic-shape compiled path",
+                self.layer_id,
+                num_tokens,
+                capture_sizes[-1] if capture_sizes else 0,
+            )
 
-            entry["graph"].replay()
+        # Copy dynamic inputs into static buffers
+        n_sle = seq_lens_expanded.shape[0]
+        bufs.qkv_latent[:num_tokens].copy_(qkv_latent)
+        bufs.hidden_states[:num_tokens].copy_(hidden_states)
+        bufs.positions[:num_tokens].copy_(positions)
+        bufs.seq_lens_expanded[:n_sle].copy_(seq_lens_expanded)
+        if topk_page_table_1 is not None and bufs.topk_page_table_1 is not None:
+            # page_table shape may differ in dim1 — resize buffer if needed
+            if bufs.topk_page_table_1.shape[1] < topk_page_table_1.shape[1]:
+                bufs.topk_page_table_1 = torch.zeros_like(topk_page_table_1).expand(
+                    bufs.topk_page_table_1.shape[0], -1
+                ).contiguous()
+            bufs.topk_page_table_1[:n_sle, :topk_page_table_1.shape[1]].copy_(
+                topk_page_table_1[:n_sle]
+            )
+        if topk_token_to_batch_idx is not None and bufs.topk_token_to_batch_idx is not None:
+            bufs.topk_token_to_batch_idx[:n_sle].copy_(topk_token_to_batch_idx[:n_sle])
+        if topk_indices_offset is not None and bufs.topk_indices_offset is not None:
+            bufs.topk_indices_offset[:n_sle].copy_(topk_indices_offset[:n_sle])
 
-            q_pe, k_pe, q_nope_out, k_nope, topk_indices, _, key = entry["output"]
-            fused_store_index_k_cache_op(key, index_k_buf, out_cache_loc, page_size)
-            return q_pe, k_pe, q_nope_out, k_nope, topk_indices, llama_4_scaling
+        # Zero-pad if we rounded up
+        if static_n > num_tokens:
+            bufs.qkv_latent[num_tokens:static_n].zero_()
+            bufs.hidden_states[num_tokens:static_n].zero_()
+            bufs.positions[num_tokens:static_n].zero_()
+        if static_n > n_sle:
+            bufs.seq_lens_expanded[n_sle:static_n].zero_()
 
-        # -------------------------------------------------------------- #
-        #  Capture: first call for this key → warmup + record CUDA graph   #
-        # -------------------------------------------------------------- #
-        # Allocate static input buffers (clone to get same shape/dtype)
-        static_qkv = qkv_latent.clone()
-        static_hs = hidden_states.clone()
-        static_pos = positions.clone()
-        static_sle = seq_lens_expanded.clone()
-        static_pt1 = topk_page_table_1.clone() if topk_page_table_1 is not None else None
-        static_ttbi = (
-            topk_token_to_batch_idx.clone()
-            if topk_token_to_batch_idx is not None
-            else None
-        )
-        static_tio = (
-            topk_indices_offset.clone()
-            if topk_indices_offset is not None
-            else None
-        )
+        # Prepare topk buffer slices for dispatch
+        s_pt1 = bufs.topk_page_table_1[:n_sle] if bufs.topk_page_table_1 is not None else None
+        s_ttbi = bufs.topk_token_to_batch_idx[:n_sle] if bufs.topk_token_to_batch_idx is not None else None
+        s_tio = bufs.topk_indices_offset[:n_sle] if bufs.topk_indices_offset is not None else None
 
-        args = _build_inner_args(
-            static_qkv, static_hs, static_pos, static_sle,
-            static_pt1, static_ttbi, static_tio,
-        )
+        # Direct CG replay — bypasses Dynamo trampoline entirely
+        cg_entry = self._absorb_cg_map.get(static_n)
+        if cg_entry is not None:
+            # Replay the captured CUDA graph directly
+            cudagraph, output = cg_entry
+            cudagraph.replay()
+            q_pe, k_pe, q_nope_out, k_nope, topk_indices, key = output
+        else:
+            # Fallback for uncaptured sizes (exceeds max capture size) —
+            # go through Dynamo module (rare path, not perf-critical)
+            args = (
+                bufs.qkv_latent[:static_n],
+                bufs.hidden_states[:static_n],
+                bufs.positions[:static_n],
+                bufs.seq_lens_expanded[:static_n],
+                s_pt1,
+                s_ttbi,
+                s_tio,
+            )
+            with enable_piecewise_cuda_graph():
+                q_pe, k_pe, q_nope_out, k_nope, topk_indices, key = (
+                    self._absorb_prepare_mod(*args)
+                )
 
-        # Warmup the compiled fn with static buffers (triggers torch.compile
-        # tracing on first ever call; stabilises kernel addresses on second).
-        _forward_absorb_prepare_native_inner(*args)
-        _forward_absorb_prepare_native_inner(*args)
+        # Slice back to actual num_tokens if we rounded up
+        if static_n > num_tokens:
+            q_pe = q_pe[:num_tokens]
+            k_pe = k_pe[:num_tokens]
+            q_nope_out = q_nope_out[:num_tokens]
+            k_nope = k_nope[:num_tokens]
+            key = key[:num_tokens]
+        if static_n > n_sle:
+            topk_indices = topk_indices[:n_sle]
 
-        # Capture
-        graph = torch.cuda.CUDAGraph()
-        pool = torch.cuda.graph_pool_handle()
-        s = torch.cuda.Stream()
-        s.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(s):
-            with torch.cuda.graph(graph, pool=pool, stream=s):
-                output = _forward_absorb_prepare_native_inner(*args)
-        torch.cuda.current_stream().wait_stream(s)
-
-        _cg_cache[cg_key] = {
-            "graph": graph,
-            "output": output,
-            "qkv_latent": static_qkv,
-            "hidden_states": static_hs,
-            "positions": static_pos,
-            "seq_lens_expanded": static_sle,
-            "topk_pt1": static_pt1,
-            "topk_ttbi": static_ttbi,
-            "topk_tio": static_tio,
-        }
-
-        # Output is already populated from the capture run
-        q_pe, k_pe, q_nope_out, k_nope, topk_indices, _, key = output
+        # Mutating op — outside the CG boundary
         fused_store_index_k_cache_op(key, index_k_buf, out_cache_loc, page_size)
+
         return q_pe, k_pe, q_nope_out, k_nope, topk_indices, llama_4_scaling
 
     def forward_absorb_core(
