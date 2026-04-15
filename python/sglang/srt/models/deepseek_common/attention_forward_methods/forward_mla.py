@@ -85,7 +85,6 @@ if _use_aiter_gfx95:
 # ------------------------------------------------------------------ #
 
 if _is_cuda:
-    import bisect
     import logging
     import threading
     from dataclasses import dataclass
@@ -332,6 +331,7 @@ if _is_cuda:
                     "triton.enable_pdl": True,
                     "max_autotune_gemm": True,
                     "combo_kernels": True,
+                    "trace.enabled": True,
                 },
             )
 
@@ -402,33 +402,54 @@ class DeepseekMLAForwardMixin:
                     out_cache_loc = out_cache_loc.contiguous()
                 page_size = forward_batch.token_to_kv_pool.page_size
 
-                q_pe, k_pe, q_nope_out, k_nope, topk_indices, llama_4_scaling = (
-                    self._forward_absorb_prepare_native(
-                        qkv_latent,
-                        hidden_states,
-                        positions,
-                        forward_batch,
-                        zero_allocator,
-                        index_k_buf,
-                        out_cache_loc,
-                        page_size,
-                        metadata,
-                        llama_4_scaling,
-                    )
-                )
-
-                return (
-                    q_pe,
-                    k_pe,
-                    q_nope_out,
-                    k_nope,
+                result = self._forward_absorb_prepare_native(
+                    qkv_latent,
+                    hidden_states,
+                    positions,
                     forward_batch,
                     zero_allocator,
-                    positions,
-                    topk_indices,
+                    index_k_buf,
+                    out_cache_loc,
+                    page_size,
+                    metadata,
                     llama_4_scaling,
                 )
-            # metadata is None → fall through to the default path
+
+                if result is not None:
+                    if self.layer_id == 0:
+                        print(f"[COMPILE] Layer 0: COMPILED path — num_tokens={hidden_states.shape[0]}")
+                    q_pe, k_pe, q_nope_out, k_nope, topk_indices, llama_4_scaling = (
+                        result
+                    )
+                    return (
+                        q_pe,
+                        k_pe,
+                        q_nope_out,
+                        k_nope,
+                        forward_batch,
+                        zero_allocator,
+                        positions,
+                        topk_indices,
+                        llama_4_scaling,
+                    )
+                else:
+                    if self.layer_id == 0:
+                        print(f"[COMPILE] Layer 0: FALLBACK (num_tokens={hidden_states.shape[0]} > buf={getattr(self, '_absorb_static_bufs', None) and self._absorb_static_bufs.qkv_latent.shape[0]})")
+            else:
+                if self.layer_id == 0:
+                    print(f"[COMPILE] Layer 0: FALLBACK (metadata is None)")
+        else:
+            if self.layer_id == 0 and _is_cuda and envs.SGLANG_TORCH_COMPILE_INDEXER.get() and forward_batch.forward_mode.is_extend():
+                reasons = []
+                if forward_batch.seq_lens_cpu is None:
+                    reasons.append("seq_lens_cpu=None")
+                elif forward_batch.seq_lens_cpu.max().item() > self.indexer.index_topk:
+                    reasons.append(f"max_seq_len={forward_batch.seq_lens_cpu.max().item()} > index_topk={self.indexer.index_topk}")
+                if not nsa_use_prefill_cp(forward_batch):
+                    pass  # expected
+                else:
+                    reasons.append("nsa_use_prefill_cp=True")
+                print(f"[COMPILE] Layer 0: FALLBACK (guard failed: {', '.join(reasons) or 'other'})")
 
         q_lora = None
         topk_indices = None
@@ -717,22 +738,14 @@ class DeepseekMLAForwardMixin:
             self.register_buffer("_w_kc_bf16", self.w_kc.to(torch.bfloat16))
 
     def _get_absorb_capture_sizes(self: DeepseekV2AttentionMLA):
-        """Determine capture sizes for the absorb-prepare CG from server_args."""
+        """Determine the buffer/capture size for the absorb-prepare CG.
+
+        Uses chunked_prefill_size as the upper bound since that is the max
+        number of tokens in a single extend step.
+        """
         server_args = get_global_server_args()
-        sizes = server_args.piecewise_cuda_graph_tokens
-        if sizes is None:
-            # Fall back: generate capture sizes with a reasonable max
-            max_tokens = getattr(server_args, "chunked_prefill_size", 0) or 8192
-            sizes = (
-                list(range(4, 33, 4))
-                + list(range(48, 257, 16))
-                + list(range(288, 513, 32))
-                + list(range(576, 1025, 64))
-                + list(range(1280, 4097, 256))
-                + list(range(4608, max_tokens + 1, 512))
-            )
-            sizes = [s for s in sizes if s <= max_tokens]
-        return sorted(sizes)
+        max_tokens = getattr(server_args, "chunked_prefill_size", 0) or 8192
+        return max_tokens
 
     def _init_absorb_prepare_module(
         self: DeepseekV2AttentionMLA,
@@ -751,18 +764,14 @@ class DeepseekMLAForwardMixin:
             sample_qkv_latent: a real qkv_latent tensor to derive shapes from.
             sample_hidden_states: a real hidden_states tensor to derive shapes from.
         """
-        # 1. Capture sizes
-        capture_sizes = self._get_absorb_capture_sizes()
-        self._absorb_capture_sizes = capture_sizes
-        max_tokens = max(capture_sizes)
+        # 1. Buffer size = chunked_prefill_size (max tokens per extend step)
+        max_tokens = self._get_absorb_capture_sizes()
 
         _absorb_logger.info(
             "Layer %d: absorb-prepare init — topk_method=%d, "
-            "%d capture sizes (min=%d, max=%d)",
+            "max_tokens=%d",
             self.layer_id,
             topk_method,
-            len(capture_sizes),
-            capture_sizes[0],
             max_tokens,
         )
 
@@ -770,6 +779,9 @@ class DeepseekMLAForwardMixin:
         device = self._q_b_proj_weight_bf16.device
         qkv_dim = sample_qkv_latent.shape[-1]
         hs_dim = sample_hidden_states.shape[-1]
+        index_topk = self.indexer.index_topk
+        server_args = get_global_server_args()
+        max_bs = server_args.cuda_graph_max_bs or 512
         bufs = AbsorbPrepareInputBuffers(
             qkv_latent=torch.zeros(
                 (max_tokens, qkv_dim), dtype=torch.bfloat16, device=device
@@ -786,9 +798,10 @@ class DeepseekMLAForwardMixin:
             topk_indices_offset=None,
         )
         # Allocate topk buffers based on method
+        # page_table_1: (batch_size, max_seq_len) — dim-0 is batch, dim-1 bounded by index_topk
         if topk_method == 1:  # PAGED
             bufs.topk_page_table_1 = torch.zeros(
-                (max_tokens, max_tokens), dtype=torch.int32, device=device
+                (max_bs, index_topk), dtype=torch.int32, device=device
             )
             bufs.topk_token_to_batch_idx = torch.zeros(
                 (max_tokens,), dtype=torch.int32, device=device
@@ -829,64 +842,45 @@ class DeepseekMLAForwardMixin:
                 self.layer_id,
             )
 
-        # 6. Manual CUDA graph capture
-        # Mark dynamic dims on static buffers so the first warmup call
-        # triggers Dynamo tracing with dynamic batch dimension.
+        # 6. Manual CUDA graph capture — single graph at max_tokens
         _absorb_logger.info(
-            "Layer %d: capturing %d CUDA graph sizes", self.layer_id, len(capture_sizes),
+            "Layer %d: capturing single CUDA graph at size %d", self.layer_id, max_tokens,
         )
-        # for buf in (bufs.qkv_latent, bufs.hidden_states, bufs.positions,
-        #             bufs.seq_lens_expanded, bufs.topk_page_table_1,
-        #             bufs.topk_token_to_batch_idx, bufs.topk_indices_offset):
-        #     if buf is not None:
-        #         torch._dynamo.maybe_mark_dynamic(buf, 0)
 
         def _make_full_args(n):
-            """Build (dynamic_inputs..., weights...) sliced to n tokens."""
+            """Build (dynamic_inputs..., weights...) sliced to n tokens.
+
+            topk_page_table_1 is passed in full (batch_size x index_topk)
+            since it's indexed by batch_idx, not by token count.
+            """
             return (
                 bufs.qkv_latent[:n],
                 bufs.hidden_states[:n],
                 bufs.positions[:n],
                 bufs.seq_lens_expanded[:n],
-                bufs.topk_page_table_1[:n] if bufs.topk_page_table_1 is not None else bufs.qkv_latent[:n, :1].to(torch.int32),
+                bufs.topk_page_table_1 if bufs.topk_page_table_1 is not None else bufs.qkv_latent[:n, :1].to(torch.int32),
                 bufs.topk_token_to_batch_idx[:n] if bufs.topk_token_to_batch_idx is not None else bufs.positions[:n].to(torch.int32),
                 bufs.topk_indices_offset[:n] if bufs.topk_indices_offset is not None else bufs.seq_lens_expanded[:n].unsqueeze(1),
                 *weights,
             )
 
-        cg_map = {}
         stream = torch.cuda.Stream()
         stream.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(stream):
-            for i, size in enumerate(reversed(capture_sizes)):
-                args = _make_full_args(size)
-                # Warmup call
-                compiled_fn(*args)
-                # Capture call
-                cudagraph = torch.cuda.CUDAGraph()
-                with torch.cuda.graph(cudagraph, pool=pool, stream=stream):
-                    output = compiled_fn(*args)
-                cg_map[size] = (cudagraph, weak_ref_tensors(output))
-                if (i + 1) % 10 == 0:
-                    _absorb_logger.debug(
-                        "Layer %d: captured %d/%d sizes",
-                        self.layer_id, i + 1, len(capture_sizes),
-                    )
+            args = _make_full_args(max_tokens)
+            # Warmup call
+            compiled_fn(*args)
+            # Capture call
+            cudagraph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(cudagraph, pool=pool, stream=stream):
+                output = compiled_fn(*args)
+            self._absorb_cudagraph = (cudagraph, weak_ref_tensors(output))
         torch.cuda.current_stream().wait_stream(stream)
 
-        if not cg_map:
-            _absorb_logger.warning(
-                "Layer %d: no CUDA graphs captured — will use compiled fallback",
-                self.layer_id,
-            )
-        else:
-            _absorb_logger.info(
-                "Layer %d: captured %d CUDA graph entries for direct replay",
-                self.layer_id,
-                len(cg_map),
-            )
-
-        self._absorb_cg_map = cg_map
+        _absorb_logger.info(
+            "Layer %d: CUDA graph captured for direct replay",
+            self.layer_id,
+        )
 
     def _forward_absorb_prepare_native(
         self: DeepseekV2AttentionMLA,
@@ -942,89 +936,61 @@ class DeepseekMLAForwardMixin:
 
         bufs = self._absorb_static_bufs
         num_tokens = qkv_latent.shape[0]
+        max_buf_tokens = bufs.qkv_latent.shape[0]
 
-        # Round up to next capture size for CG hit
-        capture_sizes = self._absorb_capture_sizes
-        idx = bisect.bisect_left(capture_sizes, num_tokens)
-        if idx < len(capture_sizes):
-            static_n = capture_sizes[idx]
-        else:
-            # Exceeds all capture sizes — dynamic-shape fallback (no CG)
-            static_n = num_tokens
+        # If num_tokens exceeds the static buffer size, we cannot use the
+        # compiled/CG path — signal the caller to fall back.
+        if num_tokens > max_buf_tokens:
             _absorb_logger.debug(
-                "Layer %d: num_tokens=%d exceeds max capture size %d, "
-                "falling back to dynamic-shape compiled path",
+                "Layer %d: num_tokens=%d exceeds buffer size %d, "
+                "falling back to default path",
                 self.layer_id,
                 num_tokens,
-                capture_sizes[-1] if capture_sizes else 0,
+                max_buf_tokens,
             )
+            return None
 
-        # Copy dynamic inputs into static buffers
+        # Copy dynamic inputs into static buffers (always replay at max_buf_tokens)
         n_sle = seq_lens_expanded.shape[0]
         bufs.qkv_latent[:num_tokens].copy_(qkv_latent)
         bufs.hidden_states[:num_tokens].copy_(hidden_states)
         bufs.positions[:num_tokens].copy_(positions)
         bufs.seq_lens_expanded[:n_sle].copy_(seq_lens_expanded)
         if topk_page_table_1 is not None and bufs.topk_page_table_1 is not None:
+            n_pt1 = topk_page_table_1.shape[0]
             # page_table shape may differ in dim1 — resize buffer if needed
             if bufs.topk_page_table_1.shape[1] < topk_page_table_1.shape[1]:
                 bufs.topk_page_table_1 = torch.zeros_like(topk_page_table_1).expand(
                     bufs.topk_page_table_1.shape[0], -1
                 ).contiguous()
-            bufs.topk_page_table_1[:n_sle, :topk_page_table_1.shape[1]].copy_(
-                topk_page_table_1[:n_sle]
+            bufs.topk_page_table_1[:n_pt1, :topk_page_table_1.shape[1]].copy_(
+                topk_page_table_1
             )
         if topk_token_to_batch_idx is not None and bufs.topk_token_to_batch_idx is not None:
             bufs.topk_token_to_batch_idx[:n_sle].copy_(topk_token_to_batch_idx[:n_sle])
         if topk_indices_offset is not None and bufs.topk_indices_offset is not None:
             bufs.topk_indices_offset[:n_sle].copy_(topk_indices_offset[:n_sle])
 
-        # Zero-pad if we rounded up
-        if static_n > num_tokens:
-            bufs.qkv_latent[num_tokens:static_n].zero_()
-            bufs.hidden_states[num_tokens:static_n].zero_()
-            bufs.positions[num_tokens:static_n].zero_()
-        if static_n > n_sle:
-            bufs.seq_lens_expanded[n_sle:static_n].zero_()
+        # Zero-pad the remainder up to max_buf_tokens
+        if num_tokens < max_buf_tokens:
+            bufs.qkv_latent[num_tokens:].zero_()
+            bufs.hidden_states[num_tokens:].zero_()
+            bufs.positions[num_tokens:].zero_()
+        if n_sle < max_buf_tokens:
+            bufs.seq_lens_expanded[n_sle:].zero_()
 
-        # Prepare topk buffer slices for dispatch
-        s_pt1 = bufs.topk_page_table_1[:n_sle] if bufs.topk_page_table_1 is not None else None
-        s_ttbi = bufs.topk_token_to_batch_idx[:n_sle] if bufs.topk_token_to_batch_idx is not None else None
-        s_tio = bufs.topk_indices_offset[:n_sle] if bufs.topk_indices_offset is not None else None
+        # Replay the single captured CUDA graph at max_buf_tokens
+        cudagraph, output = self._absorb_cudagraph
+        cudagraph.replay()
+        q_pe, k_pe, q_nope_out, k_nope, topk_indices, key = output
 
-        # Direct CG replay — bypasses Dynamo trampoline entirely
-        cg_entry = self._absorb_cg_map.get(static_n)
-        if cg_entry is not None:
-            # Replay the captured CUDA graph directly
-            cudagraph, output = cg_entry
-            cudagraph.replay()
-            q_pe, k_pe, q_nope_out, k_nope, topk_indices, key = output
-        else:
-            # Fallback for uncaptured sizes (exceeds max capture size) —
-            # call compiled function directly (rare path, not perf-critical)
-            args = (
-                bufs.qkv_latent[:static_n],
-                bufs.hidden_states[:static_n],
-                bufs.positions[:static_n],
-                bufs.seq_lens_expanded[:static_n],
-                s_pt1 if s_pt1 is not None else bufs.qkv_latent[:static_n, :1].to(torch.int32),
-                s_ttbi if s_ttbi is not None else bufs.positions[:static_n].to(torch.int32),
-                s_tio if s_tio is not None else bufs.seq_lens_expanded[:static_n].unsqueeze(1),
-                *self._absorb_weights,
-            )
-            q_pe, k_pe, q_nope_out, k_nope, topk_indices, key = (
-                self._absorb_compiled_fn(*args)
-            )
-
-        # Slice back to actual num_tokens if we rounded up
-        if static_n > num_tokens:
-            q_pe = q_pe[:num_tokens]
-            k_pe = k_pe[:num_tokens]
-            q_nope_out = q_nope_out[:num_tokens]
-            k_nope = k_nope[:num_tokens]
-            key = key[:num_tokens]
-        if static_n > n_sle:
-            topk_indices = topk_indices[:n_sle]
+        # Slice back to actual sizes
+        q_pe = q_pe[:num_tokens]
+        k_pe = k_pe[:num_tokens]
+        q_nope_out = q_nope_out[:num_tokens]
+        k_nope = k_nope[:num_tokens]
+        key = key[:num_tokens]
+        topk_indices = topk_indices[:n_sle]
 
         # Mutating op — outside the CG boundary
         fused_store_index_k_cache_op(key, index_k_buf, out_cache_loc, page_size)
