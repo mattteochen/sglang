@@ -542,7 +542,7 @@ class DeepseekMLAForwardMixin:
                 )
                 attn_bmm_output = attn_bmm_output.transpose(0, 1).flatten(1, 2)
         else:
-            if is_in_piecewise_cuda_graph():
+            if is_in_piecewise_cuda_graph() or torch._dynamo.is_compiling():
                 # torch dynamo requires out= op was called where output tensor was non-contiguous
                 attn_bmm_output = (
                     torch.bmm(attn_output.transpose(0, 1), self.w_vc)

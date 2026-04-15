@@ -240,11 +240,24 @@ class Indexer(MultiPlatformOp):
         self.softmax_scale = self.head_dim**-0.5
         self._wk_native_weight_bf16: Optional[torch.Tensor] = None
         self._wk_native_bias_bf16: Optional[torch.Tensor] = None
+        self._native_index_k_with_scale_buffer: Optional[torch.Tensor] = None
+        self._native_index_page_size: Optional[int] = None
 
     def prepare_native_compile_state(self, forward_batch: Optional[ForwardBatch] = None):
         # Avoid a first-run None -> Tensor guard inside torch.compile by
         # materializing the bf16 weight cache ahead of tracing.
         self._get_wk_native_weight_bf16()
+        if (
+            forward_batch is not None
+            and getattr(forward_batch, "token_to_kv_pool", None) is not None
+            and hasattr(forward_batch.token_to_kv_pool, "get_index_k_with_scale_buffer")
+        ):
+            self._native_index_k_with_scale_buffer = (
+                forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                    layer_id=self.layer_id
+                )
+            )
+            self._native_index_page_size = forward_batch.token_to_kv_pool.page_size
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -578,7 +591,9 @@ class Indexer(MultiPlatformOp):
         if TYPE_CHECKING:
             assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
 
-        page_size = forward_batch.token_to_kv_pool.page_size
+        page_size = self._native_index_page_size
+        if page_size is None:
+            page_size = forward_batch.token_to_kv_pool.page_size
         if (not _is_cuda) or _is_fp8_fnuz:
             raise NotImplementedError(
                 "Indexer forward_native short-ISL path requires the fused NSA "
@@ -588,9 +603,11 @@ class Indexer(MultiPlatformOp):
         out_loc = forward_batch.out_cache_loc
         if not out_loc.is_contiguous():
             out_loc = out_loc.contiguous()
-        buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
-            layer_id=layer_id
-        )
+        buf = self._native_index_k_with_scale_buffer
+        if buf is None:
+            buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                layer_id=layer_id
+            )
         fused_store_index_k_cache(key, buf, out_loc, page_size)
 
     def _forward_native_k_only(
@@ -639,9 +656,11 @@ class Indexer(MultiPlatformOp):
             block_tables = metadata.get_page_table_64()
 
         max_seq_len = block_tables.shape[1] * page_size
-        kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
-            layer_id=layer_id
-        )
+        kv_cache_fp8 = self._native_index_k_with_scale_buffer
+        if kv_cache_fp8 is None:
+            kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                layer_id=layer_id
+            )
 
         blocksize = page_size
         if (
@@ -1221,9 +1240,11 @@ class Indexer(MultiPlatformOp):
             )
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
-            buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
-                layer_id=layer_id
-            )
+            buf = self._native_index_k_with_scale_buffer
+            if buf is None:
+                buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                    layer_id=layer_id
+                )
             fused_store_index_k_cache(
                 key,
                 buf,

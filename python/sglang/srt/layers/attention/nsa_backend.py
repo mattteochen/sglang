@@ -1463,12 +1463,27 @@ class NativeSparseAttnBackend(
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                forward_batch.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
-                    layer,
-                    cache_loc,
-                    k,
-                    k_rope,
+                cached_kv_buffer = getattr(
+                    layer, "_experimental_prefill_kv_buffer_storage", None
                 )
+                if cached_kv_buffer is not None:
+                    _set_mla_kv_buffer_direct(
+                        cached_kv_buffer,
+                        cache_loc,
+                        k,
+                        k_rope,
+                        dtype=layer._experimental_prefill_kv_cache_dtype,
+                        store_dtype=layer._experimental_prefill_kv_store_dtype,
+                        nsa_kv_cache_store_fp8=layer._experimental_prefill_nsa_kv_cache_store_fp8,
+                        use_nsa=layer._experimental_prefill_use_nsa,
+                    )
+                else:
+                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
+                        layer,
+                        cache_loc,
+                        k,
+                        k_rope,
+                    )
 
         # Use MHA kernel if in MHA_ONE_SHOT mode
         if self.use_mha:
@@ -1663,12 +1678,27 @@ class NativeSparseAttnBackend(
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                forward_batch.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
-                    layer,
-                    cache_loc,
-                    k,
-                    k_rope,
+                cached_kv_buffer = getattr(
+                    layer, "_experimental_prefill_kv_buffer_storage", None
                 )
+                if cached_kv_buffer is not None:
+                    _set_mla_kv_buffer_direct(
+                        cached_kv_buffer,
+                        cache_loc,
+                        k,
+                        k_rope,
+                        dtype=layer._experimental_prefill_kv_cache_dtype,
+                        store_dtype=layer._experimental_prefill_kv_store_dtype,
+                        nsa_kv_cache_store_fp8=layer._experimental_prefill_nsa_kv_cache_store_fp8,
+                        use_nsa=layer._experimental_prefill_use_nsa,
+                    )
+                else:
+                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
+                        layer,
+                        cache_loc,
+                        k,
+                        k_rope,
+                    )
 
         # Do absorbed multi-latent attention
         kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
