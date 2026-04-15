@@ -1,3 +1,5 @@
+from typing import Tuple
+
 import torch
 import triton
 import triton.language as tl
@@ -11,6 +13,9 @@ _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import concat_mla_absorb_q
+    from sglang.srt.utils.custom_op import register_custom_op
+else:
+    register_custom_op = lambda *args, **kwargs: (lambda fn: fn)
 
 
 @triton.jit
@@ -382,6 +387,31 @@ def canonicalize_stride(tensor: torch.Tensor) -> torch.Tensor:
     return tensor.as_strided(sizes, new_strides)
 
 
+def _fake_mla_quantize_and_rope_for_fp8(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    pos_ids: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    del pos_ids, cos_sin_cache, is_neox
+    q_len, num_heads = q_rope.shape[:2]
+    attn_dtype = torch.float8_e4m3fn
+    return (
+        q_rope.new_empty(
+            (q_len, num_heads, kv_lora_rank + qk_rope_head_dim),
+            dtype=attn_dtype,
+        ),
+        k_nope.new_empty(k_nope.shape, dtype=attn_dtype),
+        k_rope.new_empty(k_rope.shape, dtype=attn_dtype),
+    )
+
+
+@register_custom_op(fake_impl=_fake_mla_quantize_and_rope_for_fp8)
 def mla_quantize_and_rope_for_fp8(
     q_nope: torch.Tensor,
     q_rope: torch.Tensor,
@@ -392,7 +422,7 @@ def mla_quantize_and_rope_for_fp8(
     is_neox: bool,
     kv_lora_rank: int,
     qk_rope_head_dim: int,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     import flashinfer.rope
 
     """Quantize and apply RoPE for FP8 attention path.

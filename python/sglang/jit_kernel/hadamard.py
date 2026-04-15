@@ -5,6 +5,7 @@ from typing import TYPE_CHECKING, Callable
 import torch
 
 from sglang.jit_kernel.utils import KERNEL_PATH, cache_once, load_jit, make_cpp_args
+from sglang.srt.utils.custom_op import register_custom_op
 
 if TYPE_CHECKING:
     from tvm_ffi.module import Module
@@ -56,26 +57,31 @@ def _hadamard_transform_impl(
     return out.reshape(shapes_og)
 
 
+@register_custom_op(out_shape="x")
 def hadamard_transform(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     module = _jit_hadamard_module(x.dtype)
     return _hadamard_transform_impl(x, scale, 8, module.hadamard_transform)
 
 
+@register_custom_op(out_shape="x")
 def hadamard_transform_12n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     module = _jit_hadamard_module(x.dtype)
     return _hadamard_transform_impl(x, scale, 4 * 12, module.hadamard_transform_12n)
 
 
+@register_custom_op(out_shape="x")
 def hadamard_transform_20n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     module = _jit_hadamard_module(x.dtype)
     return _hadamard_transform_impl(x, scale, 4 * 20, module.hadamard_transform_20n)
 
 
+@register_custom_op(out_shape="x")
 def hadamard_transform_28n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     module = _jit_hadamard_module(x.dtype)
     return _hadamard_transform_impl(x, scale, 4 * 28, module.hadamard_transform_28n)
 
 
+@register_custom_op(out_shape="x")
 def hadamard_transform_40n(x: torch.Tensor, scale: float = 1.0) -> torch.Tensor:
     module = _jit_hadamard_module(x.dtype)
     return _hadamard_transform_impl(x, scale, 4 * 40, module.hadamard_transform_40n)

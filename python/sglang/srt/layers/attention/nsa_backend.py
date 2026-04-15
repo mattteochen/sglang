@@ -16,7 +16,10 @@ from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
     compute_cu_seqlens,
 )
 from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
-from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
+from sglang.srt.layers.attention.nsa.quant_k_cache import (
+    quantize_k_cache,
+    quantize_k_cache_separate,
+)
 from sglang.srt.layers.attention.nsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
@@ -35,6 +38,11 @@ from sglang.srt.layers.attention.utils import (
     seqlens_expand_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+from sglang.srt.mem_cache.utils import (
+    set_mla_kv_buffer_triton,
+    set_mla_kv_buffer_triton_fp8_quant,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip
 
@@ -45,6 +53,7 @@ if TYPE_CHECKING:
 
 
 _is_hip = is_hip()
+_is_cuda = is_cuda()
 
 if _is_hip:
     from sglang.srt.layers.attention.nsa.triton_kernel import get_valid_kv_indices
@@ -64,6 +73,126 @@ else:
     from sglang.jit_kernel.flash_attention import (
         flash_attn_varlen_func,
         flash_attn_with_kvcache,
+    )
+
+if _is_cuda:
+    from sglang.srt.utils.custom_op import register_custom_op
+
+    def _fake_trtllm_batch_decode_with_kv_cache_mla(
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        qk_nope_head_dim: int,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_seq_len: int,
+        sparse_mla_top_k: int,
+        bmm1_scale: float,
+        skip_softmax_threshold_scale_factor: Optional[float],
+        v_head_dim: int,
+    ) -> torch.Tensor:
+        del (
+            kv_cache,
+            workspace_buffer,
+            qk_nope_head_dim,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            block_tables,
+            seq_lens,
+            max_seq_len,
+            sparse_mla_top_k,
+            bmm1_scale,
+            skip_softmax_threshold_scale_factor,
+        )
+        return query.new_empty(
+            (*query.shape[:-1], v_head_dim), dtype=torch.bfloat16
+        )
+
+    @register_custom_op(fake_impl=_fake_trtllm_batch_decode_with_kv_cache_mla)
+    def _trtllm_batch_decode_with_kv_cache_mla_op(
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        qk_nope_head_dim: int,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_seq_len: int,
+        sparse_mla_top_k: int,
+        bmm1_scale: float,
+        skip_softmax_threshold_scale_factor: Optional[float],
+        v_head_dim: int,
+    ) -> torch.Tensor:
+        import flashinfer.decode
+
+        del v_head_dim
+        return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=query,
+            kv_cache=kv_cache,
+            workspace_buffer=workspace_buffer,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            sparse_mla_top_k=sparse_mla_top_k,
+            bmm1_scale=bmm1_scale,
+            backend="trtllm-gen",
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        )
+else:
+    _trtllm_batch_decode_with_kv_cache_mla_op = None
+
+
+def _set_mla_kv_buffer_direct(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    store_dtype: torch.dtype,
+    nsa_kv_cache_store_fp8: bool,
+    use_nsa: bool,
+) -> None:
+    if _is_hip and use_nsa and dtype == fp8_dtype:
+        set_mla_kv_buffer_triton_fp8_quant(
+            kv_buffer,
+            loc,
+            cache_k_nope,
+            cache_k_rope,
+            fp8_dtype,
+        )
+        return
+
+    if nsa_kv_cache_store_fp8:
+        cache_k_nope_fp8, cache_k_rope_fp8 = quantize_k_cache_separate(
+            cache_k_nope, cache_k_rope
+        )
+        set_mla_kv_buffer_triton(
+            kv_buffer,
+            loc,
+            cache_k_nope_fp8,
+            cache_k_rope_fp8,
+        )
+        return
+
+    if cache_k_nope.dtype != dtype:
+        cache_k_nope = cache_k_nope.to(dtype)
+        cache_k_rope = cache_k_rope.to(dtype)
+    if store_dtype != dtype:
+        cache_k_nope = cache_k_nope.view(store_dtype)
+        cache_k_rope = cache_k_rope.view(store_dtype)
+
+    set_mla_kv_buffer_triton(
+        kv_buffer,
+        loc,
+        cache_k_nope,
+        cache_k_rope,
     )
 
 
@@ -2012,8 +2141,6 @@ class NativeSparseAttnBackend(
         is_prefill: bool = False,
     ) -> torch.Tensor:
         """Forward using TRT-LLM sparse MLA kernel."""
-        import flashinfer.decode
-
         metadata = self.forward_metadata
 
         merge_query = q_rope is not None
@@ -2049,11 +2176,28 @@ class NativeSparseAttnBackend(
                 if not layer.is_cross_attention
                 else forward_batch.encoder_out_cache_loc
             )
-            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
-                layer, cache_loc, k, k_rope
+            cached_kv_buffer = getattr(
+                layer, "_experimental_prefill_kv_buffer_storage", None
             )
+            if cached_kv_buffer is not None:
+                _set_mla_kv_buffer_direct(
+                    cached_kv_buffer,
+                    cache_loc,
+                    k,
+                    k_rope,
+                    dtype=layer._experimental_prefill_kv_cache_dtype,
+                    store_dtype=layer._experimental_prefill_kv_store_dtype,
+                    nsa_kv_cache_store_fp8=layer._experimental_prefill_nsa_kv_cache_store_fp8,
+                    use_nsa=layer._experimental_prefill_use_nsa,
+                )
+            else:
+                forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                    layer, cache_loc, k, k_rope
+                )
 
-        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_cache = getattr(layer, "_experimental_prefill_kv_buffer_view", None)
+        if k_cache is None:
+            k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim).unsqueeze(1)
 
         if merge_query:
@@ -2101,7 +2245,7 @@ class NativeSparseAttnBackend(
         block_tables = page_table_1.unsqueeze(1)
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
 
-        out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+        out = _trtllm_batch_decode_with_kv_cache_mla_op(
             query=q,
             kv_cache=kv,
             workspace_buffer=self.workspace_buffer,
@@ -2113,8 +2257,8 @@ class NativeSparseAttnBackend(
             max_seq_len=metadata.max_seq_len_k,
             sparse_mla_top_k=self.nsa_index_topk,
             bmm1_scale=bmm1_scale,
-            backend="trtllm-gen",
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+            v_head_dim=layer.v_head_dim,
         )
         # Output: [batch, q_len=1, heads, v_dim] -> [batch, heads, v_dim]
         return out.squeeze(1)

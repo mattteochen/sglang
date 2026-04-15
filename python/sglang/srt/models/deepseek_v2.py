@@ -18,6 +18,7 @@
 
 from __future__ import annotations
 
+import functools
 import logging
 from contextlib import nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
@@ -111,7 +112,7 @@ from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
-from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils import MultiPlatformOp, PPMissingLayer
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -150,6 +151,7 @@ from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
+    get_compiler_backend,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
     make_layers,
@@ -184,6 +186,32 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+def _set_multi_platform_compile_mode(
+    module: torch.nn.Module, *, reverse: bool, num_tokens: int
+):
+    for sub in module._modules.values():
+        if isinstance(sub, MultiPlatformOp):
+            if reverse:
+                sub.leave_torch_compile()
+            else:
+                sub.enter_torch_compile(num_tokens=num_tokens)
+        if isinstance(sub, torch.nn.Module):
+            _set_multi_platform_compile_mode(
+                sub, reverse=reverse, num_tokens=num_tokens
+            )
+
+
+@functools.lru_cache(maxsize=1)
+def _prewarm_flashinfer_lazy_modules_for_experimental_prefill_compile() -> None:
+    # Trigger FlashInfer's lazy build/load paths outside Dynamo so the
+    # compiled layer does not trip over filesystem-bound module loading.
+    import flashinfer.mla
+    import flashinfer.rope
+
+    flashinfer.rope.get_rope_module()
+    flashinfer.mla.get_trtllm_gen_fmha_module()
 
 
 class DeepseekV2MLP(nn.Module):
@@ -1684,6 +1712,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
             )
+        self._mlp_is_dense = isinstance(self.mlp, DeepseekV2MLP)
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -1715,6 +1744,13 @@ class DeepseekV2DecoderLayer(nn.Module):
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
             )
 
+        self._experimental_prefill_compiled_runner = None
+        self._experimental_prefill_compile_failed = False
+        self._experimental_prefill_compile_enabled = False
+        self._experimental_prefill_compile_logged_eligible = False
+        self._experimental_prefill_compile_logged_success = False
+        self._experimental_prefill_compile_warmup_count = 0
+
     def _detect_gfx95_quant_format(self) -> str:
         if not _is_gfx95_supported:
             return ""
@@ -1736,7 +1772,131 @@ class DeepseekV2DecoderLayer(nn.Module):
             and layer_id % self.config.moe_layer_freq == 0
         )
 
-    def forward(
+    def _should_use_experimental_prefill_compile(
+        self, forward_batch: ForwardBatch
+    ) -> bool:
+        eligible = (
+            envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_LAYER.get()
+            and _is_cuda
+            and not self._experimental_prefill_compile_failed
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and not forward_batch.can_run_tbo
+            and not nsa_use_prefill_cp(forward_batch)
+            and get_moe_a2a_backend().is_none()
+        )
+        if eligible and not self._experimental_prefill_compile_logged_eligible:
+            log_info_on_rank0(
+                logger,
+                "Experimental DeepSeek prefill layer compile is eligible for "
+                f"layer {self.layer_id}.",
+            )
+            self._experimental_prefill_compile_logged_eligible = True
+        return eligible
+
+    def _prepare_experimental_prefill_compile_state(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        try:
+            _prewarm_flashinfer_lazy_modules_for_experimental_prefill_compile()
+        except Exception as exc:
+            logger.warning(
+                "Experimental DeepSeek prefill compile could not prewarm "
+                "FlashInfer lazy modules for layer %s with %s: %r",
+                self.layer_id,
+                type(exc).__name__,
+                exc,
+            )
+        indexer = getattr(self.self_attn, "indexer", None)
+        if indexer is not None and hasattr(indexer, "prepare_native_compile_state"):
+            indexer.prepare_native_compile_state(forward_batch)
+        token_to_kv_pool = getattr(forward_batch, "token_to_kv_pool", None)
+        if token_to_kv_pool is not None and hasattr(
+            token_to_kv_pool, "get_key_buffer_storage"
+        ):
+            try:
+                self.self_attn._experimental_prefill_kv_buffer_storage = (
+                    token_to_kv_pool.get_key_buffer_storage(self.layer_id)
+                )
+                self.self_attn._experimental_prefill_kv_buffer_view = (
+                    token_to_kv_pool.get_key_buffer(self.layer_id)
+                )
+                self.self_attn._experimental_prefill_kv_cache_dtype = (
+                    token_to_kv_pool.dtype
+                )
+                self.self_attn._experimental_prefill_kv_store_dtype = (
+                    token_to_kv_pool.store_dtype
+                )
+                self.self_attn._experimental_prefill_nsa_kv_cache_store_fp8 = (
+                    token_to_kv_pool.nsa_kv_cache_store_fp8
+                )
+                self.self_attn._experimental_prefill_use_nsa = (
+                    token_to_kv_pool.use_nsa
+                )
+            except Exception as exc:
+                logger.warning(
+                    "Experimental DeepSeek prefill compile could not cache KV "
+                    "buffer handles for layer %s with %s: %r",
+                    self.layer_id,
+                    type(exc).__name__,
+                    exc,
+                )
+
+    def _get_experimental_prefill_compile_warmup_steps(self) -> int:
+        return max(
+            int(
+                envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_LAYER_WARMUP_STEPS.get()
+            ),
+            0,
+        )
+
+    def _ensure_experimental_prefill_compiled(
+        self, num_tokens: int, forward_batch: ForwardBatch
+    ) -> None:
+        if (
+            self._experimental_prefill_compiled_runner is not None
+            or self._experimental_prefill_compile_failed
+        ):
+            return
+
+        try:
+            import torch._dynamo.config as dynamo_config
+
+            dynamo_config.allow_unspec_int_on_nn_module = True
+            dynamo_config.ignore_logging_functions.update(
+                {logging.Logger.debug, logging.Logger.info}
+            )
+        except Exception:
+            pass
+
+        self._prepare_experimental_prefill_compile_state(forward_batch)
+        _set_multi_platform_compile_mode(
+            self, reverse=False, num_tokens=max(int(num_tokens), 1)
+        )
+        self._experimental_prefill_compile_enabled = True
+        log_info_on_rank0(
+            logger,
+            "Creating experimental compiled DeepSeek prefill runner for "
+            f"layer {self.layer_id} with num_tokens={num_tokens}.",
+        )
+        self._experimental_prefill_compiled_runner = torch.compile(
+            self._forward_prefill_impl,
+            dynamic=True,
+            backend=get_compiler_backend(),
+            options={
+                # "cpp_wrapper": True,
+                # "combo_kernels": True,
+                "trace.enabled": True,            
+            }
+        )
+
+    def _disable_experimental_prefill_compile(self) -> None:
+        if self._experimental_prefill_compile_enabled:
+            _set_multi_platform_compile_mode(self, reverse=True, num_tokens=1)
+            self._experimental_prefill_compile_enabled = False
+        self._experimental_prefill_compiled_runner = None
+        self._experimental_prefill_compile_failed = True
+
+    def _forward_prefill_impl(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -1746,6 +1906,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
     ) -> torch.Tensor:
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
@@ -1772,18 +1934,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
-        if isinstance(self.mlp, DeepseekV2MLP):
+        if self._mlp_is_dense:
             gemm_output_zero_allocator = None
 
         hidden_states = self.mlp(
@@ -1803,6 +1954,138 @@ class DeepseekV2DecoderLayer(nn.Module):
             )
 
         return hidden_states, residual, topk_indices
+
+    @torch.compiler.disable(reason="experimental DeepSeek prefill eager warmup")
+    def _forward_prefill_impl_eager_warmup(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
+        gemm_output_zero_allocator: BumpAllocator = None,
+        llama_4_scaling: Optional[torch.Tensor] = None,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
+    ) -> torch.Tensor:
+        return self._forward_prefill_impl(
+            positions,
+            hidden_states,
+            forward_batch,
+            residual,
+            zero_allocator,
+            gemm_output_zero_allocator,
+            llama_4_scaling,
+            prev_topk_indices,
+            should_allreduce_fusion,
+            use_reduce_scatter,
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
+        gemm_output_zero_allocator: BumpAllocator = None,
+        llama_4_scaling: Optional[torch.Tensor] = None,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        should_allreduce_fusion = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
+        )
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+
+        if self._should_use_experimental_prefill_compile(forward_batch):
+            warmup_steps = self._get_experimental_prefill_compile_warmup_steps()
+            if (
+                self._experimental_prefill_compiled_runner is None
+                and self._experimental_prefill_compile_warmup_count < warmup_steps
+            ):
+                next_warmup_step = self._experimental_prefill_compile_warmup_count + 1
+                log_info_on_rank0(
+                    logger,
+                    "Running experimental DeepSeek prefill eager warmup step "
+                    f"{next_warmup_step}/{warmup_steps} for layer {self.layer_id} "
+                    "before torch.compile.",
+                )
+                out = self._forward_prefill_impl_eager_warmup(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                    zero_allocator,
+                    gemm_output_zero_allocator,
+                    llama_4_scaling,
+                    prev_topk_indices,
+                    should_allreduce_fusion,
+                    use_reduce_scatter,
+                )
+                self._experimental_prefill_compile_warmup_count = next_warmup_step
+                return out
+            try:
+                self._ensure_experimental_prefill_compiled(
+                    hidden_states.shape[0], forward_batch
+                )
+            except Exception as exc:
+                self._disable_experimental_prefill_compile()
+                logger.exception(
+                    "Disable experimental DeepSeek prefill layer compile while "
+                    "building compiled runner for layer %s with %s: %r",
+                    self.layer_id,
+                    type(exc).__name__,
+                    exc,
+                )
+            else:
+                try:
+                    out = self._experimental_prefill_compiled_runner(
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        residual,
+                        zero_allocator,
+                        gemm_output_zero_allocator,
+                        llama_4_scaling,
+                        prev_topk_indices,
+                        should_allreduce_fusion,
+                        use_reduce_scatter,
+                    )
+                    if not self._experimental_prefill_compile_logged_success:
+                        log_info_on_rank0(
+                            logger,
+                            "Experimental DeepSeek prefill layer compile is active for "
+                            f"layer {self.layer_id}.",
+                        )
+                        self._experimental_prefill_compile_logged_success = True
+                    return out
+                except Exception as exc:
+                    self._disable_experimental_prefill_compile()
+                    logger.exception(
+                        "Disable experimental DeepSeek prefill layer compile while "
+                        "executing compiled runner for layer %s with %s: %r",
+                        self.layer_id,
+                        type(exc).__name__,
+                        exc,
+                    )
+
+        return self._forward_prefill_impl(
+            positions,
+            hidden_states,
+            forward_batch,
+            residual,
+            zero_allocator,
+            gemm_output_zero_allocator,
+            llama_4_scaling,
+            prev_topk_indices,
+            should_allreduce_fusion,
+            use_reduce_scatter,
+        )
 
     def op_comm_prepare_attn(
         self,

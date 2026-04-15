@@ -238,6 +238,13 @@ class Indexer(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+        self._wk_native_weight_bf16: Optional[torch.Tensor] = None
+        self._wk_native_bias_bf16: Optional[torch.Tensor] = None
+
+    def prepare_native_compile_state(self, forward_batch: Optional[ForwardBatch] = None):
+        # Avoid a first-run None -> Tensor guard inside torch.compile by
+        # materializing the bf16 weight cache ahead of tracing.
+        self._get_wk_native_weight_bf16()
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -409,9 +416,206 @@ class Indexer(MultiPlatformOp):
     def _update_rope_guarded(dst: torch.Tensor, src: torch.Tensor) -> None:
         # On AMD with in-place RoPE kernels, self-aliasing can occur;
         # skip write-back when src/dst tensors point to a single memory.
-        if src.data_ptr() == dst.data_ptr():
+        if _is_hip and src.data_ptr() == dst.data_ptr():
             return
         dst.copy_(src)
+
+    def _build_short_isl_topk_result_native(
+        self,
+        metadata: BaseIndexerMetadata,
+        device: torch.device,
+    ) -> torch.Tensor:
+        seq_lens_expanded = metadata.get_seqlens_expanded().to(
+            device=device, dtype=torch.int32
+        )
+        num_tokens = seq_lens_expanded.shape[0]
+        if num_tokens == 0:
+            return torch.empty((0, self.index_topk), dtype=torch.int32, device=device)
+
+        topk_range = torch.arange(self.index_topk, device=device, dtype=torch.int32)
+        topk_range = topk_range.unsqueeze(0).expand(num_tokens, -1)
+        valid_mask = topk_range < seq_lens_expanded.unsqueeze(1)
+        result = torch.full(
+            (num_tokens, self.index_topk),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+
+        force_unfused_topk = getattr(metadata, "force_unfused_topk", False)
+        if not envs.SGLANG_NSA_FUSE_TOPK.get() or force_unfused_topk:
+            return torch.where(valid_mask, topk_range, result)
+
+        topk_transform_method = getattr(metadata, "topk_transform_method", None)
+        transform_method_name = getattr(topk_transform_method, "name", "")
+        if transform_method_name == "RAGGED":
+            attn_metadata = getattr(metadata, "attn_metadata", None)
+            topk_indices_offset = getattr(attn_metadata, "topk_indices_offset", None)
+            if topk_indices_offset is None:
+                raise NotImplementedError(
+                    "Indexer forward_native short-ISL path requires "
+                    "topk_indices_offset for fused ragged topk."
+                )
+            topk_indices_offset = topk_indices_offset.to(device=device, dtype=torch.int32)
+            if topk_indices_offset.ndim == 1:
+                topk_indices_offset = topk_indices_offset.unsqueeze(1)
+            return torch.where(valid_mask, topk_range + topk_indices_offset, result)
+
+        token_to_batch_idx = metadata.get_token_to_batch_idx().to(
+            device=device, dtype=torch.long
+        )
+        page_table_1 = metadata.get_page_table_1().to(device=device, dtype=torch.int32)
+        page_table_rows = page_table_1.index_select(0, token_to_batch_idx)
+        copy_cols = min(page_table_rows.shape[1], self.index_topk)
+        if copy_cols > 0:
+            result[:, :copy_cols] = torch.where(
+                valid_mask[:, :copy_cols],
+                page_table_rows[:, :copy_cols],
+                result[:, :copy_cols],
+            )
+        return result
+
+    def _extract_bf16_input(
+        self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
+    ) -> torch.Tensor:
+        if not isinstance(x, tuple):
+            return x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16)
+
+        if _use_aiter and _is_gfx95_supported and len(x) == 3:
+            return x[2]
+
+        assert len(x) in (
+            2,
+            3,
+        ), "For tuple input, only (x, x_s) or (x, x_s, y) formats are accepted"
+
+        x_q, x_s = x[0], x[1]
+        if (
+            x_s is not None
+            and x_q.dim() == 2
+            and x_s.dim() == 2
+            and x_q.shape[0] == x_s.shape[0]
+        ):
+            m, n = x_q.shape
+            ng = x_s.shape[1]
+            if ng > 0 and n % ng == 0:
+                group = n // ng
+                return (
+                    x_q.to(torch.float32)
+                    .view(m, ng, group)
+                    .mul_(x_s.to(torch.float32).unsqueeze(-1))
+                    .view(m, n)
+                    .to(torch.bfloat16)
+                )
+
+        return x_q if x_q.dtype == torch.bfloat16 else x_q.to(torch.bfloat16)
+
+    def _get_wk_native_weight_bf16(self) -> torch.Tensor:
+        weight = self.wk.weight
+        cached_weight = self._wk_native_weight_bf16
+        if (
+            cached_weight is not None
+            and cached_weight.device == weight.device
+            and cached_weight.shape == weight.shape
+        ):
+            return cached_weight
+
+        weight_scale = getattr(self.wk, "weight_scale", None)
+        if weight_scale is None:
+            weight_bf16 = (
+                weight if weight.dtype == torch.bfloat16 else weight.to(torch.bfloat16)
+            )
+        else:
+            scale = weight_scale.to(torch.float32)
+            if scale.numel() == 1:
+                scale = scale.reshape(1, 1)
+            elif scale.numel() == weight.shape[1]:
+                scale = scale.reshape(1, weight.shape[1])
+            elif scale.numel() == weight.shape[0]:
+                scale = scale.reshape(weight.shape[0], 1)
+            else:
+                raise NotImplementedError(
+                    "Indexer forward_native only supports scalar or per-channel "
+                    f"FP8 scales for wk; got weight={tuple(weight.shape)} and "
+                    f"weight_scale={tuple(weight_scale.shape)}."
+                )
+            weight_bf16 = (weight.to(torch.float32) * scale).to(torch.bfloat16)
+
+        bias = self.wk.bias
+        self._wk_native_weight_bf16 = weight_bf16
+        self._wk_native_bias_bf16 = (
+            None
+            if bias is None
+            else (bias if bias.dtype == torch.bfloat16 else bias.to(torch.bfloat16))
+        )
+        return weight_bf16
+
+    def _get_k_bf16_native(
+        self,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        x_bf16 = self._extract_bf16_input(x)
+        weight_bf16 = self._get_wk_native_weight_bf16()
+        key = torch.nn.functional.linear(
+            x_bf16, weight_bf16, self._wk_native_bias_bf16
+        )
+
+        key = self.k_norm(key)
+        k_rope, _ = torch.split(
+            key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+        )
+        _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
+        self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
+        return rotate_activation(key)
+
+    def _store_index_k_cache_native(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        key: torch.Tensor,
+    ) -> None:
+        if TYPE_CHECKING:
+            assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
+
+        page_size = forward_batch.token_to_kv_pool.page_size
+        if (not _is_cuda) or _is_fp8_fnuz:
+            raise NotImplementedError(
+                "Indexer forward_native short-ISL path requires the fused NSA "
+                "store kernel on CUDA."
+            )
+
+        out_loc = forward_batch.out_cache_loc
+        if not out_loc.is_contiguous():
+            out_loc = out_loc.contiguous()
+        buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+            layer_id=layer_id
+        )
+        fused_store_index_k_cache(key, buf, out_loc, page_size)
+
+    def _forward_native_k_only(
+        self,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        metadata: BaseIndexerMetadata,
+        return_indices: bool = True,
+    ) -> Optional[torch.Tensor]:
+        assert forward_batch.forward_mode.is_extend_without_speculative()
+        x_meta = x[0] if isinstance(x, tuple) else x
+
+        key = self._get_k_bf16_native(x, positions)
+        self._store_index_k_cache_native(
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            key=key,
+        )
+
+        if not return_indices:
+            return None
+
+        return self._build_short_isl_topk_result_native(metadata, x_meta.device)
 
     def _get_topk_paged(
         self,
@@ -1268,6 +1472,51 @@ class Indexer(MultiPlatformOp):
                 layer_id=layer_id,
             )
         return topk_result
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        return_indices: bool = True,
+    ) -> Optional[torch.Tensor]:
+        metadata = forward_batch.attn_backend.get_indexer_metadata(
+            layer_id, forward_batch
+        )
+        if metadata is None:
+            return None
+
+        if not forward_batch.forward_mode.is_extend_without_speculative():
+            raise NotImplementedError(
+                "Indexer forward_native only supports short-ISL prefill."
+            )
+
+        if self.nsa_enable_prefill_cp:
+            raise NotImplementedError(
+                "Indexer forward_native does not support NSA prefill CP."
+            )
+
+        if forward_batch.seq_lens_cpu is None:
+            raise NotImplementedError(
+                "Indexer forward_native requires seq_lens_cpu for short-ISL prefill."
+            )
+
+        max_kv_len = forward_batch.attn_backend.forward_metadata.max_seq_len_k
+        if max_kv_len > self.index_topk:
+            raise NotImplementedError(
+                "Indexer forward_native only supports the short-ISL k-only path."
+            )
+
+        return self._forward_native_k_only(
+            x=x,
+            positions=positions,
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            metadata=metadata,
+            return_indices=return_indices,
+        )
 
     def forward_npu(
         self,
