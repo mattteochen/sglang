@@ -534,13 +534,34 @@ class DeepseekMLAForwardMixin:
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
                 if q_lora is not None:
                     if not self.skip_topk or prev_topk_indices is None:
-                        topk_indices = self.indexer(
-                            x=hidden_states,
-                            q_lora=q_lora,
-                            positions=positions,
-                            forward_batch=forward_batch,
-                            layer_id=self.layer_id,
-                        )
+                        if is_in_piecewise_cuda_graph():
+                            from sglang.srt.layers.attention.nsa.nsa_indexer import (
+                                nsa_indexer_forward_impl,
+                            )
+
+                            output = torch.full(
+                                (hidden_states.shape[0], self.indexer.index_topk),
+                                -1,
+                                dtype=torch.int32,
+                                device=hidden_states.device,
+                            )
+                            nsa_indexer_forward_impl(
+                                hidden_states,
+                                q_lora,
+                                positions,
+                                output,
+                                self.layer_id,
+                                True,
+                            )
+                            topk_indices = output
+                        else:
+                            topk_indices = self.indexer(
+                                x=hidden_states,
+                                q_lora=q_lora,
+                                positions=positions,
+                                forward_batch=forward_batch,
+                                layer_id=self.layer_id,
+                            )
                     else:
                         topk_indices = prev_topk_indices
         else:

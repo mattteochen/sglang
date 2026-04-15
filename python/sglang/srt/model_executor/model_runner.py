@@ -2582,6 +2582,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         self.attention_layers = []
         self.moe_layers = []
         self.moe_fusions = []
+        self.nsa_indexers = []
         for layer in language_model.model.layers:
             attn_layer = None
             if hasattr(layer, "self_attn"):
@@ -2634,6 +2635,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
                 moe_fusion = layer.mixer
             self.moe_layers.append(moe_block)
             self.moe_fusions.append(moe_fusion)
+
+            # Collect NSA indexer instances for piecewise CUDA graph split ops
+            indexer = None
+            if hasattr(layer, "self_attn") and hasattr(layer.self_attn, "indexer"):
+                indexer = layer.self_attn.indexer
+            self.nsa_indexers.append(indexer)
 
         if len(self.attention_layers) < self.model_config.num_hidden_layers:
             # TODO(yuwei): support Non-Standard GQA

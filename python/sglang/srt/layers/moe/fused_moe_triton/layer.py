@@ -70,6 +70,8 @@ from sglang.srt.utils import (
 )
 from sglang.srt.utils.custom_op import register_custom_op
 
+from sglang.srt.compilation.compilation_config import register_split_op
+
 _is_hip = is_hip()
 _is_cpu_amx_available = cpu_has_amx_support()
 _is_cpu = is_cpu()
@@ -1167,6 +1169,7 @@ def moe_forward_piecewise_cuda_graph_impl(
 
 
 @register_custom_op(out_shape="hidden_states")
+@register_split_op()
 def fused_moe_bypassed_piecewise_cuda_graph_impl(
     hidden_states: torch.Tensor,
     router_logits: torch.Tensor,

@@ -25,6 +25,7 @@ from sglang.srt.utils import (
     is_hip,
     is_npu,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 global _use_multi_stream
 _is_cuda = is_cuda()
@@ -2033,3 +2034,47 @@ def scattered_to_tp_attn_full(
     )
     attn_tp_all_gather_into_tensor(hidden_states, local_hidden_states.contiguous())
     return hidden_states
+
+
+# ------------------------------------------------------------------ #
+#  Piecewise CUDA graph split op for the NSA indexer                  #
+#                                                                      #
+#  The indexer has data-dependent branching (ISL <= index_topk) and    #
+#  CPU-side .item() calls that are incompatible with CUDA graph        #
+#  capture.  Registering it as a split op ensures it executes eagerly  #
+#  during piecewise CUDA graph replay, while the rest of the model     #
+#  (norms, projections, MoE) remains captured in CUDA graphs.          #
+# ------------------------------------------------------------------ #
+
+from sglang.srt.compilation.compilation_config import register_split_op
+
+
+@register_custom_op(mutates_args=["output"])
+@register_split_op()
+def nsa_indexer_forward_impl(
+    hidden_states: torch.Tensor,
+    q_lora: torch.Tensor,
+    positions: torch.Tensor,
+    output: torch.Tensor,
+    layer_id: int,
+    return_indices: bool,
+) -> None:
+    """Piecewise CUDA graph split op wrapper for the NSA indexer.
+
+    Runs the indexer eagerly (outside CUDA graph capture) and writes
+    topk indices into the pre-allocated ``output`` tensor.  When the
+    indexer returns ``None`` (e.g. metadata is None), ``output`` is
+    filled with -1 as a sentinel.
+    """
+    from sglang.srt.compilation.piecewise_context_manager import get_forward_context
+
+    ctx = get_forward_context()
+    forward_batch = ctx.forward_batch
+    nsa_indexer = ctx.nsa_indexers[layer_id]
+    result = nsa_indexer.forward_cuda(
+        hidden_states, q_lora, positions, forward_batch, layer_id, return_indices
+    )
+    if result is not None:
+        output.copy_(result)
+    else:
+        output.fill_(-1)
