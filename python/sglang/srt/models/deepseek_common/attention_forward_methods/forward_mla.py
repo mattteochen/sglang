@@ -811,6 +811,7 @@ class DeepseekMLAForwardMixin:
                 (max_tokens, 1), dtype=torch.int32, device=device
             )
         self._absorb_static_bufs = bufs
+        self._absorb_topk_method = topk_method
 
         # 3. Get or compile the shared function (compiles once, reuses for all layers)
         compiled_fn = _get_or_compile_absorb_fn(self, topk_method)
@@ -929,7 +930,10 @@ class DeepseekMLAForwardMixin:
                 topk_method = 0  # fall back to no transform
 
         # Lazy init on first call — pass real tensors so buffers match actual shapes
-        if not hasattr(self, "_absorb_compiled_fn"):
+        if (
+            not hasattr(self, "_absorb_compiled_fn")
+            or getattr(self, "_absorb_topk_method", None) != topk_method
+        ):
             self._init_absorb_prepare_module(
                 topk_method, qkv_latent, hidden_states,
             )
