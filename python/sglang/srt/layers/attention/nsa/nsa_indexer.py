@@ -198,38 +198,6 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
-def quantize_index_k_fp8(
-    key: torch.Tensor,
-    block_size: int = 128,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Per-row FP8 E4M3 quantisation matching the JIT fused_store_index_k_cache formula.
-
-    Intended to be paired with the existing paged scatter
-    (``set_index_k_scale_buffer`` / ``SetKAndS``) so that torch.compile
-    can attempt to fuse the two.
-
-    Args:
-        key: (N, head_dim) bf16 — head_dim must be divisible by *block_size*.
-        block_size: quantisation group width (default 128, one group per row).
-
-    Returns:
-        key_fp8:  (N, head_dim) float8_e4m3fn
-        scale:    (N, head_dim // block_size) float32
-    """
-    FP8_MAX = torch.finfo(torch.float8_e4m3fn).max  # 448.0
-    shape = key.shape
-    key_f32 = key.view(-1, block_size).float()
-
-    abs_max = key_f32.abs().amax(dim=-1).clamp(min=1e-4)
-    scale = abs_max / FP8_MAX
-    inv_scale = 1.0 / scale
-
-    key_fp8 = (key_f32 * inv_scale.unsqueeze(-1)).clamp(-FP8_MAX, FP8_MAX)
-    key_fp8 = key_fp8.to(torch.float8_e4m3fn).view(shape)
-    scale = scale.view(*shape[:-1], shape[-1] // block_size)
-    return key_fp8, scale
-
-
 class Indexer(MultiPlatformOp):
     def __init__(
         self,
@@ -944,62 +912,12 @@ class Indexer(MultiPlatformOp):
 
         return base_indices
 
-    def _apply_topk_transform(
-        self,
-        base_indices: torch.Tensor,
-        seq_lens: torch.Tensor,
-        metadata: BaseIndexerMetadata,
-    ) -> torch.Tensor:
-        """Apply PAGED/RAGGED topk transform to base dummy indices.
-
-        Called outside the torch.compile boundary for the wide-compile path.
-        Mirrors the post-processing logic in _topk_dummy_native.
-        """
-        fuse_topk = envs.SGLANG_NSA_FUSE_TOPK.get()
-        force_unfused = getattr(metadata, "force_unfused_topk", False)
-        if not fuse_topk or force_unfused:
-            return base_indices
-
-        topk_method = getattr(metadata, "topk_transform_method", None)
-        if topk_method is None:
-            return base_indices
-
-        from sglang.srt.layers.attention.nsa_backend import TopkTransformMethod
-
-        topk = self.index_topk
-        col_idx = torch.arange(topk, dtype=torch.int32, device=base_indices.device)
-        valid = col_idx.unsqueeze(0) < seq_lens.unsqueeze(1)
-        neg_one = torch.tensor(-1, dtype=torch.int32, device=base_indices.device)
-
-        if topk_method == TopkTransformMethod.PAGED:
-            page_table_1 = metadata.get_page_table_1()
-            batch_idx = metadata.get_token_to_batch_idx()
-            safe_idx = base_indices.clamp(min=0).long()
-            batch_idx_2d = batch_idx.unsqueeze(1).expand_as(safe_idx)
-            mapped = page_table_1[batch_idx_2d, safe_idx]
-            return torch.where(valid, mapped.to(torch.int32), neg_one)
-
-        if topk_method == TopkTransformMethod.RAGGED:
-            attn_meta = getattr(metadata, "attn_metadata", None)
-            if attn_meta is not None:
-                offset = attn_meta.topk_indices_offset
-                if offset.ndim == 1:
-                    offset = offset.unsqueeze(1)
-                return torch.where(
-                    valid,
-                    base_indices + offset.to(base_indices.dtype),
-                    neg_one,
-                )
-
-        return base_indices
-
     @torch.compile(
         dynamic=True,
         options={
             "triton.enable_pdl": True,
             "combo_kernels": True,
             "cpp_wrapper": True,
-            "trace.enabled": True,
         },
     )
     def _forward_native_k_only(
@@ -1017,7 +935,7 @@ class Indexer(MultiPlatformOp):
         Compared to _forward_cuda_k_only this method:
         * uses forward_native for LayerNorm and RoPE,
         * calls hadamard_transform via its registered custom op,
-        * decomposes the fused K-cache store into act_quant + torch scatter,
+        * routes the fused K-cache store through a registered custom op,
         * generates dummy topk indices in pure torch (no sgl_kernel call),
         * avoids the .data_ptr() graph break in _update_rope_guarded.
 
@@ -1338,6 +1256,7 @@ class Indexer(MultiPlatformOp):
             envs.SGLANG_TORCH_COMPILE_INDEXER.get()
             and forward_batch.forward_mode.is_extend()
             and self.wk.weight.dtype == torch.float8_e4m3fn
+            and not self.nsa_enable_prefill_cp
         ):
             return self.forward_native(
                 x, q_lora, positions, forward_batch, layer_id, return_indices
@@ -1594,7 +1513,7 @@ class Indexer(MultiPlatformOp):
         # --- fast path: skip logits when all seqs are short enough ---
         # NOTE: .item() on a CPU tensor is a graph break for torch.compile;
         # guard this block with torch.compiler.is_compiling() if needed.
-        if forward_batch.seq_lens_cpu is not None:
+        if forward_batch.seq_lens_cpu is not None and not self.nsa_enable_prefill_cp:
             max_kv_len = forward_batch.seq_lens_cpu.max().item()
             if max_kv_len <= self.index_topk:
                 # Hoist buffer lookup outside torch.compile so all layers
