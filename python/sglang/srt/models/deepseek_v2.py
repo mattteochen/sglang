@@ -2475,6 +2475,23 @@ class DeepseekV2DecoderLayer(nn.Module):
         return output
 
 
+@functools.lru_cache(maxsize=1)
+def _enable_experimental_prefill_nested_compile_region() -> None:
+    wrapped_fn = DeepseekV2DecoderLayer._forward_prefill_impl
+    if not hasattr(wrapped_fn, "__marked_compile_region_fn__"):
+        DeepseekV2DecoderLayer._forward_prefill_impl = (
+            torch.compiler.nested_compile_region(
+                wrapped_fn,
+                max_reuse_entries=64,
+            )
+        )
+    log_info_on_rank0(
+        logger,
+        "Enabled experimental nested_compile_region for DeepSeek prefill "
+        "decoder blocks.",
+    )
+
+
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -2494,6 +2511,11 @@ class DeepseekV2Model(nn.Module):
             self.cp_size = get_attention_cp_size()
         else:
             self.cp_size = None
+
+        if (
+            envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_NESTED_COMPILE_REGION.get()
+        ):
+            _enable_experimental_prefill_nested_compile_region()
 
         if self.pp_group.is_first_rank:
             self.embed_tokens = VocabParallelEmbedding(
