@@ -226,6 +226,28 @@ def _get_experimental_prefill_compile_options() -> Dict[str, Any]:
     }
 
 
+_SKIP_GUARD_EVAL_UNSAFE_RECOMPILE_MESSAGE = (
+    "Recompilation triggered with skip_guard_eval_unsafe stance"
+)
+
+
+def _run_experimental_prefill_compiled_runner(
+    compiled_runner,
+    *runner_args,
+    enable_skip_guard_eval_unsafe: bool,
+):
+    if not enable_skip_guard_eval_unsafe:
+        return compiled_runner(*runner_args)
+
+    try:
+        with torch.compiler.set_stance(skip_guard_eval_unsafe=True):
+            return compiled_runner(*runner_args)
+    except RuntimeError as exc:
+        if _SKIP_GUARD_EVAL_UNSAFE_RECOMPILE_MESSAGE not in str(exc):
+            raise
+        return compiled_runner(*runner_args)
+
+
 class DeepseekV2MLP(nn.Module):
     def __init__(
         self,
@@ -2332,7 +2354,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                 )
             else:
                 try:
-                    out = self._experimental_prefill_compiled_runner(
+                    out = _run_experimental_prefill_compiled_runner(
+                        self._experimental_prefill_compiled_runner,
                         positions,
                         hidden_states,
                         forward_batch,
@@ -2343,6 +2366,10 @@ class DeepseekV2DecoderLayer(nn.Module):
                         prev_topk_indices,
                         should_allreduce_fusion,
                         use_reduce_scatter,
+                        enable_skip_guard_eval_unsafe=(
+                            self._experimental_prefill_compile_logged_success
+                            and envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_SKIP_GUARD_EVAL_UNSAFE.get()
+                        ),
                     )
                     if not self._experimental_prefill_compile_logged_success:
                         log_info_on_rank0(
@@ -2841,7 +2868,8 @@ class DeepseekV2Model(nn.Module):
                 )
             else:
                 try:
-                    out = self._experimental_prefill_compiled_runner(
+                    out = _run_experimental_prefill_compiled_runner(
+                        self._experimental_prefill_compiled_runner,
                         positions,
                         hidden_states,
                         forward_batch,
@@ -2849,6 +2877,10 @@ class DeepseekV2Model(nn.Module):
                         zero_allocator,
                         gemm_output_zero_allocator,
                         llama_4_scaling,
+                        enable_skip_guard_eval_unsafe=(
+                            self._experimental_prefill_compile_logged_success
+                            and envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_SKIP_GUARD_EVAL_UNSAFE.get()
+                        ),
                     )
                     if not self._experimental_prefill_compile_logged_success:
                         log_info_on_rank0(
