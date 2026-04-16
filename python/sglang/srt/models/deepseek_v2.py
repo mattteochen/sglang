@@ -229,6 +229,9 @@ def _get_experimental_prefill_compile_options() -> Dict[str, Any]:
 _SKIP_GUARD_EVAL_UNSAFE_RECOMPILE_MESSAGE = (
     "Recompilation triggered with skip_guard_eval_unsafe stance"
 )
+_NESTED_COMPILE_REGION_ROOT_SUBGRAPH_MESSAGE = (
+    "lift_tracked_freevar_to_input should not be called on root SubgraphTracer"
+)
 
 
 def _run_experimental_prefill_compiled_runner(
@@ -246,6 +249,40 @@ def _run_experimental_prefill_compiled_runner(
         if _SKIP_GUARD_EVAL_UNSAFE_RECOMPILE_MESSAGE not in str(exc):
             raise
         return compiled_runner(*runner_args)
+
+
+def _reset_experimental_prefill_compiled_runner(module: torch.nn.Module) -> None:
+    if getattr(module, "_experimental_prefill_compile_enabled", False):
+        _set_multi_platform_compile_mode(module, reverse=True, num_tokens=1)
+        module._experimental_prefill_compile_enabled = False
+    module._experimental_prefill_compiled_runner = None
+
+
+def _disable_experimental_prefill_nested_compile_region() -> bool:
+    wrapped_fn = DeepseekV2DecoderLayer._forward_prefill_impl
+    original_fn = getattr(wrapped_fn, "__marked_compile_region_fn__", None)
+    if original_fn is None:
+        return False
+    DeepseekV2DecoderLayer._forward_prefill_impl = original_fn
+    log_info_on_rank0(
+        logger,
+        "Disabled experimental nested_compile_region for DeepSeek prefill "
+        "decoder blocks after an incompatible Dynamo invoke_subgraph failure.",
+    )
+    return True
+
+
+def _should_retry_experimental_prefill_without_nested_compile_region(
+    exc: BaseException,
+) -> bool:
+    if not envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_NESTED_COMPILE_REGION.get():
+        return False
+    if (
+        getattr(DeepseekV2DecoderLayer._forward_prefill_impl, "__marked_compile_region_fn__", None)
+        is None
+    ):
+        return False
+    return _NESTED_COMPILE_REGION_ROOT_SUBGRAPH_MESSAGE in str(exc)
 
 
 class DeepseekV2MLP(nn.Module):
@@ -296,6 +333,137 @@ class DeepseekV2MLP(nn.Module):
                 "Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self._gate_up_proj_native_weight_bf16: Optional[torch.Tensor] = None
+        self._down_proj_native_weight_bf16: Optional[torch.Tensor] = None
+
+    def reset_native_compile_state(self) -> None:
+        self._gate_up_proj_native_weight_bf16 = None
+        self._down_proj_native_weight_bf16 = None
+
+    @staticmethod
+    def _is_supported_block_fp8_linear_native_compile_module(
+        module: Optional[nn.Module],
+    ) -> bool:
+        if module is None:
+            return False
+        weight = getattr(module, "weight", None)
+        weight_scale_inv = getattr(module, "weight_scale_inv", None)
+        fp8_dtypes = tuple(
+            dtype
+            for dtype in (
+                getattr(torch, "float8_e4m3fn", None),
+                getattr(torch, "float8_e4m3fnuz", None),
+            )
+            if dtype is not None
+        )
+        return (
+            weight is not None
+            and weight_scale_inv is not None
+            and weight.dtype in fp8_dtypes
+            and weight_scale_inv.dtype in (torch.int32, torch.float32)
+        )
+
+    def _get_block_fp8_linear_native_weight_bf16(
+        self, module: nn.Module, cache_attr: str
+    ) -> torch.Tensor:
+        weight = getattr(module, "weight", None)
+        cached_weight = getattr(self, cache_attr)
+        if (
+            weight is not None
+            and cached_weight is not None
+            and cached_weight.device == weight.device
+            and cached_weight.shape == weight.shape
+        ):
+            return cached_weight
+
+        assert weight is not None
+        weight_scale_inv = getattr(module, "weight_scale_inv", None)
+        if weight_scale_inv is None:
+            raise ValueError(
+                f"{module.__class__.__name__} does not expose weight_scale_inv."
+            )
+
+        quant_method = getattr(module, "quant_method", None)
+        quant_config = getattr(quant_method, "quant_config", None)
+        block_size = getattr(quant_config, "weight_block_size", None) or [128, 128]
+        if len(block_size) != 2:
+            raise ValueError(f"Unexpected block quant size {block_size}.")
+
+        if weight_scale_inv.dtype == torch.int32:
+            weight_scale = _unpack_ue8m0_scale_for_triton(
+                weight_scale_inv,
+                tuple(weight.shape),
+                block_size,
+            )
+        elif weight_scale_inv.dtype == torch.float32:
+            weight_scale = weight_scale_inv
+        else:
+            raise ValueError(
+                "Native compile BF16 path only supports float32 or packed int32 "
+                f"block scales, got {weight_scale_inv.dtype}."
+            )
+
+        weight_bf16 = block_quant_dequant(
+            weight,
+            weight_scale,
+            block_size,
+            torch.bfloat16,
+        ).contiguous()
+        setattr(self, cache_attr, weight_bf16)
+        return weight_bf16
+
+    def _should_use_native_bf16_compile_path(self) -> bool:
+        return self._is_supported_block_fp8_linear_native_compile_module(
+            self.gate_up_proj
+        ) and self._is_supported_block_fp8_linear_native_compile_module(
+            self.down_proj
+        )
+
+    def _forward_gate_up_proj_native_compile(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(
+            x.to(torch.bfloat16),
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.gate_up_proj,
+                "_gate_up_proj_native_weight_bf16",
+            ),
+        )
+
+    def _forward_down_proj_native_compile(
+        self,
+        x: torch.Tensor,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
+    ) -> torch.Tensor:
+        output_parallel = F.linear(
+            x.to(torch.bfloat16),
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.down_proj,
+                "_down_proj_native_weight_bf16",
+            ),
+        )
+        if (
+            self.down_proj.reduce_results
+            and self.down_proj.tp_size > 1
+            and not (should_allreduce_fusion or use_reduce_scatter)
+        ):
+            if self.down_proj.use_dp_attention_reduce:
+                return get_attention_tp_group().all_reduce(output_parallel)
+            return tensor_model_parallel_all_reduce(output_parallel)
+        return output_parallel
+
+    def prepare_native_compile_state(
+        self, forward_batch: Optional[ForwardBatch] = None
+    ) -> None:
+        del forward_batch
+        if self._should_use_native_bf16_compile_path():
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.gate_up_proj,
+                "_gate_up_proj_native_weight_bf16",
+            )
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.down_proj,
+                "_down_proj_native_weight_bf16",
+            )
 
     def forward(
         self,
@@ -307,6 +475,18 @@ class DeepseekV2MLP(nn.Module):
     ):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
+
+        if (
+            torch._dynamo.is_compiling()
+            and self._should_use_native_bf16_compile_path()
+        ):
+            gate_up = self._forward_gate_up_proj_native_compile(x)
+            x = self.act_fn(gate_up)
+            return self._forward_down_proj_native_compile(
+                x,
+                should_allreduce_fusion=should_allreduce_fusion,
+                use_reduce_scatter=use_reduce_scatter,
+            )
 
         if (
             gemm_output_zero_allocator is not None
@@ -641,6 +821,22 @@ class DeepseekV2MoE(nn.Module):
                 name, x, self.experts.num_local_experts
             )
         ]
+
+    def reset_native_compile_state(self) -> None:
+        shared_experts = getattr(self, "shared_experts", None)
+        if shared_experts is not None and hasattr(
+            shared_experts, "reset_native_compile_state"
+        ):
+            shared_experts.reset_native_compile_state()
+
+    def prepare_native_compile_state(
+        self, forward_batch: Optional[ForwardBatch] = None
+    ) -> None:
+        shared_experts = getattr(self, "shared_experts", None)
+        if shared_experts is not None and hasattr(
+            shared_experts, "prepare_native_compile_state"
+        ):
+            shared_experts.prepare_native_compile_state(forward_batch)
 
     def forward(
         self,
@@ -2123,6 +2319,8 @@ class DeepseekV2DecoderLayer(nn.Module):
         indexer = getattr(self.self_attn, "indexer", None)
         if indexer is not None and hasattr(indexer, "prepare_native_compile_state"):
             indexer.prepare_native_compile_state(forward_batch)
+        if hasattr(self.mlp, "prepare_native_compile_state"):
+            self.mlp.prepare_native_compile_state(forward_batch)
         token_to_kv_pool = getattr(forward_batch, "token_to_kv_pool", None)
         if token_to_kv_pool is not None and hasattr(
             token_to_kv_pool, "get_key_buffer_storage"
@@ -2380,6 +2578,41 @@ class DeepseekV2DecoderLayer(nn.Module):
                         self._experimental_prefill_compile_logged_success = True
                     return out
                 except Exception as exc:
+                    if _should_retry_experimental_prefill_without_nested_compile_region(
+                        exc
+                    ):
+                        try:
+                            _disable_experimental_prefill_nested_compile_region()
+                            _reset_experimental_prefill_compiled_runner(self)
+                            self._ensure_experimental_prefill_compiled(
+                                hidden_states.shape[0], forward_batch
+                            )
+                            out = _run_experimental_prefill_compiled_runner(
+                                self._experimental_prefill_compiled_runner,
+                                positions,
+                                hidden_states,
+                                forward_batch,
+                                residual,
+                                zero_allocator,
+                                gemm_output_zero_allocator,
+                                llama_4_scaling,
+                                prev_topk_indices,
+                                should_allreduce_fusion,
+                                use_reduce_scatter,
+                                enable_skip_guard_eval_unsafe=False,
+                            )
+                            if not self._experimental_prefill_compile_logged_success:
+                                log_info_on_rank0(
+                                    logger,
+                                    "Experimental DeepSeek prefill layer compile is active for "
+                                    f"layer {self.layer_id} after disabling nested_compile_region.",
+                                )
+                                self._experimental_prefill_compile_logged_success = (
+                                    True
+                                )
+                            return out
+                        except Exception as retry_exc:
+                            exc = retry_exc
                     self._disable_experimental_prefill_compile()
                     logger.exception(
                         "Disable experimental DeepSeek prefill layer compile while "
@@ -2913,6 +3146,38 @@ class DeepseekV2Model(nn.Module):
                         self._experimental_prefill_compile_logged_success = True
                     return out
                 except Exception as exc:
+                    if _should_retry_experimental_prefill_without_nested_compile_region(
+                        exc
+                    ):
+                        try:
+                            _disable_experimental_prefill_nested_compile_region()
+                            _reset_experimental_prefill_compiled_runner(self)
+                            self._ensure_experimental_prefill_compiled(
+                                hidden_states.shape[0], forward_batch
+                            )
+                            out = _run_experimental_prefill_compiled_runner(
+                                self._experimental_prefill_compiled_runner,
+                                positions,
+                                hidden_states,
+                                forward_batch,
+                                residual,
+                                zero_allocator,
+                                gemm_output_zero_allocator,
+                                llama_4_scaling,
+                                enable_skip_guard_eval_unsafe=False,
+                            )
+                            if not self._experimental_prefill_compile_logged_success:
+                                log_info_on_rank0(
+                                    logger,
+                                    "Experimental DeepSeek prefill model compile is active for "
+                                    f"layers {self.start_layer}-{self.end_layer - 1} after disabling nested_compile_region.",
+                                )
+                                self._experimental_prefill_compile_logged_success = (
+                                    True
+                                )
+                            return out
+                        except Exception as retry_exc:
+                            exc = retry_exc
                     self._disable_experimental_prefill_compile()
                     logger.exception(
                         "Disable experimental DeepSeek prefill model compile while "
