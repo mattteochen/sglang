@@ -110,6 +110,10 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.fp8_utils import (
+    _unpack_ue8m0_scale_for_triton,
+    block_quant_dequant,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import MultiPlatformOp, PPMissingLayer
@@ -212,6 +216,14 @@ def _prewarm_flashinfer_lazy_modules_for_experimental_prefill_compile() -> None:
 
     flashinfer.rope.get_rope_module()
     flashinfer.mla.get_trtllm_gen_fmha_module()
+
+
+def _get_experimental_prefill_compile_options() -> Dict[str, Any]:
+    return {
+        "cpp_wrapper": True,
+        "combo_kernels": True,
+        "trace.enabled": True,
+    }
 
 
 class DeepseekV2MLP(nn.Module):
@@ -1367,6 +1379,13 @@ class DeepseekV2AttentionMLA(
         self.w_scale_k = None
         self.w_scale_v = None
         self.use_deep_gemm_bmm = False
+        self._fused_qkv_a_proj_native_weight_bf16: Optional[torch.Tensor] = None
+        self._q_b_proj_native_weight_bf16: Optional[torch.Tensor] = None
+        self._q_proj_native_weight_bf16: Optional[torch.Tensor] = None
+        self._kv_a_proj_with_mqa_native_weight_bf16: Optional[torch.Tensor] = None
+        self._o_proj_native_weight_bf16: Optional[torch.Tensor] = None
+        self._w_kc_native_weight_bf16: Optional[torch.Tensor] = None
+        self._w_vc_native_weight_bf16: Optional[torch.Tensor] = None
 
         self.current_attention_backend = (
             None  # Attention backend used by current forward batch
@@ -1393,6 +1412,268 @@ class DeepseekV2AttentionMLA(
         self.init_mla_forward()
         self.init_mla_fused_rope_rocm_forward()
         self.init_mla_fused_rope_cpu_forward()
+
+    def reset_native_compile_state(self) -> None:
+        self._fused_qkv_a_proj_native_weight_bf16 = None
+        self._q_b_proj_native_weight_bf16 = None
+        self._q_proj_native_weight_bf16 = None
+        self._kv_a_proj_with_mqa_native_weight_bf16 = None
+        self._o_proj_native_weight_bf16 = None
+        self._w_kc_native_weight_bf16 = None
+        self._w_vc_native_weight_bf16 = None
+
+    def _should_use_absorb_native_bf16_compile_path(
+        self, weight: Optional[torch.Tensor]
+    ) -> bool:
+        if weight is None:
+            return False
+        fp8_dtypes = tuple(
+            dtype
+            for dtype in (
+                getattr(torch, "float8_e4m3fn", None),
+                getattr(torch, "float8_e4m3fnuz", None),
+            )
+            if dtype is not None
+        )
+        return self.use_deep_gemm_bmm or weight.dtype in fp8_dtypes
+
+    @staticmethod
+    def _is_supported_block_fp8_linear_native_compile_module(
+        module: Optional[nn.Module],
+    ) -> bool:
+        if module is None:
+            return False
+        weight = getattr(module, "weight", None)
+        weight_scale_inv = getattr(module, "weight_scale_inv", None)
+        fp8_dtypes = tuple(
+            dtype
+            for dtype in (
+                getattr(torch, "float8_e4m3fn", None),
+                getattr(torch, "float8_e4m3fnuz", None),
+            )
+            if dtype is not None
+        )
+        return (
+            weight is not None
+            and weight_scale_inv is not None
+            and weight.dtype in fp8_dtypes
+            and weight_scale_inv.dtype in (torch.int32, torch.float32)
+        )
+
+    def _get_block_fp8_linear_native_weight_bf16(
+        self, module: nn.Module, cache_attr: str
+    ) -> torch.Tensor:
+        weight = getattr(module, "weight", None)
+        cached_weight = getattr(self, cache_attr)
+        if (
+            weight is not None
+            and cached_weight is not None
+            and cached_weight.device == weight.device
+            and cached_weight.shape == weight.shape
+        ):
+            return cached_weight
+
+        assert weight is not None
+        weight_scale_inv = getattr(module, "weight_scale_inv", None)
+        if weight_scale_inv is None:
+            raise ValueError(
+                f"{module.__class__.__name__} does not expose weight_scale_inv."
+            )
+
+        quant_method = getattr(module, "quant_method", None)
+        quant_config = getattr(quant_method, "quant_config", None)
+        block_size = getattr(quant_config, "weight_block_size", None) or [128, 128]
+        if len(block_size) != 2:
+            raise ValueError(f"Unexpected block quant size {block_size}.")
+
+        if weight_scale_inv.dtype == torch.int32:
+            weight_scale = _unpack_ue8m0_scale_for_triton(
+                weight_scale_inv,
+                tuple(weight.shape),
+                block_size,
+            )
+        elif weight_scale_inv.dtype == torch.float32:
+            weight_scale = weight_scale_inv
+        else:
+            raise ValueError(
+                "Native compile BF16 path only supports float32 or packed int32 "
+                f"block scales, got {weight_scale_inv.dtype}."
+            )
+
+        weight_bf16 = block_quant_dequant(
+            weight,
+            weight_scale,
+            block_size,
+            torch.bfloat16,
+        ).contiguous()
+        setattr(self, cache_attr, weight_bf16)
+        return weight_bf16
+
+    def _forward_fused_qkv_a_proj_with_mqa_native_compile(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        return F.linear(
+            hidden_states.to(torch.bfloat16),
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.fused_qkv_a_proj_with_mqa,
+                "_fused_qkv_a_proj_native_weight_bf16",
+            ),
+        )
+
+    def _forward_q_b_proj_native_compile(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(
+            x.to(torch.bfloat16),
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.q_b_proj,
+                "_q_b_proj_native_weight_bf16",
+            ),
+        )
+
+    def _forward_q_proj_native_compile(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(
+            x.to(torch.bfloat16),
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.q_proj,
+                "_q_proj_native_weight_bf16",
+            ),
+        )
+
+    def _forward_kv_a_proj_with_mqa_native_compile(
+        self, x: torch.Tensor
+    ) -> torch.Tensor:
+        return F.linear(
+            x.to(torch.bfloat16),
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.kv_a_proj_with_mqa,
+                "_kv_a_proj_with_mqa_native_weight_bf16",
+            ),
+        )
+
+    def _forward_o_proj_native_compile(self, x: torch.Tensor) -> torch.Tensor:
+        bias = None
+        if (
+            getattr(self.o_proj, "bias", None) is not None
+            and self.o_proj.tp_rank == 0
+            and not self.o_proj.skip_bias_add
+        ):
+            bias = self.o_proj.bias
+        output_parallel = F.linear(
+            x.to(torch.bfloat16),
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.o_proj,
+                "_o_proj_native_weight_bf16",
+            ),
+            bias,
+        )
+        if self.o_proj.reduce_results and self.o_proj.tp_size > 1:
+            if self.o_proj.use_dp_attention_reduce:
+                return get_attention_tp_group().all_reduce(output_parallel)
+            return tensor_model_parallel_all_reduce(output_parallel)
+        return output_parallel
+
+    def _get_w_kc_native_weight_bf16(self) -> torch.Tensor:
+        weight = self.w_kc
+        cached_weight = self._w_kc_native_weight_bf16
+        if (
+            weight is not None
+            and cached_weight is not None
+            and cached_weight.device == weight.device
+            and cached_weight.shape
+            == (self.num_local_heads, self.qk_nope_head_dim, self.kv_lora_rank)
+        ):
+            return cached_weight
+
+        assert weight is not None
+        if self.use_deep_gemm_bmm:
+            weight_bf16 = block_quant_dequant(
+                weight,
+                self.w_scale_k,
+                [128, 128],
+                torch.bfloat16,
+            ).transpose(-1, -2)
+        elif self._should_use_absorb_native_bf16_compile_path(weight):
+            weight_bf16 = (weight.to(torch.float32) * self.w_scale).to(torch.bfloat16)
+        else:
+            weight_bf16 = (
+                weight if weight.dtype == torch.bfloat16 else weight.to(torch.bfloat16)
+            )
+
+        self._w_kc_native_weight_bf16 = weight_bf16.contiguous()
+        return self._w_kc_native_weight_bf16
+
+    def _get_w_vc_native_weight_bf16(self) -> torch.Tensor:
+        weight = self.w_vc
+        cached_weight = self._w_vc_native_weight_bf16
+        if (
+            weight is not None
+            and cached_weight is not None
+            and cached_weight.device == weight.device
+            and cached_weight.shape
+            == (self.num_local_heads, self.kv_lora_rank, self.v_head_dim)
+        ):
+            return cached_weight
+
+        assert weight is not None
+        if self.use_deep_gemm_bmm:
+            weight_bf16 = block_quant_dequant(
+                weight,
+                self.w_scale_v,
+                [128, 128],
+                torch.bfloat16,
+            ).transpose(-1, -2)
+        elif self._should_use_absorb_native_bf16_compile_path(weight):
+            weight_bf16 = (weight.to(torch.float32) * self.w_scale).to(torch.bfloat16)
+        else:
+            weight_bf16 = (
+                weight if weight.dtype == torch.bfloat16 else weight.to(torch.bfloat16)
+            )
+
+        self._w_vc_native_weight_bf16 = weight_bf16.contiguous()
+        return self._w_vc_native_weight_bf16
+
+    def prepare_native_compile_state(
+        self, forward_batch: Optional[ForwardBatch] = None
+    ) -> None:
+        del forward_batch
+        if self._is_supported_block_fp8_linear_native_compile_module(
+            getattr(self, "fused_qkv_a_proj_with_mqa", None)
+        ):
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.fused_qkv_a_proj_with_mqa,
+                "_fused_qkv_a_proj_native_weight_bf16",
+            )
+        if self._is_supported_block_fp8_linear_native_compile_module(
+            getattr(self, "q_b_proj", None)
+        ):
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.q_b_proj,
+                "_q_b_proj_native_weight_bf16",
+            )
+        if self._is_supported_block_fp8_linear_native_compile_module(
+            getattr(self, "q_proj", None)
+        ):
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.q_proj,
+                "_q_proj_native_weight_bf16",
+            )
+        if self._is_supported_block_fp8_linear_native_compile_module(
+            getattr(self, "kv_a_proj_with_mqa", None)
+        ):
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.kv_a_proj_with_mqa,
+                "_kv_a_proj_with_mqa_native_weight_bf16",
+            )
+        if self._is_supported_block_fp8_linear_native_compile_module(
+            getattr(self, "o_proj", None)
+        ):
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.o_proj,
+                "_o_proj_native_weight_bf16",
+            )
+        if self._should_use_absorb_native_bf16_compile_path(self.w_kc):
+            self._get_w_kc_native_weight_bf16()
+        if self._should_use_absorb_native_bf16_compile_path(self.w_vc):
+            self._get_w_vc_native_weight_bf16()
 
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
@@ -1582,6 +1863,15 @@ class DeepseekV2AttentionMLA(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
         assert self.q_lora_rank is not None
+        if (
+            torch._dynamo.is_compiling()
+            and self._is_supported_block_fp8_linear_native_compile_module(
+                self.fused_qkv_a_proj_with_mqa
+            )
+        ):
+            return self._forward_fused_qkv_a_proj_with_mqa_native_compile(
+                hidden_states
+            )
         if (
             (not isinstance(hidden_states, tuple))
             and hidden_states.shape[0] >= 1
@@ -1806,6 +2096,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                 type(exc).__name__,
                 exc,
             )
+        if hasattr(self.self_attn, "prepare_native_compile_state"):
+            self.self_attn.prepare_native_compile_state(forward_batch)
         indexer = getattr(self.self_attn, "indexer", None)
         if indexer is not None and hasattr(indexer, "prepare_native_compile_state"):
             indexer.prepare_native_compile_state(forward_batch)
@@ -1882,11 +2174,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             self._forward_prefill_impl,
             dynamic=True,
             backend=get_compiler_backend(),
-            options={
-                # "cpp_wrapper": True,
-                # "combo_kernels": True,
-                "trace.enabled": True,            
-            }
+            options=_get_experimental_prefill_compile_options(),
         )
 
     def _disable_experimental_prefill_compile(self) -> None:
@@ -2284,9 +2572,174 @@ class DeepseekV2Model(nn.Module):
 
         # llama_4_scaling: for supporting Mistral-Large-3 model
         self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
+        self._experimental_prefill_compiled_runner = None
+        self._experimental_prefill_compile_failed = False
+        self._experimental_prefill_compile_enabled = False
+        self._experimental_prefill_compile_logged_eligible = False
+        self._experimental_prefill_compile_logged_success = False
+        self._experimental_prefill_compile_warmup_count = 0
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
+
+    def _should_use_experimental_prefill_compile(
+        self,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor],
+        pp_proxy_tensors: Optional[PPProxyTensors],
+    ) -> bool:
+        eligible = (
+            envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_MODEL.get()
+            and _is_cuda
+            and not self._experimental_prefill_compile_failed
+            and self.pp_group.world_size == 1
+            and input_embeds is None
+            and pp_proxy_tensors is None
+            and not self.layers_to_capture
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and not forward_batch.can_run_tbo
+            and not nsa_use_prefill_cp(forward_batch)
+            and get_moe_a2a_backend().is_none()
+        )
+        if eligible and not self._experimental_prefill_compile_logged_eligible:
+            log_info_on_rank0(
+                logger,
+                "Experimental DeepSeek prefill model compile is eligible for "
+                f"layers {self.start_layer}-{self.end_layer - 1}.",
+            )
+            self._experimental_prefill_compile_logged_eligible = True
+        return eligible
+
+    def _prepare_experimental_prefill_compile_state(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        try:
+            _prewarm_flashinfer_lazy_modules_for_experimental_prefill_compile()
+        except Exception as exc:
+            logger.warning(
+                "Experimental DeepSeek prefill model compile could not prewarm "
+                "FlashInfer lazy modules with %s: %r",
+                type(exc).__name__,
+                exc,
+            )
+        for layer in self.layers[self.start_layer : self.end_layer]:
+            if hasattr(layer, "_prepare_experimental_prefill_compile_state"):
+                layer._prepare_experimental_prefill_compile_state(forward_batch)
+
+    def _get_experimental_prefill_compile_warmup_steps(self) -> int:
+        return max(
+            int(
+                envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_MODEL_WARMUP_STEPS.get()
+            ),
+            0,
+        )
+
+    def _ensure_experimental_prefill_compiled(
+        self, num_tokens: int, forward_batch: ForwardBatch
+    ) -> None:
+        if (
+            self._experimental_prefill_compiled_runner is not None
+            or self._experimental_prefill_compile_failed
+        ):
+            return
+
+        try:
+            import torch._dynamo.config as dynamo_config
+
+            dynamo_config.allow_unspec_int_on_nn_module = True
+            dynamo_config.ignore_logging_functions.update(
+                {logging.Logger.debug, logging.Logger.info}
+            )
+        except Exception:
+            pass
+
+        self._prepare_experimental_prefill_compile_state(forward_batch)
+        _set_multi_platform_compile_mode(
+            self, reverse=False, num_tokens=max(int(num_tokens), 1)
+        )
+        self._experimental_prefill_compile_enabled = True
+        log_info_on_rank0(
+            logger,
+            "Creating experimental compiled DeepSeek prefill runner for "
+            f"layers {self.start_layer}-{self.end_layer - 1} with "
+            f"num_tokens={num_tokens}.",
+        )
+        self._experimental_prefill_compiled_runner = torch.compile(
+            self._forward_prefill_model_impl,
+            dynamic=True,
+            backend=get_compiler_backend(),
+            options=_get_experimental_prefill_compile_options(),
+        )
+
+    def _disable_experimental_prefill_compile(self) -> None:
+        if self._experimental_prefill_compile_enabled:
+            _set_multi_platform_compile_mode(self, reverse=True, num_tokens=1)
+            self._experimental_prefill_compile_enabled = False
+        self._experimental_prefill_compiled_runner = None
+        self._experimental_prefill_compile_failed = True
+
+    def _forward_prefill_model_impl(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
+        gemm_output_zero_allocator: Optional[BumpAllocator] = None,
+        llama_4_scaling: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        topk_indices = None
+        for i in range(self.start_layer, self.end_layer):
+            layer = self.layers[i]
+            should_allreduce_fusion = (
+                layer.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                    forward_batch
+                )
+            )
+            use_reduce_scatter = layer.layer_communicator.should_use_reduce_scatter(
+                forward_batch
+            )
+            hidden_states, residual, topk_indices = layer._forward_prefill_impl(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+                zero_allocator,
+                gemm_output_zero_allocator,
+                llama_4_scaling,
+                prev_topk_indices=topk_indices,
+                should_allreduce_fusion=should_allreduce_fusion,
+                use_reduce_scatter=use_reduce_scatter,
+            )
+
+        if not forward_batch.forward_mode.is_idle():
+            if residual is None:
+                hidden_states = self.norm(hidden_states)
+            else:
+                hidden_states, _ = self.norm(hidden_states, residual)
+
+        return hidden_states
+
+    @torch.compiler.disable(reason="experimental DeepSeek prefill model eager warmup")
+    def _forward_prefill_model_impl_eager_warmup(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
+        gemm_output_zero_allocator: Optional[BumpAllocator] = None,
+        llama_4_scaling: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        return self._forward_prefill_model_impl(
+            positions,
+            hidden_states,
+            forward_batch,
+            residual,
+            zero_allocator,
+            gemm_output_zero_allocator,
+            llama_4_scaling,
+        )
 
     def forward(
         self,
@@ -2345,6 +2798,76 @@ class DeepseekV2Model(nn.Module):
                 scaling_beta=self.llama_4_scaling_config["beta"],
                 positions=positions,
             )
+
+        if self._should_use_experimental_prefill_compile(
+            forward_batch, input_embeds, pp_proxy_tensors
+        ):
+            warmup_steps = self._get_experimental_prefill_compile_warmup_steps()
+            if (
+                self._experimental_prefill_compiled_runner is None
+                and self._experimental_prefill_compile_warmup_count < warmup_steps
+            ):
+                next_warmup_step = self._experimental_prefill_compile_warmup_count + 1
+                log_info_on_rank0(
+                    logger,
+                    "Running experimental DeepSeek prefill eager warmup step "
+                    f"{next_warmup_step}/{warmup_steps} for layers "
+                    f"{self.start_layer}-{self.end_layer - 1} before torch.compile.",
+                )
+                out = self._forward_prefill_model_impl_eager_warmup(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                    zero_allocator,
+                    gemm_output_zero_allocator,
+                    llama_4_scaling,
+                )
+                self._experimental_prefill_compile_warmup_count = next_warmup_step
+                return out
+            try:
+                self._ensure_experimental_prefill_compiled(
+                    hidden_states.shape[0], forward_batch
+                )
+            except Exception as exc:
+                self._disable_experimental_prefill_compile()
+                logger.exception(
+                    "Disable experimental DeepSeek prefill model compile while "
+                    "building compiled runner for layers %s-%s with %s: %r",
+                    self.start_layer,
+                    self.end_layer - 1,
+                    type(exc).__name__,
+                    exc,
+                )
+            else:
+                try:
+                    out = self._experimental_prefill_compiled_runner(
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        residual,
+                        zero_allocator,
+                        gemm_output_zero_allocator,
+                        llama_4_scaling,
+                    )
+                    if not self._experimental_prefill_compile_logged_success:
+                        log_info_on_rank0(
+                            logger,
+                            "Experimental DeepSeek prefill model compile is active for "
+                            f"layers {self.start_layer}-{self.end_layer - 1}.",
+                        )
+                        self._experimental_prefill_compile_logged_success = True
+                    return out
+                except Exception as exc:
+                    self._disable_experimental_prefill_compile()
+                    logger.exception(
+                        "Disable experimental DeepSeek prefill model compile while "
+                        "executing compiled runner for layers %s-%s with %s: %r",
+                        self.start_layer,
+                        self.end_layer - 1,
+                        type(exc).__name__,
+                        exc,
+                    )
 
         normal_start_layer = self.start_layer
         normal_end_layer = self.end_layer

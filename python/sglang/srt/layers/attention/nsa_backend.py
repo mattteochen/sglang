@@ -35,6 +35,7 @@ from sglang.srt.layers.attention.nsa.utils import (
 from sglang.srt.layers.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
+    mla_quantize_and_rope_for_fp8_native,
     seqlens_expand_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
@@ -2183,7 +2184,12 @@ class NativeSparseAttnBackend(
                 cos_sin_cache is not None
             ), "For FP8 path cos_sin_cache should not be None."
 
-            q, k, k_rope = mla_quantize_and_rope_for_fp8(
+            quantize_rope_impl = (
+                mla_quantize_and_rope_for_fp8_native
+                if torch._dynamo.is_compiling()
+                else mla_quantize_and_rope_for_fp8
+            )
+            q, k, k_rope = quantize_rope_impl(
                 q,
                 q_rope,
                 k.squeeze(1),

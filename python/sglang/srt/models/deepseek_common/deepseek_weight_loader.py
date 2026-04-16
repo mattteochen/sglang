@@ -431,6 +431,8 @@ class DeepseekV2WeightLoaderMixin:
                 if not is_nextn
                 else self.model.decoder.self_attn
             )
+            if hasattr(self_attn, "reset_native_compile_state"):
+                self_attn.reset_native_compile_state()
 
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # awq compatible, dequantize the weight if supported

@@ -4,6 +4,7 @@ import torch
 import triton
 import triton.language as tl
 
+from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.utils import is_cuda
 
 _FLASHMLA_CREATE_KV_BLOCK_SIZE = 4096
@@ -409,6 +410,52 @@ def _fake_mla_quantize_and_rope_for_fp8(
         k_nope.new_empty(k_nope.shape, dtype=attn_dtype),
         k_rope.new_empty(k_rope.shape, dtype=attn_dtype),
     )
+
+
+def mla_quantize_and_rope_for_fp8_native(
+    q_nope: torch.Tensor,
+    q_rope: torch.Tensor,
+    k_nope: torch.Tensor,
+    k_rope: torch.Tensor,
+    pos_ids: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    is_neox: bool,
+    kv_lora_rank: int,
+    qk_rope_head_dim: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    attn_dtype = torch.float8_e4m3fn
+
+    q_nope_3d = q_nope if q_nope.ndim == 3 else q_nope.unsqueeze(1)
+    q_rope_3d = q_rope if q_rope.ndim == 3 else q_rope.unsqueeze(1)
+    k_nope_3d = k_nope if k_nope.ndim == 3 else k_nope.unsqueeze(1)
+    k_rope_3d = k_rope if k_rope.ndim == 3 else k_rope.unsqueeze(1)
+
+    pos_ids = pos_ids.flatten()
+    cos_sin = cos_sin_cache.index_select(0, pos_ids)
+    cos, sin = cos_sin.chunk(2, dim=-1)
+
+    q_rope_rot = apply_rotary_emb(q_rope_3d, cos, sin, is_neox)
+    k_rope_rot = apply_rotary_emb(k_rope_3d, cos, sin, is_neox)
+
+    q_out = torch.cat((q_nope_3d, q_rope_rot), dim=-1)
+    if q_out.shape[-1] != kv_lora_rank + qk_rope_head_dim:
+        raise ValueError(
+            "mla_quantize_and_rope_for_fp8_native produced an unexpected merged "
+            f"query size {q_out.shape[-1]} != {kv_lora_rank + qk_rope_head_dim}."
+        )
+
+    q_out = q_out.to(attn_dtype)
+    k_nope_out = k_nope_3d.to(attn_dtype)
+    k_rope_out = k_rope_rot.to(attn_dtype)
+
+    if q_nope.ndim != 3:
+        q_out = q_out.squeeze(1)
+    if k_nope.ndim != 3:
+        k_nope_out = k_nope_out.squeeze(1)
+    if k_rope.ndim != 3:
+        k_rope_out = k_rope_out.squeeze(1)
+
+    return q_out, k_nope_out, k_rope_out
 
 
 @register_custom_op(fake_impl=_fake_mla_quantize_and_rope_for_fp8)

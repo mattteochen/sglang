@@ -154,6 +154,21 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert (
         hidden_size & (hidden_size - 1)
     ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
+    if torch._dynamo.is_compiling():
+        x_shape = x.shape
+        out = x.reshape(-1, hidden_size)
+        if out.stride(-1) != 1:
+            out = out.contiguous()
+        step = 1
+        while step < hidden_size:
+            out = out.reshape(-1, hidden_size // (2 * step), 2, step)
+            lhs = out[..., 0, :]
+            rhs = out[..., 1, :]
+            out = torch.stack((lhs + rhs, lhs - rhs), dim=-2).reshape(
+                -1, hidden_size
+            )
+            step *= 2
+        return out.mul(hidden_size**-0.5).reshape(x_shape)
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 

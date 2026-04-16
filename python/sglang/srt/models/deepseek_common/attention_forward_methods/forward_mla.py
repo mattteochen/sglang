@@ -180,9 +180,19 @@ class DeepseekMLAForwardMixin:
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     k_nope = k_nope.unsqueeze(1)
-                    q = self.q_b_proj(q)[0].view(
-                        -1, self.num_local_heads, self.qk_head_dim
-                    )
+                    if (
+                        torch._dynamo.is_compiling()
+                        and self._is_supported_block_fp8_linear_native_compile_module(
+                            self.q_b_proj
+                        )
+                    ):
+                        q = self._forward_q_b_proj_native_compile(q).view(
+                            -1, self.num_local_heads, self.qk_head_dim
+                        )
+                    else:
+                        q = self.q_b_proj(q)[0].view(
+                            -1, self.num_local_heads, self.qk_head_dim
+                        )
                 if not self.skip_topk or prev_topk_indices is None:
                     topk_indices = self.indexer(
                         x=hidden_states,
@@ -196,7 +206,19 @@ class DeepseekMLAForwardMixin:
                 current_stream.wait_stream(self.alt_stream)
             else:
                 k_nope = k_nope.unsqueeze(1)
-                q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+                if (
+                    torch._dynamo.is_compiling()
+                    and self._is_supported_block_fp8_linear_native_compile_module(
+                        self.q_b_proj
+                    )
+                ):
+                    q = self._forward_q_b_proj_native_compile(q).view(
+                        -1, self.num_local_heads, self.qk_head_dim
+                    )
+                else:
+                    q = self.q_b_proj(q)[0].view(
+                        -1, self.num_local_heads, self.qk_head_dim
+                    )
                 if q_lora is not None:
                     if not self.skip_topk or prev_topk_indices is None:
                         topk_indices = self.indexer(
@@ -209,17 +231,45 @@ class DeepseekMLAForwardMixin:
                     else:
                         topk_indices = prev_topk_indices
         else:
-            q = self.q_proj(hidden_states)[0].view(
-                -1, self.num_local_heads, self.qk_head_dim
-            )
-            latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
+            if (
+                torch._dynamo.is_compiling()
+                and self._is_supported_block_fp8_linear_native_compile_module(
+                    self.q_proj
+                )
+            ):
+                q = self._forward_q_proj_native_compile(hidden_states).view(
+                    -1, self.num_local_heads, self.qk_head_dim
+                )
+            else:
+                q = self.q_proj(hidden_states)[0].view(
+                    -1, self.num_local_heads, self.qk_head_dim
+                )
+            if (
+                torch._dynamo.is_compiling()
+                and self._is_supported_block_fp8_linear_native_compile_module(
+                    self.kv_a_proj_with_mqa
+                )
+            ):
+                latent_cache = self._forward_kv_a_proj_with_mqa_native_compile(
+                    hidden_states
+                )
+            else:
+                latent_cache = self.kv_a_proj_with_mqa(hidden_states)[0]
             k_nope = latent_cache[..., : self.kv_lora_rank]
             k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
 
         q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
         k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
-        if self.use_deep_gemm_bmm:
+        if (
+            torch._dynamo.is_compiling()
+            and self._should_use_absorb_native_bf16_compile_path(self.w_kc)
+        ):
+            q_nope_out = torch.bmm(
+                q_nope.to(torch.bfloat16).transpose(0, 1),
+                self._get_w_kc_native_weight_bf16(),
+            )
+        elif self.use_deep_gemm_bmm:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
                 per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
             )
@@ -449,7 +499,19 @@ class DeepseekMLAForwardMixin:
             )
         attn_output = attn_output.view(-1, self.num_local_heads, self.kv_lora_rank)
 
-        if self.use_deep_gemm_bmm:
+        if (
+            torch._dynamo.is_compiling()
+            and self._should_use_absorb_native_bf16_compile_path(self.w_vc)
+        ):
+            attn_bmm_output = (
+                torch.bmm(
+                    attn_output.to(torch.bfloat16).transpose(0, 1),
+                    self._get_w_vc_native_weight_bf16(),
+                )
+                .transpose(0, 1)
+                .flatten(1, 2)
+            )
+        elif self.use_deep_gemm_bmm:
             attn_output_val, attn_output_scale, masked_m, expected_m, aligned_m = (
                 per_token_group_quant_mla_deep_gemm_masked_fp8(
                     attn_output.transpose(0, 1)
@@ -562,7 +624,13 @@ class DeepseekMLAForwardMixin:
                         -1, self.num_local_heads, self.v_head_dim
                     ).transpose(0, 1),
                 )
-        output, _ = self.o_proj(attn_bmm_output)
+        if (
+            torch._dynamo.is_compiling()
+            and self._is_supported_block_fp8_linear_native_compile_module(self.o_proj)
+        ):
+            output = self._forward_o_proj_native_compile(attn_bmm_output)
+        else:
+            output, _ = self.o_proj(attn_bmm_output)
 
         if self.next_skip_topk is None:
             return output
