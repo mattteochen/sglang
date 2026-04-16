@@ -258,7 +258,7 @@ def _get_experimental_prefill_compile_options() -> Dict[str, Any]:
     return {
         "cpp_wrapper": True,
         "combo_kernels": True,
-        "trace.enabled": True,
+        # "trace.enabled": True,
     }
 
 
@@ -296,17 +296,33 @@ def _run_experimental_prefill_compiled_runner(
 
 
 def _reset_experimental_prefill_compiled_runner(module: torch.nn.Module) -> None:
-    if getattr(module, "_experimental_prefill_compile_enabled", False):
-        _set_multi_platform_compile_mode(module, reverse=True, num_tokens=1)
-        module._experimental_prefill_compile_enabled = False
+    _leave_experimental_prefill_compile_mode(module)
     module._experimental_prefill_compiled_runner = None
+
+
+def _enter_experimental_prefill_compile_mode(
+    module: torch.nn.Module, *, num_tokens: int
+) -> None:
+    if getattr(module, "_experimental_prefill_compile_enabled", False):
+        return
+    _set_multi_platform_compile_mode(
+        module, reverse=False, num_tokens=max(int(num_tokens), 1)
+    )
+    module._experimental_prefill_compile_enabled = True
+
+
+def _leave_experimental_prefill_compile_mode(module: torch.nn.Module) -> None:
+    if not getattr(module, "_experimental_prefill_compile_enabled", False):
+        return
+    _set_multi_platform_compile_mode(module, reverse=True, num_tokens=1)
+    module._experimental_prefill_compile_enabled = False
 
 
 @functools.lru_cache(maxsize=None)
 def _get_experimental_prefill_nested_compile_region_fn(fn):
     return torch.compiler.nested_compile_region(
         fn,
-        max_reuse_entries=64,
+        max_reuse_entries=1,
     )
 
 
@@ -2458,6 +2474,8 @@ class DeepseekV2DecoderLayer(nn.Module):
                 f"layer {self.layer_id}.",
             )
             self._experimental_prefill_compile_logged_eligible = True
+        if not eligible:
+            _leave_experimental_prefill_compile_mode(self)
         return eligible
 
     def _prepare_experimental_prefill_compile_state(
@@ -2523,10 +2541,10 @@ class DeepseekV2DecoderLayer(nn.Module):
     def _ensure_experimental_prefill_compiled(
         self, num_tokens: int, forward_batch: ForwardBatch
     ) -> None:
-        if (
-            self._experimental_prefill_compiled_runner is not None
-            or self._experimental_prefill_compile_failed
-        ):
+        if self._experimental_prefill_compile_failed:
+            return
+        if self._experimental_prefill_compiled_runner is not None:
+            _enter_experimental_prefill_compile_mode(self, num_tokens=num_tokens)
             return
 
         try:
@@ -2540,10 +2558,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             pass
 
         self._prepare_experimental_prefill_compile_state(forward_batch)
-        _set_multi_platform_compile_mode(
-            self, reverse=False, num_tokens=max(int(num_tokens), 1)
-        )
-        self._experimental_prefill_compile_enabled = True
+        _enter_experimental_prefill_compile_mode(self, num_tokens=num_tokens)
         log_info_on_rank0(
             logger,
             "Creating experimental compiled DeepSeek prefill runner for "
@@ -2559,9 +2574,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         )
 
     def _disable_experimental_prefill_compile(self) -> None:
-        if self._experimental_prefill_compile_enabled:
-            _set_multi_platform_compile_mode(self, reverse=True, num_tokens=1)
-            self._experimental_prefill_compile_enabled = False
+        _leave_experimental_prefill_compile_mode(self)
         self._experimental_prefill_compiled_runner = None
         self._experimental_prefill_compile_failed = True
 
@@ -3053,6 +3066,8 @@ class DeepseekV2Model(nn.Module):
                 f"layers {self.start_layer}-{self.end_layer - 1}.",
             )
             self._experimental_prefill_compile_logged_eligible = True
+        if not eligible:
+            _leave_experimental_prefill_compile_mode(self)
         return eligible
 
     def _prepare_experimental_prefill_compile_state(
@@ -3082,10 +3097,10 @@ class DeepseekV2Model(nn.Module):
     def _ensure_experimental_prefill_compiled(
         self, num_tokens: int, forward_batch: ForwardBatch
     ) -> None:
-        if (
-            self._experimental_prefill_compiled_runner is not None
-            or self._experimental_prefill_compile_failed
-        ):
+        if self._experimental_prefill_compile_failed:
+            return
+        if self._experimental_prefill_compiled_runner is not None:
+            _enter_experimental_prefill_compile_mode(self, num_tokens=num_tokens)
             return
 
         try:
@@ -3099,10 +3114,7 @@ class DeepseekV2Model(nn.Module):
             pass
 
         self._prepare_experimental_prefill_compile_state(forward_batch)
-        _set_multi_platform_compile_mode(
-            self, reverse=False, num_tokens=max(int(num_tokens), 1)
-        )
-        self._experimental_prefill_compile_enabled = True
+        _enter_experimental_prefill_compile_mode(self, num_tokens=num_tokens)
         log_info_on_rank0(
             logger,
             "Creating experimental compiled DeepSeek prefill runner for "
@@ -3112,15 +3124,13 @@ class DeepseekV2Model(nn.Module):
         )
         self._experimental_prefill_compiled_runner = torch.compile(
             self._forward_prefill_model_impl,
-            dynamic=True,
+            # dynamic=True,
             backend=get_compiler_backend(),
             options=_get_experimental_prefill_compile_options(),
         )
 
     def _disable_experimental_prefill_compile(self) -> None:
-        if self._experimental_prefill_compile_enabled:
-            _set_multi_platform_compile_mode(self, reverse=True, num_tokens=1)
-            self._experimental_prefill_compile_enabled = False
+        _leave_experimental_prefill_compile_mode(self)
         self._experimental_prefill_compiled_runner = None
         self._experimental_prefill_compile_failed = True
 
