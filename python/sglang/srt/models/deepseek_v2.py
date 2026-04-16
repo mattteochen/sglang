@@ -268,6 +268,14 @@ _SKIP_GUARD_EVAL_UNSAFE_RECOMPILE_MESSAGE = (
 _NESTED_COMPILE_REGION_ROOT_SUBGRAPH_MESSAGE = (
     "lift_tracked_freevar_to_input should not be called on root SubgraphTracer"
 )
+_EXPERIMENTAL_PREFILL_NESTED_COMPILE_REGION_MIN_LAYER_ID = 3
+_experimental_prefill_nested_compile_region_enabled = False
+
+
+def _deepseek_prefill_mlp_native_bf16_gemms_enabled() -> bool:
+    return (
+        not envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_DISABLE_MLP_BF16_GEMMS.get()
+    )
 
 
 def _run_experimental_prefill_compiled_runner(
@@ -294,12 +302,94 @@ def _reset_experimental_prefill_compiled_runner(module: torch.nn.Module) -> None
     module._experimental_prefill_compiled_runner = None
 
 
+@functools.lru_cache(maxsize=None)
+def _get_experimental_prefill_nested_compile_region_fn(fn):
+    return torch.compiler.nested_compile_region(
+        fn,
+        max_reuse_entries=64,
+    )
+
+
+def _should_use_experimental_prefill_nested_compile_region_for_layer(
+    layer_id: Optional[int],
+) -> bool:
+    return (
+        layer_id is not None
+        and layer_id >= _EXPERIMENTAL_PREFILL_NESTED_COMPILE_REGION_MIN_LAYER_ID
+        and envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_NESTED_COMPILE_REGION.get()
+        and _experimental_prefill_nested_compile_region_enabled
+    )
+
+
+def _get_experimental_prefill_nested_compile_region_target(
+    layer: nn.Module,
+):
+    wrapped_fn = getattr(layer._forward_prefill_impl, "__func__", None)
+    if not _should_use_experimental_prefill_nested_compile_region_for_layer(
+        getattr(layer, "layer_id", None)
+    ) or wrapped_fn is None:
+        return layer._forward_prefill_impl
+    return _get_experimental_prefill_nested_compile_region_fn(wrapped_fn).__get__(
+        layer, type(layer)
+    )
+
+
+def _format_experimental_prefill_nested_compile_region_layer_ids(
+    layer_ids: Iterable[int],
+) -> str:
+    layer_ids = list(layer_ids)
+    if not layer_ids:
+        return "none"
+    if layer_ids == list(range(layer_ids[0], layer_ids[-1] + 1)):
+        return (
+            str(layer_ids[0])
+            if len(layer_ids) == 1
+            else f"{layer_ids[0]}-{layer_ids[-1]}"
+        )
+    return ",".join(str(layer_id) for layer_id in layer_ids)
+
+
+def _get_experimental_prefill_nested_compile_region_layer_ids(
+    layer_ids: Iterable[int],
+) -> List[int]:
+    return [
+        layer_id
+        for layer_id in layer_ids
+        if _should_use_experimental_prefill_nested_compile_region_for_layer(layer_id)
+    ]
+
+
+def _log_experimental_prefill_nested_compile_region_failure(
+    exc: BaseException,
+    layer_ids: Iterable[int],
+) -> None:
+    nested_compile_layer_ids = _get_experimental_prefill_nested_compile_region_layer_ids(
+        layer_ids
+    )
+    if not nested_compile_layer_ids:
+        return
+    log_info_on_rank0(
+        logger,
+        "Experimental DeepSeek prefill nested_compile_region failed for "
+        f"layers {_format_experimental_prefill_nested_compile_region_layer_ids(nested_compile_layer_ids)} "
+        f"with {type(exc).__name__}: {exc!r}. Retrying with nested_compile_region disabled.",
+    )
+
+
+def _format_experimental_prefill_nested_compile_region_status(
+    layer_ids: Iterable[int],
+) -> str:
+    return _format_experimental_prefill_nested_compile_region_layer_ids(
+        _get_experimental_prefill_nested_compile_region_layer_ids(layer_ids)
+    )
+
+
 def _disable_experimental_prefill_nested_compile_region() -> bool:
-    wrapped_fn = DeepseekV2DecoderLayer._forward_prefill_impl
-    original_fn = getattr(wrapped_fn, "__marked_compile_region_fn__", None)
-    if original_fn is None:
+    global _experimental_prefill_nested_compile_region_enabled
+
+    if not _experimental_prefill_nested_compile_region_enabled:
         return False
-    DeepseekV2DecoderLayer._forward_prefill_impl = original_fn
+    _experimental_prefill_nested_compile_region_enabled = False
     log_info_on_rank0(
         logger,
         "Disabled experimental nested_compile_region for DeepSeek prefill "
@@ -310,12 +400,11 @@ def _disable_experimental_prefill_nested_compile_region() -> bool:
 
 def _should_retry_experimental_prefill_without_nested_compile_region(
     exc: BaseException,
+    layer_ids: Iterable[int],
 ) -> bool:
-    if not envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_NESTED_COMPILE_REGION.get():
-        return False
-    if (
-        getattr(DeepseekV2DecoderLayer._forward_prefill_impl, "__marked_compile_region_fn__", None)
-        is None
+    if not any(
+        _should_use_experimental_prefill_nested_compile_region_for_layer(layer_id)
+        for layer_id in layer_ids
     ):
         return False
     return _NESTED_COMPILE_REGION_ROOT_SUBGRAPH_MESSAGE in str(exc)
@@ -457,6 +546,8 @@ class DeepseekV2MLP(nn.Module):
         return weight_bf16
 
     def _should_use_native_bf16_compile_path(self) -> bool:
+        if not _deepseek_prefill_mlp_native_bf16_gemms_enabled():
+            return False
         return self._is_supported_block_fp8_linear_native_compile_module(
             self.gate_up_proj
         ) and self._is_supported_block_fp8_linear_native_compile_module(
@@ -2456,10 +2547,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         log_info_on_rank0(
             logger,
             "Creating experimental compiled DeepSeek prefill runner for "
-            f"layer {self.layer_id} with num_tokens={num_tokens}.",
+            f"layer {self.layer_id} with num_tokens={num_tokens} "
+            f"(nested_compile_region layers: "
+            f"{_format_experimental_prefill_nested_compile_region_status([self.layer_id])}).",
         )
         self._experimental_prefill_compiled_runner = torch.compile(
-            self._forward_prefill_impl,
+            _get_experimental_prefill_nested_compile_region_target(self),
             dynamic=True,
             backend=get_compiler_backend(),
             options=_get_experimental_prefill_compile_options(),
@@ -2647,9 +2740,14 @@ class DeepseekV2DecoderLayer(nn.Module):
                     return out
                 except Exception as exc:
                     if _should_retry_experimental_prefill_without_nested_compile_region(
-                        exc
+                        exc,
+                        layer_ids=[self.layer_id],
                     ):
                         try:
+                            _log_experimental_prefill_nested_compile_region_failure(
+                                exc,
+                                layer_ids=[self.layer_id],
+                            )
                             _disable_experimental_prefill_nested_compile_region()
                             _reset_experimental_prefill_compiled_runner(self)
                             self._ensure_experimental_prefill_compiled(
@@ -2776,20 +2874,17 @@ class DeepseekV2DecoderLayer(nn.Module):
         return output
 
 
-@functools.lru_cache(maxsize=1)
 def _enable_experimental_prefill_nested_compile_region() -> None:
-    wrapped_fn = DeepseekV2DecoderLayer._forward_prefill_impl
-    if not hasattr(wrapped_fn, "__marked_compile_region_fn__"):
-        DeepseekV2DecoderLayer._forward_prefill_impl = (
-            torch.compiler.nested_compile_region(
-                wrapped_fn,
-                max_reuse_entries=64,
-            )
-        )
+    global _experimental_prefill_nested_compile_region_enabled
+
+    _get_experimental_prefill_nested_compile_region_fn(
+        DeepseekV2DecoderLayer._forward_prefill_impl
+    )
+    _experimental_prefill_nested_compile_region_enabled = True
     log_info_on_rank0(
         logger,
         "Enabled experimental nested_compile_region for DeepSeek prefill "
-        "decoder blocks.",
+        "decoder blocks from layer 3 onward.",
     )
 
 
@@ -3012,7 +3107,8 @@ class DeepseekV2Model(nn.Module):
             logger,
             "Creating experimental compiled DeepSeek prefill runner for "
             f"layers {self.start_layer}-{self.end_layer - 1} with "
-            f"num_tokens={num_tokens}.",
+            f"num_tokens={num_tokens} (nested_compile_region layers: "
+            f"{_format_experimental_prefill_nested_compile_region_status(range(self.start_layer, self.end_layer))}).",
         )
         self._experimental_prefill_compiled_runner = torch.compile(
             self._forward_prefill_model_impl,
@@ -3049,7 +3145,9 @@ class DeepseekV2Model(nn.Module):
             use_reduce_scatter = layer.layer_communicator.should_use_reduce_scatter(
                 forward_batch
             )
-            hidden_states, residual, topk_indices = layer._forward_prefill_impl(
+            hidden_states, residual, topk_indices = (
+                _get_experimental_prefill_nested_compile_region_target(layer)
+            )(
                 positions,
                 hidden_states,
                 forward_batch,
@@ -3214,10 +3312,19 @@ class DeepseekV2Model(nn.Module):
                         self._experimental_prefill_compile_logged_success = True
                     return out
                 except Exception as exc:
+                    layer_ids = [
+                        getattr(self.layers[i], "layer_id", i)
+                        for i in range(self.start_layer, self.end_layer)
+                    ]
                     if _should_retry_experimental_prefill_without_nested_compile_region(
-                        exc
+                        exc,
+                        layer_ids=layer_ids,
                     ):
                         try:
+                            _log_experimental_prefill_nested_compile_region_failure(
+                                exc,
+                                layer_ids=layer_ids,
+                            )
                             _disable_experimental_prefill_nested_compile_region()
                             _reset_experimental_prefill_compiled_runner(self)
                             self._ensure_experimental_prefill_compiled(
