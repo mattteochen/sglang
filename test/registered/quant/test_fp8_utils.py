@@ -3,6 +3,7 @@ import unittest
 import torch
 
 from sglang.srt.layers.quantization.fp8_utils import (
+    _unpack_ue8m0_scale_for_triton,
     inverse_transform_scale_ue8m0,
     quant_weight_ue8m0,
     transform_scale_ue8m0,
@@ -41,6 +42,28 @@ class TestInverseTransformScaleUe8m0(CustomTestCase):
             assert torch.all(
                 sf_fp32_original == sf_fp32_recreated
             ), f"{sf_fp32_original=} {sf_fp32_recreated}"
+
+    def test_unpack_triton_scale_with_size_one_trailing_dim(self):
+        # Shared-expert TP sharding can legally produce a "contiguous" int32
+        # tensor with shape [N, 1] and a non-unit last stride. The unpack helper
+        # must still be able to reinterpret it as uint8 for bf16 dequantization.
+        weight_bf16 = torch.randn((6144, 384), dtype=torch.bfloat16, device="cuda")
+        weight_block_size = [128, 128]
+        _, sf_fp32_original = quant_weight_ue8m0(
+            weight_bf16, weight_block_size=weight_block_size
+        )
+        sf_packed = transform_scale_ue8m0(sf_fp32_original, mn=weight_bf16.shape[0])
+        sf_packed = sf_packed.t()
+
+        self.assertEqual(sf_packed.shape[-1], 1)
+        self.assertEqual(sf_packed.stride()[-1], weight_bf16.shape[0])
+
+        sf_fp32_recreated = _unpack_ue8m0_scale_for_triton(
+            sf_packed,
+            tuple(weight_bf16.shape),
+            weight_block_size,
+        )
+        self.assertTrue(torch.equal(sf_fp32_recreated, sf_fp32_original))
 
 
 if __name__ == "__main__":

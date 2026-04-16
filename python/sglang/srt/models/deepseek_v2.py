@@ -192,6 +192,42 @@ else:
 logger = logging.getLogger(__name__)
 
 
+def _validate_native_compile_linear_semantics(
+    module: nn.Module,
+    *,
+    module_name: str,
+    allow_bias: bool = False,
+) -> None:
+    if getattr(module, "gather_output", False):
+        raise RuntimeError(
+            "Experimental DeepSeek native BF16 compile path does not support "
+            f"{module_name} ({module.__class__.__name__}) with gather_output=True; "
+            "the native wrapper does not issue the required TP all-gather."
+        )
+    if hasattr(module, "input_is_parallel") and not getattr(
+        module, "input_is_parallel"
+    ):
+        raise RuntimeError(
+            "Experimental DeepSeek native BF16 compile path does not support "
+            f"{module_name} ({module.__class__.__name__}) with "
+            "input_is_parallel=False; the native wrapper expects shard-local "
+            "inputs and does not split them for TP."
+        )
+    if getattr(module, "skip_bias_add", False):
+        raise RuntimeError(
+            "Experimental DeepSeek native BF16 compile path does not support "
+            f"{module_name} ({module.__class__.__name__}) with "
+            "skip_bias_add=True; the native wrapper does not return a "
+            "separate output_bias tensor."
+        )
+    if not allow_bias and getattr(module, "bias", None) is not None:
+        raise RuntimeError(
+            "Experimental DeepSeek native BF16 compile path does not support "
+            f"{module_name} ({module.__class__.__name__}) with bias; the native "
+            "wrapper only handles bias-free modules here."
+        )
+
+
 def _set_multi_platform_compile_mode(
     module: torch.nn.Module, *, reverse: bool, num_tokens: int
 ):
@@ -364,8 +400,16 @@ class DeepseekV2MLP(nn.Module):
         )
 
     def _get_block_fp8_linear_native_weight_bf16(
-        self, module: nn.Module, cache_attr: str
+        self,
+        module: nn.Module,
+        cache_attr: str,
+        *,
+        module_name: str,
+        allow_bias: bool = False,
     ) -> torch.Tensor:
+        _validate_native_compile_linear_semantics(
+            module, module_name=module_name, allow_bias=allow_bias
+        )
         weight = getattr(module, "weight", None)
         cached_weight = getattr(self, cache_attr)
         if (
@@ -425,6 +469,7 @@ class DeepseekV2MLP(nn.Module):
             self._get_block_fp8_linear_native_weight_bf16(
                 self.gate_up_proj,
                 "_gate_up_proj_native_weight_bf16",
+                module_name="gate_up_proj",
             ),
         )
 
@@ -439,6 +484,7 @@ class DeepseekV2MLP(nn.Module):
             self._get_block_fp8_linear_native_weight_bf16(
                 self.down_proj,
                 "_down_proj_native_weight_bf16",
+                module_name="down_proj",
             ),
         )
         if (
@@ -459,10 +505,12 @@ class DeepseekV2MLP(nn.Module):
             self._get_block_fp8_linear_native_weight_bf16(
                 self.gate_up_proj,
                 "_gate_up_proj_native_weight_bf16",
+                module_name="gate_up_proj",
             )
             self._get_block_fp8_linear_native_weight_bf16(
                 self.down_proj,
                 "_down_proj_native_weight_bf16",
+                module_name="down_proj",
             )
 
     def forward(
@@ -1679,8 +1727,16 @@ class DeepseekV2AttentionMLA(
         )
 
     def _get_block_fp8_linear_native_weight_bf16(
-        self, module: nn.Module, cache_attr: str
+        self,
+        module: nn.Module,
+        cache_attr: str,
+        *,
+        module_name: str,
+        allow_bias: bool = False,
     ) -> torch.Tensor:
+        _validate_native_compile_linear_semantics(
+            module, module_name=module_name, allow_bias=allow_bias
+        )
         weight = getattr(module, "weight", None)
         cached_weight = getattr(self, cache_attr)
         if (
@@ -1735,6 +1791,7 @@ class DeepseekV2AttentionMLA(
             self._get_block_fp8_linear_native_weight_bf16(
                 self.fused_qkv_a_proj_with_mqa,
                 "_fused_qkv_a_proj_native_weight_bf16",
+                module_name="fused_qkv_a_proj_with_mqa",
             ),
         )
 
@@ -1744,6 +1801,7 @@ class DeepseekV2AttentionMLA(
             self._get_block_fp8_linear_native_weight_bf16(
                 self.q_b_proj,
                 "_q_b_proj_native_weight_bf16",
+                module_name="q_b_proj",
             ),
         )
 
@@ -1753,6 +1811,7 @@ class DeepseekV2AttentionMLA(
             self._get_block_fp8_linear_native_weight_bf16(
                 self.q_proj,
                 "_q_proj_native_weight_bf16",
+                module_name="q_proj",
             ),
         )
 
@@ -1764,6 +1823,7 @@ class DeepseekV2AttentionMLA(
             self._get_block_fp8_linear_native_weight_bf16(
                 self.kv_a_proj_with_mqa,
                 "_kv_a_proj_with_mqa_native_weight_bf16",
+                module_name="kv_a_proj_with_mqa",
             ),
         )
 
@@ -1780,6 +1840,8 @@ class DeepseekV2AttentionMLA(
             self._get_block_fp8_linear_native_weight_bf16(
                 self.o_proj,
                 "_o_proj_native_weight_bf16",
+                module_name="o_proj",
+                allow_bias=True,
             ),
             bias,
         )
@@ -1859,6 +1921,7 @@ class DeepseekV2AttentionMLA(
             self._get_block_fp8_linear_native_weight_bf16(
                 self.fused_qkv_a_proj_with_mqa,
                 "_fused_qkv_a_proj_native_weight_bf16",
+                module_name="fused_qkv_a_proj_with_mqa",
             )
         if self._is_supported_block_fp8_linear_native_compile_module(
             getattr(self, "q_b_proj", None)
@@ -1866,6 +1929,7 @@ class DeepseekV2AttentionMLA(
             self._get_block_fp8_linear_native_weight_bf16(
                 self.q_b_proj,
                 "_q_b_proj_native_weight_bf16",
+                module_name="q_b_proj",
             )
         if self._is_supported_block_fp8_linear_native_compile_module(
             getattr(self, "q_proj", None)
@@ -1873,6 +1937,7 @@ class DeepseekV2AttentionMLA(
             self._get_block_fp8_linear_native_weight_bf16(
                 self.q_proj,
                 "_q_proj_native_weight_bf16",
+                module_name="q_proj",
             )
         if self._is_supported_block_fp8_linear_native_compile_module(
             getattr(self, "kv_a_proj_with_mqa", None)
@@ -1880,6 +1945,7 @@ class DeepseekV2AttentionMLA(
             self._get_block_fp8_linear_native_weight_bf16(
                 self.kv_a_proj_with_mqa,
                 "_kv_a_proj_with_mqa_native_weight_bf16",
+                module_name="kv_a_proj_with_mqa",
             )
         if self._is_supported_block_fp8_linear_native_compile_module(
             getattr(self, "o_proj", None)
@@ -1887,6 +1953,8 @@ class DeepseekV2AttentionMLA(
             self._get_block_fp8_linear_native_weight_bf16(
                 self.o_proj,
                 "_o_proj_native_weight_bf16",
+                module_name="o_proj",
+                allow_bias=True,
             )
         if self._should_use_absorb_native_bf16_compile_path(self.w_kc):
             self._get_w_kc_native_weight_bf16()
