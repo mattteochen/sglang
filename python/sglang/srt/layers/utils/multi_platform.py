@@ -1,4 +1,4 @@
-from typing import Callable
+from typing import Callable, Optional
 
 from torch import nn
 
@@ -30,6 +30,29 @@ class MultiPlatformOp(nn.Module):
         # States for torch.compile
         self._original_forward_method = None
         self.is_torch_compile = False
+        self._cached_torch_compile_forward_method: Optional[Callable] = None
+        self._cached_topk_compile_forward_method: Optional[Callable] = None
+
+    def _get_torch_compile_forward_method(self, num_tokens: int) -> Callable:
+        if "FusedMoE" in self.__class__.__name__:
+            if num_tokens == 1:
+                from sglang.srt.layers.moe.fused_moe_native import (
+                    fused_moe_forward_native,
+                )
+
+                return fused_moe_forward_native
+            return self._forward_method
+
+        if "TopK" in self.__class__.__name__:
+            if num_tokens == 1:
+                if self._cached_topk_compile_forward_method is None:
+                    self._cached_topk_compile_forward_method = self.forward_native
+                return self._cached_topk_compile_forward_method
+            return self._forward_method
+
+        if self._cached_torch_compile_forward_method is None:
+            self._cached_torch_compile_forward_method = self.forward_native
+        return self._cached_torch_compile_forward_method
 
     def enter_torch_compile(self, num_tokens: int):
         # Skip if Op is already entered compile mode.
@@ -41,21 +64,7 @@ class MultiPlatformOp(nn.Module):
             return
 
         self._original_forward_method = self._forward_method
-        # NOTE: Temporarily workaround MoE
-        # The performance of torch.compile on this layer is not always good when bs > 1,
-        # so we decide to only use torch.compile when bs=1
-        if "FusedMoE" in self.__class__.__name__:
-            if num_tokens == 1:
-                from sglang.srt.layers.moe.fused_moe_native import (
-                    fused_moe_forward_native,
-                )
-
-                self._forward_method = fused_moe_forward_native
-        elif "TopK" in self.__class__.__name__:
-            if num_tokens == 1:
-                self._forward_method = self.forward_native
-        else:
-            self._forward_method = self.forward_native
+        self._forward_method = self._get_torch_compile_forward_method(num_tokens)
         self.is_torch_compile = True
 
     def leave_torch_compile(self):

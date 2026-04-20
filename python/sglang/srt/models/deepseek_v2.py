@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import functools
 import logging
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -258,7 +258,7 @@ def _get_experimental_prefill_compile_options() -> Dict[str, Any]:
     return {
         "cpp_wrapper": True,
         "combo_kernels": True,
-        # "trace.enabled": True,
+        "trace.enabled": True,
     }
 
 
@@ -298,17 +298,18 @@ def _run_experimental_prefill_compiled_runner(
 def _reset_experimental_prefill_compiled_runner(module: torch.nn.Module) -> None:
     _leave_experimental_prefill_compile_mode(module)
     module._experimental_prefill_compiled_runner = None
+    module._experimental_prefill_compile_num_tokens = 1
 
 
 def _enter_experimental_prefill_compile_mode(
     module: torch.nn.Module, *, num_tokens: int
 ) -> None:
+    num_tokens = max(int(num_tokens), 1)
     if getattr(module, "_experimental_prefill_compile_enabled", False):
         return
-    _set_multi_platform_compile_mode(
-        module, reverse=False, num_tokens=max(int(num_tokens), 1)
-    )
+    _set_multi_platform_compile_mode(module, reverse=False, num_tokens=num_tokens)
     module._experimental_prefill_compile_enabled = True
+    module._experimental_prefill_compile_num_tokens = num_tokens
 
 
 def _leave_experimental_prefill_compile_mode(module: torch.nn.Module) -> None:
@@ -316,6 +317,25 @@ def _leave_experimental_prefill_compile_mode(module: torch.nn.Module) -> None:
         return
     _set_multi_platform_compile_mode(module, reverse=True, num_tokens=1)
     module._experimental_prefill_compile_enabled = False
+
+
+@contextmanager
+def _temporarily_leave_experimental_prefill_compile_mode(module: torch.nn.Module):
+    should_restore_compile_mode = (
+        getattr(module, "_experimental_prefill_compile_enabled", False)
+        and getattr(module, "_experimental_prefill_compiled_runner", None) is not None
+        and not getattr(module, "_experimental_prefill_compile_failed", False)
+    )
+    restore_num_tokens = getattr(module, "_experimental_prefill_compile_num_tokens", 1)
+    if should_restore_compile_mode:
+        _leave_experimental_prefill_compile_mode(module)
+    try:
+        yield
+    finally:
+        if should_restore_compile_mode:
+            _enter_experimental_prefill_compile_mode(
+                module, num_tokens=restore_num_tokens
+            )
 
 
 @functools.lru_cache(maxsize=None)
@@ -2433,6 +2453,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         self._experimental_prefill_compile_logged_eligible = False
         self._experimental_prefill_compile_logged_success = False
         self._experimental_prefill_compile_warmup_count = 0
+        self._experimental_prefill_compile_num_tokens = 1
 
     def _detect_gfx95_quant_format(self) -> str:
         if not _is_gfx95_supported:
@@ -2474,8 +2495,6 @@ class DeepseekV2DecoderLayer(nn.Module):
                 f"layer {self.layer_id}.",
             )
             self._experimental_prefill_compile_logged_eligible = True
-        if not eligible:
-            _leave_experimental_prefill_compile_mode(self)
         return eligible
 
     def _prepare_experimental_prefill_compile_state(
@@ -2577,6 +2596,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         _leave_experimental_prefill_compile_mode(self)
         self._experimental_prefill_compiled_runner = None
         self._experimental_prefill_compile_failed = True
+        self._experimental_prefill_compile_num_tokens = 1
 
     def _forward_prefill_impl(
         self,
@@ -2801,18 +2821,19 @@ class DeepseekV2DecoderLayer(nn.Module):
                         exc,
                     )
 
-        return self._forward_prefill_impl(
-            positions,
-            hidden_states,
-            forward_batch,
-            residual,
-            zero_allocator,
-            gemm_output_zero_allocator,
-            llama_4_scaling,
-            prev_topk_indices,
-            should_allreduce_fusion,
-            use_reduce_scatter,
-        )
+        with _temporarily_leave_experimental_prefill_compile_mode(self):
+            return self._forward_prefill_impl(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+                zero_allocator,
+                gemm_output_zero_allocator,
+                llama_4_scaling,
+                prev_topk_indices,
+                should_allreduce_fusion,
+                use_reduce_scatter,
+            )
 
     def op_comm_prepare_attn(
         self,
@@ -3036,6 +3057,7 @@ class DeepseekV2Model(nn.Module):
         self._experimental_prefill_compile_logged_eligible = False
         self._experimental_prefill_compile_logged_success = False
         self._experimental_prefill_compile_warmup_count = 0
+        self._experimental_prefill_compile_num_tokens = 1
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
@@ -3066,8 +3088,6 @@ class DeepseekV2Model(nn.Module):
                 f"layers {self.start_layer}-{self.end_layer - 1}.",
             )
             self._experimental_prefill_compile_logged_eligible = True
-        if not eligible:
-            _leave_experimental_prefill_compile_mode(self)
         return eligible
 
     def _prepare_experimental_prefill_compile_state(
@@ -3124,7 +3144,7 @@ class DeepseekV2Model(nn.Module):
         )
         self._experimental_prefill_compiled_runner = torch.compile(
             self._forward_prefill_model_impl,
-            # dynamic=True,
+            dynamic=True,
             backend=get_compiler_backend(),
             options=_get_experimental_prefill_compile_options(),
         )
@@ -3133,6 +3153,7 @@ class DeepseekV2Model(nn.Module):
         _leave_experimental_prefill_compile_mode(self)
         self._experimental_prefill_compiled_runner = None
         self._experimental_prefill_compile_failed = True
+        self._experimental_prefill_compile_num_tokens = 1
 
     def _forward_prefill_model_impl(
         self,
@@ -3373,85 +3394,88 @@ class DeepseekV2Model(nn.Module):
                         exc,
                     )
 
-        normal_start_layer = self.start_layer
-        normal_end_layer = self.end_layer
-        if forward_batch.can_run_tbo:
-            if (
-                self.first_k_dense_replace > normal_start_layer
-                and self.first_k_dense_replace < normal_end_layer
-            ):
-                normal_end_layer = self.first_k_dense_replace
-            elif self.first_k_dense_replace < normal_start_layer:
-                normal_end_layer = normal_start_layer = 0
-        aux_hidden_states = []
-        topk_indices = None
-        for i in range(normal_start_layer, normal_end_layer):
-            # NOTE: torch dynamo does not support graph break in context manager
-            ctx = (
-                nullcontext()
-                if not get_global_server_args().disable_piecewise_cuda_graph
-                else get_global_expert_distribution_recorder().with_current_layer(i)
-            )
-            with ctx:
-                if i in self.layers_to_capture:
-                    if self.enable_a2a_moe and i > self.first_k_dense_replace:
-                        aux_hidden_state = get_attention_tp_group().all_gather(
-                            hidden_states + residual, dim=0
-                        )
-                        aux_hidden_states.append(aux_hidden_state)
-                    else:
-                        aux_hidden_states.append(hidden_states + residual)
-                layer = self.layers[i]
-                hidden_states, residual, topk_indices = layer(
-                    positions,
-                    hidden_states,
-                    forward_batch,
-                    residual,
-                    zero_allocator,
-                    gemm_output_zero_allocator,
-                    llama_4_scaling,
-                    prev_topk_indices=topk_indices,
+        with _temporarily_leave_experimental_prefill_compile_mode(self):
+            normal_start_layer = self.start_layer
+            normal_end_layer = self.end_layer
+            if forward_batch.can_run_tbo:
+                if (
+                    self.first_k_dense_replace > normal_start_layer
+                    and self.first_k_dense_replace < normal_end_layer
+                ):
+                    normal_end_layer = self.first_k_dense_replace
+                elif self.first_k_dense_replace < normal_start_layer:
+                    normal_end_layer = normal_start_layer = 0
+            aux_hidden_states = []
+            topk_indices = None
+            for i in range(normal_start_layer, normal_end_layer):
+                # NOTE: torch dynamo does not support graph break in context manager
+                ctx = (
+                    nullcontext()
+                    if not get_global_server_args().disable_piecewise_cuda_graph
+                    else get_global_expert_distribution_recorder().with_current_layer(
+                        i
+                    )
+                )
+                with ctx:
+                    if i in self.layers_to_capture:
+                        if self.enable_a2a_moe and i > self.first_k_dense_replace:
+                            aux_hidden_state = get_attention_tp_group().all_gather(
+                                hidden_states + residual, dim=0
+                            )
+                            aux_hidden_states.append(aux_hidden_state)
+                        else:
+                            aux_hidden_states.append(hidden_states + residual)
+                    layer = self.layers[i]
+                    hidden_states, residual, topk_indices = layer(
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        residual,
+                        zero_allocator,
+                        gemm_output_zero_allocator,
+                        llama_4_scaling,
+                        prev_topk_indices=topk_indices,
+                    )
+
+            if normal_end_layer != self.end_layer:
+                hidden_states, residual = model_forward_maybe_tbo(
+                    layers=self.layers[normal_end_layer : self.end_layer],
+                    enable_tbo=True,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    input_data_scatter_mode=self.layers[
+                        normal_end_layer - 1
+                    ].layer_scatter_modes.layer_output_mode,
+                    zero_allocator=zero_allocator,
                 )
 
-        if normal_end_layer != self.end_layer:
-            hidden_states, residual = model_forward_maybe_tbo(
-                layers=self.layers[normal_end_layer : self.end_layer],
-                enable_tbo=True,
-                positions=positions,
-                forward_batch=forward_batch,
-                hidden_states=hidden_states,
-                residual=residual,
-                input_data_scatter_mode=self.layers[
-                    normal_end_layer - 1
-                ].layer_scatter_modes.layer_output_mode,
-                zero_allocator=zero_allocator,
-            )
+            if not self.pp_group.is_last_rank:
+                return PPProxyTensors(
+                    {
+                        "hidden_states": hidden_states,
+                        "residual": residual,
+                    }
+                )
+            else:
+                if not forward_batch.forward_mode.is_idle():
+                    if residual is None:
+                        hidden_states = self.norm(hidden_states)
+                    else:
+                        hidden_states, _ = self.norm(hidden_states, residual)
 
-        if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
-        else:
-            if not forward_batch.forward_mode.is_idle():
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
-
-        if self.pp_group.is_last_rank and nsa_use_prefill_cp(forward_batch):
-            # allgather + rerrange
-            hidden_states = cp_all_gather_rerange_output(
-                hidden_states,
-                self.cp_size,
-                forward_batch,
-                torch.cuda.current_stream(),
-            )
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-        return hidden_states, aux_hidden_states
+            if self.pp_group.is_last_rank and nsa_use_prefill_cp(forward_batch):
+                # allgather + rerrange
+                hidden_states = cp_all_gather_rerange_output(
+                    hidden_states,
+                    self.cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+            if len(aux_hidden_states) == 0:
+                return hidden_states
+            return hidden_states, aux_hidden_states
 
 
 class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):

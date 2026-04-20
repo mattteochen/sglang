@@ -7,6 +7,7 @@ from unittest.mock import patch
 import torch
 from torch import nn
 
+from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import (
@@ -60,12 +61,21 @@ class FakeLayerCommunicator:
         return False
 
 
+class FakeCompileModeOp(MultiPlatformOp):
+    def forward_native(self, x):
+        return x
+
+    def forward_cpu(self, x):
+        return x
+
+
 class FakePrefillCompileLayer(nn.Module):
     def __init__(self, hidden_size: int, layer_id: int):
         super().__init__()
         self.layer_id = layer_id
         self.layer_communicator = FakeLayerCommunicator()
         self.lin1 = nn.Linear(hidden_size, hidden_size, bias=False)
+        self.compile_mode_op = FakeCompileModeOp()
         self.lin2 = nn.Linear(hidden_size, hidden_size, bias=False)
         self.pos_scale = nn.Parameter(torch.randn(hidden_size))
 
@@ -73,7 +83,8 @@ class FakePrefillCompileLayer(nn.Module):
         self, positions: torch.Tensor, hidden_states: torch.Tensor
     ) -> torch.Tensor:
         pos = positions.to(hidden_states.dtype).unsqueeze(-1) * self.pos_scale
-        return self.lin2(torch.relu(self.lin1(hidden_states) + pos))
+        hidden_states = self.compile_mode_op(self.lin1(hidden_states) + pos)
+        return self.lin2(torch.relu(hidden_states))
 
     def _prepare_experimental_prefill_compile_state(self, forward_batch):
         del forward_batch
@@ -146,11 +157,14 @@ class FakeAttnTpContext:
 
 
 def _build_forward_batch(
-    input_ids: torch.Tensor, positions: torch.Tensor
+    input_ids: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    forward_mode: ForwardMode = ForwardMode.EXTEND,
 ) -> ForwardBatch:
     seq_len = input_ids.numel()
     return ForwardBatch(
-        forward_mode=ForwardMode.EXTEND,
+        forward_mode=forward_mode,
         batch_size=1,
         input_ids=input_ids,
         req_pool_indices=torch.tensor([0], dtype=torch.int32),
@@ -199,6 +213,7 @@ def _build_tiny_compile_test_model(
     model._experimental_prefill_compile_logged_eligible = False
     model._experimental_prefill_compile_logged_success = False
     model._experimental_prefill_compile_warmup_count = 0
+    model._experimental_prefill_compile_num_tokens = 1
 
     causal_lm = object.__new__(DeepseekV2ForCausalLM)
     nn.Module.__init__(causal_lm)
@@ -314,6 +329,92 @@ class TestDeepseekV2NestedCompileRegion(unittest.TestCase):
                 targets[layer_id].__func__,
                 layers[layer_id]._forward_prefill_impl.__func__,
             )
+
+
+class TestMultiPlatformCompileCallables(unittest.TestCase):
+    def test_reuses_compile_callable_across_reentry(self):
+        op = FakeCompileModeOp()
+        eager_method = op._forward_method
+
+        op.enter_torch_compile(num_tokens=4)
+        first_compile_method = op._forward_method
+
+        op.leave_torch_compile()
+        op.enter_torch_compile(num_tokens=4)
+        second_compile_method = op._forward_method
+
+        self.assertIsNot(first_compile_method, eager_method)
+        self.assertIs(first_compile_method, second_compile_method)
+
+
+class TestDeepseekV2CompileModeTransitions(unittest.TestCase):
+    def test_model_restores_compile_mode_after_decode_fallback(self):
+        torch.manual_seed(0)
+        model = _build_tiny_compile_test_model(num_layers=4).model
+        prefill_input_ids = torch.tensor([1, 2, 3, 4], dtype=torch.long)
+        prefill_positions = torch.arange(prefill_input_ids.numel(), dtype=torch.long)
+        prefill_batch = _build_forward_batch(prefill_input_ids, prefill_positions)
+
+        decode_input_ids = torch.tensor([5], dtype=torch.long)
+        decode_positions = torch.tensor([4], dtype=torch.long)
+        decode_batch = _build_forward_batch(
+            decode_input_ids,
+            decode_positions,
+            forward_mode=ForwardMode.DECODE,
+        )
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch(
+                    "sglang.srt.models.deepseek_v2.nsa_use_prefill_cp",
+                    return_value=False,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.models.deepseek_v2.get_global_server_args",
+                    return_value=SimpleNamespace(disable_piecewise_cuda_graph=False),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.models.deepseek_v2._prewarm_flashinfer_lazy_modules_for_experimental_prefill_compile",
+                    lambda: None,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.models.deepseek_v2._get_experimental_prefill_compile_options",
+                    lambda: {},
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.models.deepseek_v2.get_compiler_backend",
+                    return_value="aot_eager",
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    model,
+                    "_should_use_experimental_prefill_compile",
+                    side_effect=lambda forward_batch, input_embeds, pp_proxy_tensors: forward_batch.forward_mode.is_extend_without_speculative(),
+                )
+            )
+
+            model.forward(prefill_input_ids, prefill_positions, prefill_batch)
+            self.assertTrue(model._experimental_prefill_compile_enabled)
+            compile_methods = [
+                layer.compile_mode_op._forward_method for layer in model.layers
+            ]
+
+            model.forward(decode_input_ids, decode_positions, decode_batch)
+
+        self.assertTrue(model._experimental_prefill_compile_enabled)
+        self.assertEqual(model._experimental_prefill_compile_num_tokens, 4)
+        for layer, compile_method in zip(model.layers, compile_methods):
+            self.assertTrue(layer.compile_mode_op.is_torch_compile)
+            self.assertIs(layer.compile_mode_op._forward_method, compile_method)
 
 
 class TestDeepseekV2NativeCompileEquivalence(unittest.TestCase):
