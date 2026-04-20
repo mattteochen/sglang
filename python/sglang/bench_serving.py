@@ -149,6 +149,76 @@ def wait_for_endpoint(url: str, timeout_sec: int = 60) -> bool:
         time.sleep(1)
 
 
+def _resize_token_ids(token_ids: List[int], target_len: int) -> List[int]:
+    if target_len < 1:
+        raise ValueError(f"Prompt length must be >= 1, got {target_len}")
+    if not token_ids:
+        return []
+    if len(token_ids) >= target_len:
+        return token_ids[:target_len]
+    repeat = (target_len + len(token_ids) - 1) // len(token_ids)
+    return (token_ids * repeat)[:target_len]
+
+
+def _get_reference_token_ids(
+    prompt: Union[str, List[int], List[str], List[Dict[str, str]]], tokenizer
+) -> List[int]:
+    if isinstance(prompt, str):
+        return tokenizer.encode(prompt, add_special_tokens=False)
+    if isinstance(prompt, list) and (
+        len(prompt) == 0 or isinstance(prompt[0], int)
+    ):
+        return [int(token_id) for token_id in prompt]
+    return []
+
+
+def _build_explicit_warmup_inputs(
+    *,
+    backend: str,
+    tokenizer: PreTrainedTokenizerBase,
+    warmup_input_lens: List[int],
+    test_request: DatasetRow,
+    model_id: str,
+    api_url: str,
+    output_len: int,
+    lora_name: Optional[str],
+    extra_request_body: Dict[str, Any],
+) -> List[RequestFuncInput]:
+    if backend not in {"sglang", "sglang-native"}:
+        raise ValueError(
+            "--warmup-input-lens is currently only supported for sglang backends."
+        )
+    if test_request.image_data is not None:
+        raise ValueError(
+            "--warmup-input-lens is not supported for multimodal warmup requests."
+        )
+
+    reference_token_ids = _get_reference_token_ids(test_request.prompt, tokenizer)
+    if not reference_token_ids:
+        vocab_token_ids = sorted(set(tokenizer.get_vocab().values()))
+        if not vocab_token_ids:
+            raise ValueError("Failed to build warmup token ids from tokenizer vocab.")
+        reference_token_ids = vocab_token_ids
+
+    warmup_inputs = []
+    for prompt_len in warmup_input_lens:
+        prompt_token_ids = _resize_token_ids(reference_token_ids, prompt_len)
+        warmup_inputs.append(
+            RequestFuncInput(
+                model=model_id,
+                prompt=prompt_token_ids,
+                api_url=api_url,
+                prompt_len=len(prompt_token_ids),
+                output_len=output_len,
+                lora_name=lora_name,
+                image_data=None,
+                extra_request_body=extra_request_body,
+            )
+        )
+
+    return warmup_inputs
+
+
 # trt llm does not support ignore_eos
 # https://github.com/triton-inference-server/tensorrtllm_backend/issues/505
 async def async_request_trt_llm(
@@ -1184,6 +1254,7 @@ async def benchmark(
     mooncake_num_rounds=1,
     profile_prefill_url: Optional[List[str]] = None,
     profile_decode_url: Optional[List[str]] = None,
+    warmup_input_lens: Optional[List[int]] = None,
 ):
     if backend in ASYNC_REQUEST_FUNCS:
         request_func = ASYNC_REQUEST_FUNCS[backend]
@@ -1213,7 +1284,10 @@ async def benchmark(
             return await request_func(request_func_input=request_func_input, pbar=pbar)
 
     # Warmup
-    print(f"Starting warmup with {warmup_requests} sequences...")
+    if warmup_input_lens:
+        print(f"Starting warmup with prompt lengths {warmup_input_lens}...")
+    else:
+        print(f"Starting warmup with {warmup_requests} sequences...")
 
     # Handle the data structure difference for the warmup request
     if args.dataset_name == "mooncake":
@@ -1247,38 +1321,58 @@ async def benchmark(
     else:
         lora_name = None
 
-    # Create the test input once
-    test_input = RequestFuncInput(
-        model=model_id,
-        prompt=test_request.prompt,
-        api_url=api_url,
-        prompt_len=test_request.prompt_len,
-        output_len=min(test_request.output_len, 32),
-        lora_name=lora_name,
-        image_data=test_request.image_data,
-        extra_request_body=extra_request_body,
-    )
-
-    # Run warmup requests
-    warmup_tasks = []
-    for _ in range(warmup_requests):
-        warmup_tasks.append(
-            asyncio.create_task(request_func(request_func_input=test_input))
+    warmup_output_len = min(test_request.output_len, 32)
+    if warmup_input_lens:
+        warmup_inputs = _build_explicit_warmup_inputs(
+            backend=backend,
+            tokenizer=tokenizer,
+            warmup_input_lens=warmup_input_lens,
+            test_request=test_request,
+            model_id=model_id,
+            api_url=api_url,
+            output_len=warmup_output_len,
+            lora_name=lora_name,
+            extra_request_body=extra_request_body,
         )
+    else:
+        test_input = RequestFuncInput(
+            model=model_id,
+            prompt=test_request.prompt,
+            api_url=api_url,
+            prompt_len=test_request.prompt_len,
+            output_len=warmup_output_len,
+            lora_name=lora_name,
+            image_data=test_request.image_data,
+            extra_request_body=extra_request_body,
+        )
+        warmup_inputs = [test_input for _ in range(warmup_requests)]
 
-    warmup_outputs = await asyncio.gather(*warmup_tasks)
+    # Run explicit warmup lengths sequentially so compile-oriented warmup can
+    # deterministically walk the targeted graph families in order.
+    if warmup_input_lens:
+        warmup_outputs = []
+        for warmup_input in warmup_inputs:
+            warmup_outputs.append(
+                await request_func(request_func_input=warmup_input)
+            )
+    else:
+        warmup_tasks = [
+            asyncio.create_task(request_func(request_func_input=warmup_input))
+            for warmup_input in warmup_inputs
+        ]
+        warmup_outputs = await asyncio.gather(*warmup_tasks)
     if is_multi_turn:
         warmup_outputs = [x for output in warmup_outputs for x in output]
 
     # Check if at least one warmup request succeeded
-    if warmup_requests > 0 and not any(output.success for output in warmup_outputs):
+    if warmup_inputs and not any(output.success for output in warmup_outputs):
         raise ValueError(
             "Warmup failed - Please make sure benchmark arguments "
             f"are correctly specified. Error: {warmup_outputs[0].error}"
         )
     else:
         print(
-            f"Warmup completed with {args.warmup_requests} sequences. Starting main benchmark run..."
+            f"Warmup completed with {len(warmup_inputs)} sequence(s). Starting main benchmark run..."
         )
 
     # Flush cache
@@ -1662,6 +1756,8 @@ def run_benchmark(args_: argparse.Namespace):
     # Set default value for warmup_requests if not present
     if not hasattr(args, "warmup_requests"):
         args.warmup_requests = 1
+    if not hasattr(args, "warmup_input_lens"):
+        args.warmup_input_lens = None
 
     if not hasattr(args, "output_details"):
         args.output_details = False
@@ -1881,6 +1977,7 @@ def run_benchmark(args_: argparse.Namespace):
             pd_separated=args.pd_separated,
             flush_cache=args.flush_cache,
             warmup_requests=args.warmup_requests,
+            warmup_input_lens=args.warmup_input_lens,
             use_trace_timestamps=args.use_trace_timestamps,
             mooncake_slowdown_factor=args.mooncake_slowdown_factor,
             mooncake_num_rounds=args.mooncake_num_rounds,
@@ -2245,6 +2342,16 @@ if __name__ == "__main__":
         type=int,
         default=1,
         help="Number of warmup requests to run before the benchmark",
+    )
+    parser.add_argument(
+        "--warmup-input-lens",
+        type=int,
+        nargs="+",
+        default=None,
+        help="Explicit prompt lengths for warmup requests. When set, this overrides "
+        "--warmup-requests and sends one warmup request per length. For sglang "
+        "backends these warmups use input_ids, which is useful for pre-hitting "
+        "torch.compile graph families.",
     )
     parser.add_argument(
         "--tokenize-prompt",
