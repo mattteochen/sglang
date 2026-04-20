@@ -262,6 +262,41 @@ def _get_experimental_prefill_compile_options() -> Dict[str, Any]:
     }
 
 
+def _maybe_mark_dynamic_dim0(tensor: Optional[torch.Tensor]) -> None:
+    if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
+        return
+
+    try:
+        torch._dynamo.maybe_mark_dynamic(tensor, [0])
+    except Exception:
+        pass
+
+
+def _mark_experimental_prefill_dynamic_inputs(
+    *,
+    positions: Optional[torch.Tensor] = None,
+    hidden_states: Optional[torch.Tensor] = None,
+    forward_batch: Optional[ForwardBatch] = None,
+) -> None:
+    # Keep this list intentionally narrow. These are the DeepSeek prefill tensors
+    # that previously showed up as length-specialized in Dynamo logs.
+    _maybe_mark_dynamic_dim0(positions)
+    _maybe_mark_dynamic_dim0(hidden_states)
+
+    if forward_batch is None:
+        return
+
+    forward_metadata = getattr(
+        getattr(forward_batch, "attn_backend", None),
+        "forward_metadata",
+        None,
+    )
+    _maybe_mark_dynamic_dim0(
+        getattr(forward_metadata, "nsa_seqlens_expanded", None)
+    )
+    _maybe_mark_dynamic_dim0(getattr(forward_metadata, "token_to_batch_idx", None))
+
+
 _SKIP_GUARD_EVAL_UNSAFE_RECOMPILE_MESSAGE = (
     "Recompilation triggered with skip_guard_eval_unsafe stance"
 )
@@ -2704,7 +2739,15 @@ class DeepseekV2DecoderLayer(nn.Module):
             forward_batch
         )
 
-        if self._should_use_experimental_prefill_compile(forward_batch):
+        use_experimental_prefill_compile = (
+            self._should_use_experimental_prefill_compile(forward_batch)
+        )
+        if use_experimental_prefill_compile:
+            _mark_experimental_prefill_dynamic_inputs(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
             warmup_steps = self._get_experimental_prefill_compile_warmup_steps()
             if (
                 self._experimental_prefill_compiled_runner is None
@@ -3228,6 +3271,12 @@ class DeepseekV2Model(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        use_experimental_prefill_compile = (
+            self._should_use_experimental_prefill_compile(
+                forward_batch, input_embeds, pp_proxy_tensors
+            )
+        )
+
         total_num_layers = self.end_layer - self.start_layer
         if self.pp_group.is_first_rank:
             if input_embeds is None:
@@ -3278,9 +3327,12 @@ class DeepseekV2Model(nn.Module):
                 positions=positions,
             )
 
-        if self._should_use_experimental_prefill_compile(
-            forward_batch, input_embeds, pp_proxy_tensors
-        ):
+        if use_experimental_prefill_compile:
+            _mark_experimental_prefill_dynamic_inputs(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
             warmup_steps = self._get_experimental_prefill_compile_warmup_steps()
             if (
                 self._experimental_prefill_compiled_runner is None
