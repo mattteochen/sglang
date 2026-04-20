@@ -13,6 +13,9 @@ def _compute_tune_max_num_tokens(
 
 
 def _register_fp8_trtllm_moe_custom_op(fn, *, op_name: str):
+    # Keep tune_max_num_tokens out of the traced op schema. Computing
+    # next_power_of_2(hidden_states.shape[0]) in Python forces Dynamo to
+    # specialize on the concrete token count and triggers recompilation.
     return register_custom_op_from_extern(
         fn,
         op_name=op_name,
