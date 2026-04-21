@@ -8,6 +8,7 @@ import torch
 from torch import nn
 
 from sglang.srt.layers.utils import MultiPlatformOp
+from sglang.srt.layers.attention.nsa_backend import _get_cached_mla_kv_buffer_view
 from sglang.srt.layers.logits_processor import LogitsProcessorOutput
 from sglang.srt.environ import envs
 from sglang.srt.model_executor.forward_batch_info import (
@@ -17,6 +18,7 @@ from sglang.srt.model_executor.forward_batch_info import (
 )
 from sglang.srt.models.deepseek_v2 import (
     DeepseekV2ForCausalLM,
+    DeepseekV2DecoderLayer,
     DeepseekV2MLP,
     DeepseekV2Model,
     _disable_experimental_prefill_nested_compile_region,
@@ -291,6 +293,58 @@ class TestDeepseekV2NativeCompileFlags(unittest.TestCase):
 
             self.assertTrue(_deepseek_prefill_mlp_native_bf16_gemms_enabled())
             self.assertTrue(mlp._should_use_native_bf16_compile_path())
+
+    def test_prepare_compile_state_mirrors_kv_handles_to_attn_mqa(self):
+        kv_buffer_storage = torch.empty((4, 8), dtype=torch.float32)
+        token_to_kv_pool = SimpleNamespace(
+            dtype=torch.float16,
+            store_dtype=torch.uint8,
+            nsa_kv_cache_store_fp8=True,
+            use_nsa=True,
+            get_key_buffer_storage=lambda layer_id: (
+                self.assertEqual(layer_id, 7) or kv_buffer_storage
+            ),
+        )
+        forward_batch = SimpleNamespace(token_to_kv_pool=token_to_kv_pool)
+
+        layer = object.__new__(DeepseekV2DecoderLayer)
+        object.__setattr__(layer, "layer_id", 7)
+        object.__setattr__(
+            layer,
+            "self_attn",
+            SimpleNamespace(attn_mqa=SimpleNamespace()),
+        )
+        object.__setattr__(layer, "mlp", SimpleNamespace())
+
+        with patch(
+            "sglang.srt.models.deepseek_v2._prewarm_flashinfer_lazy_modules_for_experimental_prefill_compile",
+            lambda: None,
+        ):
+            DeepseekV2DecoderLayer._prepare_experimental_prefill_compile_state(
+                layer, forward_batch
+            )
+
+        for target in (layer.self_attn, layer.self_attn.attn_mqa):
+            self.assertIs(
+                target._experimental_prefill_kv_buffer_storage, kv_buffer_storage
+            )
+            self.assertEqual(target._experimental_prefill_kv_cache_dtype, torch.float16)
+            self.assertEqual(target._experimental_prefill_kv_store_dtype, torch.uint8)
+            self.assertTrue(target._experimental_prefill_nsa_kv_cache_store_fp8)
+            self.assertTrue(target._experimental_prefill_use_nsa)
+
+    def test_cached_mla_kv_buffer_view_is_derived_from_storage(self):
+        kv_buffer_storage = torch.empty((4, 8), dtype=torch.uint8)
+        layer = SimpleNamespace(
+            _experimental_prefill_kv_buffer_storage=kv_buffer_storage,
+            _experimental_prefill_kv_cache_dtype=torch.float16,
+            _experimental_prefill_kv_store_dtype=torch.uint8,
+        )
+
+        kv_buffer_view = _get_cached_mla_kv_buffer_view(layer)
+
+        self.assertEqual(kv_buffer_view.dtype, torch.float16)
+        self.assertEqual(kv_buffer_view.data_ptr(), kv_buffer_storage.data_ptr())
 
 
 class TestDeepseekV2NestedCompileRegion(unittest.TestCase):

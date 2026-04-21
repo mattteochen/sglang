@@ -197,6 +197,22 @@ def _set_mla_kv_buffer_direct(
     )
 
 
+def _get_cached_mla_kv_buffer_view(
+    layer: RadixAttention,
+) -> Optional[torch.Tensor]:
+    kv_buffer = getattr(layer, "_experimental_prefill_kv_buffer_storage", None)
+    if kv_buffer is None:
+        return None
+
+    kv_cache_dtype = getattr(layer, "_experimental_prefill_kv_cache_dtype", None)
+    kv_store_dtype = getattr(layer, "_experimental_prefill_kv_store_dtype", None)
+    if kv_cache_dtype is None or kv_store_dtype is None:
+        return kv_buffer
+    if kv_store_dtype != kv_cache_dtype:
+        return kv_buffer.view(kv_cache_dtype)
+    return kv_buffer
+
+
 # Reuse this workspace buffer across all NSA backend instances
 global_workspace_buffer = None
 
@@ -1504,7 +1520,9 @@ class NativeSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path)
         assert q_rope is not None
-        kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_cache = _get_cached_mla_kv_buffer_view(layer)
+        if kv_cache is None:
+            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -1702,7 +1720,9 @@ class NativeSparseAttnBackend(
                     )
 
         # Do absorbed multi-latent attention
-        kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_cache = _get_cached_mla_kv_buffer_view(layer)
+        if kv_cache is None:
+            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
@@ -2231,7 +2251,7 @@ class NativeSparseAttnBackend(
                     layer, cache_loc, k, k_rope
                 )
 
-        k_cache = getattr(layer, "_experimental_prefill_kv_buffer_view", None)
+        k_cache = _get_cached_mla_kv_buffer_view(layer)
         if k_cache is None:
             k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim).unsqueeze(1)

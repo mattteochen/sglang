@@ -2557,24 +2557,33 @@ class DeepseekV2DecoderLayer(nn.Module):
             token_to_kv_pool, "get_key_buffer_storage"
         ):
             try:
-                self.self_attn._experimental_prefill_kv_buffer_storage = (
-                    token_to_kv_pool.get_key_buffer_storage(self.layer_id)
+                kv_buffer_storage = token_to_kv_pool.get_key_buffer_storage(
+                    self.layer_id
                 )
-                self.self_attn._experimental_prefill_kv_buffer_view = (
-                    token_to_kv_pool.get_key_buffer(self.layer_id)
-                )
-                self.self_attn._experimental_prefill_kv_cache_dtype = (
-                    token_to_kv_pool.dtype
-                )
-                self.self_attn._experimental_prefill_kv_store_dtype = (
-                    token_to_kv_pool.store_dtype
-                )
-                self.self_attn._experimental_prefill_nsa_kv_cache_store_fp8 = (
-                    token_to_kv_pool.nsa_kv_cache_store_fp8
-                )
-                self.self_attn._experimental_prefill_use_nsa = (
-                    token_to_kv_pool.use_nsa
-                )
+                kv_cache_dtype = token_to_kv_pool.dtype
+                kv_store_dtype = token_to_kv_pool.store_dtype
+                nsa_kv_cache_store_fp8 = token_to_kv_pool.nsa_kv_cache_store_fp8
+                use_nsa = token_to_kv_pool.use_nsa
+
+                # The compile-time KV cache fast path is consumed off the
+                # RadixAttention instance in nsa_backend, so mirror the cached
+                # handles onto attn_mqa in addition to the wrapper module. Keep
+                # only the storage tensor cached here; the readable dtype view is
+                # rebuilt inside nsa_backend so AOTAutograd does not see two
+                # aliased graph inputs with different dtypes.
+                kv_cache_targets = [self.self_attn]
+                attn_mqa = getattr(self.self_attn, "attn_mqa", None)
+                if attn_mqa is not None:
+                    kv_cache_targets.append(attn_mqa)
+
+                for target in kv_cache_targets:
+                    target._experimental_prefill_kv_buffer_storage = kv_buffer_storage
+                    target._experimental_prefill_kv_cache_dtype = kv_cache_dtype
+                    target._experimental_prefill_kv_store_dtype = kv_store_dtype
+                    target._experimental_prefill_nsa_kv_cache_store_fp8 = (
+                        nsa_kv_cache_store_fp8
+                    )
+                    target._experimental_prefill_use_nsa = use_nsa
             except Exception as exc:
                 logger.warning(
                     "Experimental DeepSeek prefill compile could not cache KV "
