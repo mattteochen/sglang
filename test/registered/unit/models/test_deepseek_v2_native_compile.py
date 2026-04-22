@@ -69,6 +69,22 @@ class FakeCompileModeOp(MultiPlatformOp):
         return x
 
 
+class FakeCompileModeTopK(MultiPlatformOp):
+    def forward_native(self, x):
+        return x
+
+    def forward_cuda(self, x):
+        return x
+
+
+class FakeCompileModeFusedMoE(MultiPlatformOp):
+    def forward_native(self, layer, dispatch_output):
+        return dispatch_output
+
+    def forward_cuda(self, layer, dispatch_output):
+        return dispatch_output
+
+
 class FakePrefillCompileLayer(nn.Module):
     def __init__(self, hidden_size: int, layer_id: int):
         super().__init__()
@@ -406,6 +422,30 @@ class TestMultiPlatformCompileCallables(unittest.TestCase):
         self.assertIsNot(first_compile_method, eager_method)
         self.assertIs(first_compile_method, second_compile_method)
 
+    def test_topk_keeps_cuda_forward_for_flashinfer_trtllm(self):
+        op = FakeCompileModeTopK()
+        eager_method = op._forward_method
+
+        with patch(
+            "sglang.srt.layers.moe.get_moe_runner_backend",
+            return_value=SimpleNamespace(is_flashinfer_trtllm=lambda: True),
+        ):
+            op.enter_torch_compile(num_tokens=1)
+
+        self.assertIs(op._forward_method, eager_method)
+
+    def test_fused_moe_keeps_cuda_forward_for_flashinfer_trtllm(self):
+        op = FakeCompileModeFusedMoE()
+        eager_method = op._forward_method
+
+        with patch(
+            "sglang.srt.layers.moe.get_moe_runner_backend",
+            return_value=SimpleNamespace(is_flashinfer_trtllm=lambda: True),
+        ):
+            op.enter_torch_compile(num_tokens=1)
+
+        self.assertIs(op._forward_method, eager_method)
+
 
 class TestDeepseekV2CompileModeTransitions(unittest.TestCase):
     def test_layer_groups_restore_compile_mode_after_decode_fallback(self):
@@ -444,6 +484,12 @@ class TestDeepseekV2CompileModeTransitions(unittest.TestCase):
                 patch(
                     "sglang.srt.models.deepseek_v2.get_global_server_args",
                     return_value=SimpleNamespace(disable_piecewise_cuda_graph=False),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.models.deepseek_v2.get_moe_runner_backend",
+                    return_value=SimpleNamespace(is_flashinfer_trtllm=lambda: True),
                 )
             )
             stack.enter_context(
@@ -532,6 +578,12 @@ class TestDeepseekV2LayerGroupCompileGuards(unittest.TestCase):
                     return_value=SimpleNamespace(is_none=lambda: True),
                 )
             )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.models.deepseek_v2.get_moe_runner_backend",
+                    return_value=SimpleNamespace(is_flashinfer_trtllm=lambda: True),
+                )
+            )
             actual = group.forward(
                 positions,
                 hidden_states,
@@ -585,6 +637,12 @@ class TestDeepseekV2LayerGroupCompileGuards(unittest.TestCase):
                 patch(
                     "sglang.srt.models.deepseek_v2.get_moe_a2a_backend",
                     return_value=SimpleNamespace(is_none=lambda: True),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.models.deepseek_v2.get_moe_runner_backend",
+                    return_value=SimpleNamespace(is_flashinfer_trtllm=lambda: True),
                 )
             )
             group.forward(
@@ -653,6 +711,12 @@ class TestDeepseekV2LayerGroupCompileGuards(unittest.TestCase):
                 patch(
                     "sglang.srt.models.deepseek_v2.get_moe_a2a_backend",
                     return_value=SimpleNamespace(is_none=lambda: True),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.models.deepseek_v2.get_moe_runner_backend",
+                    return_value=SimpleNamespace(is_flashinfer_trtllm=lambda: True),
                 )
             )
             stack.enter_context(
@@ -764,6 +828,12 @@ class TestDeepseekV2NativeCompileEquivalence(unittest.TestCase):
                 patch(
                     "sglang.srt.models.deepseek_v2.get_global_server_args",
                     return_value=SimpleNamespace(disable_piecewise_cuda_graph=False),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.models.deepseek_v2.get_moe_runner_backend",
+                    return_value=SimpleNamespace(is_flashinfer_trtllm=lambda: True),
                 )
             )
             stack.enter_context(

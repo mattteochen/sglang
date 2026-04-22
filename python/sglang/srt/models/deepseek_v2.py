@@ -256,9 +256,9 @@ def _prewarm_flashinfer_lazy_modules_for_experimental_prefill_compile() -> None:
 
 def _get_experimental_prefill_compile_options() -> Dict[str, Any]:
     return {
-        "cpp_wrapper": True,
+        # "cpp_wrapper": True,
         "combo_kernels": True,
-        "trace.enabled": True,
+        # "trace.enabled": True,
     }
 
 
@@ -328,6 +328,16 @@ def _format_experimental_prefill_layer_ids(layer_ids: Iterable[int]) -> str:
             else f"{layer_ids[0]}-{layer_ids[-1]}"
         )
     return ",".join(str(layer_id) for layer_id in layer_ids)
+
+
+def _experimental_prefill_compile_supports_moe_backend() -> bool:
+    # The current compiled DeepSeek grouped-prefill strategy assumes the
+    # non-routed flashinfer_trtllm MoE path. In that backend, TopK stays as a
+    # thin metadata wrapper and the real routing remains fused inside the
+    # monolithic flashinfer_trtllm MoE kernel. Guard grouped compile on that
+    # backend so the compile-mode MultiPlatformOp swaps do not silently change
+    # the MoE routing path.
+    return get_moe_runner_backend().is_flashinfer_trtllm()
 
 
 class DeepseekV2MLP(nn.Module):
@@ -2596,7 +2606,6 @@ class _ExperimentalPrefillCompileLayerGroup:
         self._experimental_prefill_compile_failed = False
         self._experimental_prefill_compile_enabled = False
         self._experimental_prefill_compile_logged_success = False
-        self._experimental_prefill_compile_num_tokens = 1
         self._experimental_prefill_nsa_guard_cache_key = None
         self._experimental_prefill_nsa_guard_cache_result: Optional[bool] = None
 
@@ -2611,6 +2620,7 @@ class _ExperimentalPrefillCompileLayerGroup:
         return (
             _get_experimental_prefill_layer_compile_group_size() > 1
             and _is_cuda
+            and _experimental_prefill_compile_supports_moe_backend()
             and not self._experimental_prefill_compile_failed
             and forward_batch.forward_mode.is_extend_without_speculative()
             and not forward_batch.can_run_tbo
@@ -2707,15 +2717,14 @@ class _ExperimentalPrefillCompileLayerGroup:
                 layer._prepare_experimental_prefill_compile_state(forward_batch)
 
     def _enter_experimental_prefill_compile_mode(self, num_tokens: int) -> None:
-        num_tokens = max(int(num_tokens), 1)
         if self._experimental_prefill_compile_enabled:
             return
+        num_tokens = max(int(num_tokens), 1)
         for layer in self.layers:
             _set_multi_platform_compile_mode(
                 layer, reverse=False, num_tokens=num_tokens
             )
         self._experimental_prefill_compile_enabled = True
-        self._experimental_prefill_compile_num_tokens = num_tokens
 
     def _leave_experimental_prefill_compile_mode(self) -> None:
         if not self._experimental_prefill_compile_enabled:
@@ -2731,16 +2740,18 @@ class _ExperimentalPrefillCompileLayerGroup:
             and self._experimental_prefill_compiled_runner is not None
             and not self._experimental_prefill_compile_failed
         )
-        restore_num_tokens = self._experimental_prefill_compile_num_tokens
         if should_restore_compile_mode:
             self._leave_experimental_prefill_compile_mode()
         try:
             yield
         finally:
             if should_restore_compile_mode:
-                self._enter_experimental_prefill_compile_mode(
-                    num_tokens=restore_num_tokens
-                )
+                # Grouped prefill compile is guarded to non-routed
+                # flashinfer_trtllm MoE, where the compile-mode
+                # MultiPlatformOp selection no longer depends on the request
+                # token count. Restore with a canonical value instead of
+                # tracking the last-seen prefill length.
+                self._enter_experimental_prefill_compile_mode(num_tokens=1)
 
     def _ensure_experimental_prefill_compiled(
         self, num_tokens: int, forward_batch: ForwardBatch
@@ -2779,7 +2790,6 @@ class _ExperimentalPrefillCompileLayerGroup:
         self._leave_experimental_prefill_compile_mode()
         self._experimental_prefill_compiled_runner = None
         self._experimental_prefill_compile_failed = True
-        self._experimental_prefill_compile_num_tokens = 1
 
     def _forward_prefill_group_impl(
         self,
@@ -3093,6 +3103,7 @@ class DeepseekV2Model(nn.Module):
             _get_experimental_prefill_layer_compile_group_size() > 1
             and bool(self._get_experimental_prefill_layer_compile_groups())
             and _is_cuda
+            and _experimental_prefill_compile_supports_moe_backend()
             and not self.layers_to_capture
             and forward_batch.forward_mode.is_extend_without_speculative()
             and not forward_batch.can_run_tbo
@@ -3109,16 +3120,13 @@ class DeepseekV2Model(nn.Module):
             and group._experimental_prefill_compiled_runner is not None
             and not group._experimental_prefill_compile_failed
         ]
-        restore_num_tokens = [
-            group._experimental_prefill_compile_num_tokens for group in restore_groups
-        ]
         for group in restore_groups:
             group._leave_experimental_prefill_compile_mode()
         try:
             yield
         finally:
-            for group, num_tokens in zip(restore_groups, restore_num_tokens):
-                group._enter_experimental_prefill_compile_mode(num_tokens)
+            for group in restore_groups:
+                group._enter_experimental_prefill_compile_mode(num_tokens=1)
 
     def forward(
         self,
