@@ -257,6 +257,8 @@ class Indexer(MultiPlatformOp):
         self._wk_native_bias_bf16: Optional[torch.Tensor] = None
         self._native_index_k_with_scale_buffer: Optional[torch.Tensor] = None
         self._native_index_page_size: Optional[int] = None
+        self._native_compile_guard_cache_key = None
+        self._native_compile_guard_cache_result: Optional[Tuple[bool, bool]] = None
 
     def prepare_native_compile_state(self, forward_batch: Optional[ForwardBatch] = None):
         # Avoid a first-run None -> Tensor guard inside torch.compile by
@@ -273,6 +275,65 @@ class Indexer(MultiPlatformOp):
                 )
             )
             self._native_index_page_size = forward_batch.token_to_kv_pool.page_size
+
+    def _get_native_compile_guard_cache_key(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+    ) -> Tuple[Any, ...]:
+        attn_backend = getattr(forward_batch, "attn_backend", None)
+        forward_metadata = getattr(attn_backend, "forward_metadata", None)
+        return (
+            layer_id,
+            forward_batch.forward_mode,
+            forward_batch.seq_lens_cpu is not None,
+            id(attn_backend),
+            id(forward_metadata),
+            getattr(forward_metadata, "max_seq_len_k", None),
+        )
+
+    def get_native_compile_guard_state(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+    ) -> Tuple[bool, bool]:
+        cache_key = self._get_native_compile_guard_cache_key(forward_batch, layer_id)
+        if (
+            self._native_compile_guard_cache_key == cache_key
+            and self._native_compile_guard_cache_result is not None
+        ):
+            return self._native_compile_guard_cache_result
+
+        metadata = forward_batch.attn_backend.get_indexer_metadata(
+            layer_id, forward_batch
+        )
+        if metadata is None:
+            result = (True, False)
+        else:
+            max_kv_len = getattr(
+                getattr(metadata, "attn_metadata", None), "max_seq_len_k", None
+            )
+            result = (
+                _is_cuda
+                and not _is_fp8_fnuz
+                and forward_batch.forward_mode.is_extend_without_speculative()
+                and not self.nsa_enable_prefill_cp
+                and forward_batch.seq_lens_cpu is not None
+                and max_kv_len is not None
+                and max_kv_len <= self.index_topk,
+                True,
+            )
+
+        self._native_compile_guard_cache_key = cache_key
+        self._native_compile_guard_cache_result = result
+        return result
+
+    def supports_native_compile_for_batch(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+    ) -> bool:
+        return self.get_native_compile_guard_state(forward_batch, layer_id)[0]
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):

@@ -85,17 +85,13 @@ class TestGLM5DummyCompileEquivalence(unittest.TestCase):
             eager_payload, eager_output = self._run_bench_one_batch(
                 eager_logits_path,
                 env_overrides={
-                    "SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_MODEL": "0",
-                    "SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_SKIP_GUARD_EVAL_UNSAFE": "0",
-                    "SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_NESTED_COMPILE_REGION": "0",
+                    "SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_LAYER_GROUP_SIZE": "1",
                 },
             )
             compiled_payload, compiled_output = self._run_bench_one_batch(
                 compiled_logits_path,
                 env_overrides={
-                    "SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_MODEL": "1",
-                    "SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_SKIP_GUARD_EVAL_UNSAFE": "1",
-                    "SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_NESTED_COMPILE_REGION": "0",
+                    "SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_LAYER_GROUP_SIZE": "2",
                 },
             )
 
