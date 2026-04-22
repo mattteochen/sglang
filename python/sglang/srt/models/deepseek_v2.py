@@ -20,7 +20,7 @@ from __future__ import annotations
 
 import functools
 import logging
-from contextlib import contextmanager, nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -310,6 +310,13 @@ _experimental_prefill_nested_compile_region_enabled = False
 def _deepseek_prefill_mlp_native_bf16_gemms_enabled() -> bool:
     return (
         not envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_DISABLE_MLP_BF16_GEMMS.get()
+    )
+
+
+def _get_experimental_prefill_layer_compile_group_size() -> int:
+    return max(
+        int(envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_LAYER_GROUP_SIZE.get()),
+        1,
     )
 
 
@@ -2974,6 +2981,372 @@ def _enable_experimental_prefill_nested_compile_region() -> None:
     )
 
 
+class _ExperimentalPrefillCompileLayerGroup:
+    def __init__(
+        self,
+        *,
+        layers: List[DeepseekV2DecoderLayer],
+        start_layer: int,
+        end_layer: int,
+    ) -> None:
+        self.layers = tuple(layers)
+        self.start_layer = start_layer
+        self.end_layer = end_layer
+        self.layer_ids = [
+            int(getattr(layer, "layer_id", layer_idx))
+            for layer_idx, layer in zip(range(start_layer, end_layer), self.layers)
+        ]
+        self._experimental_prefill_compiled_runner = None
+        self._experimental_prefill_compile_failed = False
+        self._experimental_prefill_compile_enabled = False
+        self._experimental_prefill_compile_logged_eligible = False
+        self._experimental_prefill_compile_logged_success = False
+        self._experimental_prefill_compile_warmup_count = 0
+        self._experimental_prefill_compile_num_tokens = 1
+
+    def _format_layer_ids(self) -> str:
+        return _format_experimental_prefill_nested_compile_region_layer_ids(
+            self.layer_ids
+        )
+
+    def _should_use_experimental_prefill_compile(
+        self, forward_batch: ForwardBatch
+    ) -> bool:
+        eligible = (
+            envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_LAYER.get()
+            and _is_cuda
+            and not self._experimental_prefill_compile_failed
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and not forward_batch.can_run_tbo
+            and not nsa_use_prefill_cp(forward_batch)
+            and get_moe_a2a_backend().is_none()
+        )
+        if eligible and not self._experimental_prefill_compile_logged_eligible:
+            log_info_on_rank0(
+                logger,
+                "Experimental DeepSeek prefill layer-group compile is eligible for "
+                f"layers {self._format_layer_ids()}.",
+            )
+            self._experimental_prefill_compile_logged_eligible = True
+        return eligible
+
+    def _prepare_experimental_prefill_compile_state(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        try:
+            _prewarm_flashinfer_lazy_modules_for_experimental_prefill_compile()
+        except Exception as exc:
+            logger.warning(
+                "Experimental DeepSeek prefill layer-group compile could not "
+                "prewarm FlashInfer lazy modules for layers %s with %s: %r",
+                self._format_layer_ids(),
+                type(exc).__name__,
+                exc,
+            )
+        for layer in self.layers:
+            if hasattr(layer, "_prepare_experimental_prefill_compile_state"):
+                layer._prepare_experimental_prefill_compile_state(forward_batch)
+
+    def _get_experimental_prefill_compile_warmup_steps(self) -> int:
+        return max(
+            int(
+                envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_LAYER_WARMUP_STEPS.get()
+            ),
+            0,
+        )
+
+    def _enter_experimental_prefill_compile_mode(self, num_tokens: int) -> None:
+        num_tokens = max(int(num_tokens), 1)
+        if self._experimental_prefill_compile_enabled:
+            return
+        for layer in self.layers:
+            _set_multi_platform_compile_mode(
+                layer, reverse=False, num_tokens=num_tokens
+            )
+        self._experimental_prefill_compile_enabled = True
+        self._experimental_prefill_compile_num_tokens = num_tokens
+
+    def _leave_experimental_prefill_compile_mode(self) -> None:
+        if not self._experimental_prefill_compile_enabled:
+            return
+        for layer in self.layers:
+            _set_multi_platform_compile_mode(layer, reverse=True, num_tokens=1)
+        self._experimental_prefill_compile_enabled = False
+
+    @contextmanager
+    def _temporarily_leave_experimental_prefill_compile_mode(self):
+        should_restore_compile_mode = (
+            self._experimental_prefill_compile_enabled
+            and self._experimental_prefill_compiled_runner is not None
+            and not self._experimental_prefill_compile_failed
+        )
+        restore_num_tokens = self._experimental_prefill_compile_num_tokens
+        if should_restore_compile_mode:
+            self._leave_experimental_prefill_compile_mode()
+        try:
+            yield
+        finally:
+            if should_restore_compile_mode:
+                self._enter_experimental_prefill_compile_mode(
+                    num_tokens=restore_num_tokens
+                )
+
+    def _ensure_experimental_prefill_compiled(
+        self, num_tokens: int, forward_batch: ForwardBatch
+    ) -> None:
+        if self._experimental_prefill_compile_failed:
+            return
+        if self._experimental_prefill_compiled_runner is not None:
+            self._enter_experimental_prefill_compile_mode(num_tokens=num_tokens)
+            return
+
+        try:
+            import torch._dynamo.config as dynamo_config
+
+            dynamo_config.allow_unspec_int_on_nn_module = True
+            dynamo_config.ignore_logging_functions.update(
+                {logging.Logger.debug, logging.Logger.info}
+            )
+        except Exception:
+            pass
+
+        self._prepare_experimental_prefill_compile_state(forward_batch)
+        self._enter_experimental_prefill_compile_mode(num_tokens=num_tokens)
+        log_info_on_rank0(
+            logger,
+            "Creating experimental compiled DeepSeek prefill runner for "
+            f"layers {self._format_layer_ids()} with num_tokens={num_tokens} "
+            f"(nested_compile_region layers: "
+            f"{_format_experimental_prefill_nested_compile_region_status(self.layer_ids)}).",
+        )
+        self._experimental_prefill_compiled_runner = torch.compile(
+            self._forward_prefill_group_impl,
+            dynamic=True,
+            backend=get_compiler_backend(),
+            options=_get_experimental_prefill_compile_options(),
+        )
+
+    def _disable_experimental_prefill_compile(self) -> None:
+        self._leave_experimental_prefill_compile_mode()
+        self._experimental_prefill_compiled_runner = None
+        self._experimental_prefill_compile_failed = True
+        self._experimental_prefill_compile_num_tokens = 1
+
+    def _forward_prefill_group_impl(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
+        gemm_output_zero_allocator: Optional[BumpAllocator] = None,
+        llama_4_scaling: Optional[torch.Tensor] = None,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        topk_indices = prev_topk_indices
+        for layer in self.layers:
+            should_allreduce_fusion = (
+                layer.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                    forward_batch
+                )
+            )
+            use_reduce_scatter = layer.layer_communicator.should_use_reduce_scatter(
+                forward_batch
+            )
+            hidden_states, residual, topk_indices = (
+                _get_experimental_prefill_nested_compile_region_target(layer)
+            )(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+                zero_allocator,
+                gemm_output_zero_allocator,
+                llama_4_scaling,
+                prev_topk_indices=topk_indices,
+                should_allreduce_fusion=should_allreduce_fusion,
+                use_reduce_scatter=use_reduce_scatter,
+            )
+        return hidden_states, residual, topk_indices
+
+    @torch.compiler.disable(
+        reason="experimental DeepSeek prefill layer-group eager warmup"
+    )
+    def _forward_prefill_group_impl_eager_warmup(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
+        gemm_output_zero_allocator: Optional[BumpAllocator] = None,
+        llama_4_scaling: Optional[torch.Tensor] = None,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        return self._forward_prefill_group_impl(
+            positions,
+            hidden_states,
+            forward_batch,
+            residual,
+            zero_allocator,
+            gemm_output_zero_allocator,
+            llama_4_scaling,
+            prev_topk_indices,
+        )
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
+        gemm_output_zero_allocator: Optional[BumpAllocator] = None,
+        llama_4_scaling: Optional[torch.Tensor] = None,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        if not self._should_use_experimental_prefill_compile(forward_batch):
+            return self._forward_prefill_group_impl(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+                zero_allocator,
+                gemm_output_zero_allocator,
+                llama_4_scaling,
+                prev_topk_indices,
+            )
+
+        _mark_experimental_prefill_dynamic_inputs(
+            positions=positions,
+            hidden_states=hidden_states,
+            forward_batch=forward_batch,
+        )
+        warmup_steps = self._get_experimental_prefill_compile_warmup_steps()
+        if (
+            self._experimental_prefill_compiled_runner is None
+            and self._experimental_prefill_compile_warmup_count < warmup_steps
+        ):
+            next_warmup_step = self._experimental_prefill_compile_warmup_count + 1
+            log_info_on_rank0(
+                logger,
+                "Running experimental DeepSeek prefill eager warmup step "
+                f"{next_warmup_step}/{warmup_steps} for layers "
+                f"{self._format_layer_ids()} before torch.compile.",
+            )
+            out = self._forward_prefill_group_impl_eager_warmup(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+                zero_allocator,
+                gemm_output_zero_allocator,
+                llama_4_scaling,
+                prev_topk_indices,
+            )
+            self._experimental_prefill_compile_warmup_count = next_warmup_step
+            return out
+        try:
+            self._ensure_experimental_prefill_compiled(
+                hidden_states.shape[0], forward_batch
+            )
+        except Exception as exc:
+            self._disable_experimental_prefill_compile()
+            logger.exception(
+                "Disable experimental DeepSeek prefill layer-group compile while "
+                "building compiled runner for layers %s with %s: %r",
+                self._format_layer_ids(),
+                type(exc).__name__,
+                exc,
+            )
+        else:
+            try:
+                out = _run_experimental_prefill_compiled_runner(
+                    self._experimental_prefill_compiled_runner,
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                    zero_allocator,
+                    gemm_output_zero_allocator,
+                    llama_4_scaling,
+                    prev_topk_indices,
+                    enable_skip_guard_eval_unsafe=(
+                        self._experimental_prefill_compile_logged_success
+                        and envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_SKIP_GUARD_EVAL_UNSAFE.get()
+                    ),
+                )
+                if not self._experimental_prefill_compile_logged_success:
+                    log_info_on_rank0(
+                        logger,
+                        "Experimental DeepSeek prefill layer-group compile is "
+                        f"active for layers {self._format_layer_ids()}.",
+                    )
+                    self._experimental_prefill_compile_logged_success = True
+                return out
+            except Exception as exc:
+                if _should_retry_experimental_prefill_without_nested_compile_region(
+                    exc,
+                    layer_ids=self.layer_ids,
+                ):
+                    try:
+                        _log_experimental_prefill_nested_compile_region_failure(
+                            exc,
+                            layer_ids=self.layer_ids,
+                        )
+                        _disable_experimental_prefill_nested_compile_region()
+                        self._leave_experimental_prefill_compile_mode()
+                        self._experimental_prefill_compiled_runner = None
+                        self._experimental_prefill_compile_num_tokens = 1
+                        self._ensure_experimental_prefill_compiled(
+                            hidden_states.shape[0], forward_batch
+                        )
+                        out = _run_experimental_prefill_compiled_runner(
+                            self._experimental_prefill_compiled_runner,
+                            positions,
+                            hidden_states,
+                            forward_batch,
+                            residual,
+                            zero_allocator,
+                            gemm_output_zero_allocator,
+                            llama_4_scaling,
+                            prev_topk_indices,
+                            enable_skip_guard_eval_unsafe=False,
+                        )
+                        if not self._experimental_prefill_compile_logged_success:
+                            log_info_on_rank0(
+                                logger,
+                                "Experimental DeepSeek prefill layer-group "
+                                "compile is active for layers "
+                                f"{self._format_layer_ids()} after disabling "
+                                "nested_compile_region.",
+                            )
+                            self._experimental_prefill_compile_logged_success = True
+                        return out
+                    except Exception as retry_exc:
+                        exc = retry_exc
+                self._disable_experimental_prefill_compile()
+                logger.exception(
+                    "Disable experimental DeepSeek prefill layer-group compile "
+                    "while executing compiled runner for layers %s with %s: %r",
+                    self._format_layer_ids(),
+                    type(exc).__name__,
+                    exc,
+                )
+
+        with self._temporarily_leave_experimental_prefill_compile_mode():
+            return self._forward_prefill_group_impl(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+                zero_allocator,
+                gemm_output_zero_allocator,
+                llama_4_scaling,
+                prev_topk_indices,
+            )
+
+
 class DeepseekV2Model(nn.Module):
     fall_back_to_pt_during_load = False
 
@@ -3110,9 +3483,103 @@ class DeepseekV2Model(nn.Module):
         self._experimental_prefill_compile_logged_success = False
         self._experimental_prefill_compile_warmup_count = 0
         self._experimental_prefill_compile_num_tokens = 1
+        self._experimental_prefill_layer_compile_groups = None
+        self._experimental_prefill_layer_compile_groups_by_start = {}
+        self._experimental_prefill_layer_compile_group_size = None
+        self._experimental_prefill_layer_compile_group_start_cached = None
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
+
+    def _get_experimental_prefill_layer_compile_group_start(self) -> int:
+        first_sparse_layer = getattr(self, "first_k_dense_replace", self.start_layer)
+        if first_sparse_layer is None:
+            first_sparse_layer = self.start_layer
+        return max(self.start_layer, int(first_sparse_layer))
+
+    def _get_experimental_prefill_layer_compile_groups(
+        self,
+    ) -> List[_ExperimentalPrefillCompileLayerGroup]:
+        group_size = _get_experimental_prefill_layer_compile_group_size()
+        group_start_layer = self._get_experimental_prefill_layer_compile_group_start()
+        should_rebuild_groups = self._experimental_prefill_layer_compile_groups is None
+        if not should_rebuild_groups:
+            has_active_group_state = any(
+                group._experimental_prefill_compiled_runner is not None
+                or group._experimental_prefill_compile_enabled
+                or group._experimental_prefill_compile_failed
+                for group in self._experimental_prefill_layer_compile_groups
+            )
+            should_rebuild_groups = (
+                not has_active_group_state
+                and (
+                    self._experimental_prefill_layer_compile_group_size != group_size
+                    or self._experimental_prefill_layer_compile_group_start_cached
+                    != group_start_layer
+                )
+            )
+        if not should_rebuild_groups:
+            return self._experimental_prefill_layer_compile_groups
+
+        groups: List[_ExperimentalPrefillCompileLayerGroup] = []
+        if group_size > 1 and group_start_layer < self.end_layer:
+            for start_layer in range(group_start_layer, self.end_layer, group_size):
+                end_layer = min(start_layer + group_size, self.end_layer)
+                groups.append(
+                    _ExperimentalPrefillCompileLayerGroup(
+                        layers=[self.layers[i] for i in range(start_layer, end_layer)],
+                        start_layer=start_layer,
+                        end_layer=end_layer,
+                    )
+                )
+        self._experimental_prefill_layer_compile_groups = groups
+        self._experimental_prefill_layer_compile_groups_by_start = {
+            group.start_layer: group for group in groups
+        }
+        self._experimental_prefill_layer_compile_group_size = group_size
+        self._experimental_prefill_layer_compile_group_start_cached = (
+            group_start_layer
+        )
+        return groups
+
+    def _should_use_experimental_prefill_layer_group_compile(
+        self,
+        forward_batch: ForwardBatch,
+        input_embeds: Optional[torch.Tensor],
+        pp_proxy_tensors: Optional[PPProxyTensors],
+    ) -> bool:
+        del input_embeds, pp_proxy_tensors
+        return (
+            envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_LAYER.get()
+            and _get_experimental_prefill_layer_compile_group_size() > 1
+            and bool(self._get_experimental_prefill_layer_compile_groups())
+            and _is_cuda
+            and not self.layers_to_capture
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and not forward_batch.can_run_tbo
+            and not nsa_use_prefill_cp(forward_batch)
+            and get_moe_a2a_backend().is_none()
+        )
+
+    @contextmanager
+    def _temporarily_leave_experimental_prefill_layer_group_compile_modes(self):
+        restore_groups = [
+            group
+            for group in self._get_experimental_prefill_layer_compile_groups()
+            if group._experimental_prefill_compile_enabled
+            and group._experimental_prefill_compiled_runner is not None
+            and not group._experimental_prefill_compile_failed
+        ]
+        restore_num_tokens = [
+            group._experimental_prefill_compile_num_tokens for group in restore_groups
+        ]
+        for group in restore_groups:
+            group._leave_experimental_prefill_compile_mode()
+        try:
+            yield
+        finally:
+            for group, num_tokens in zip(restore_groups, restore_num_tokens):
+                group._enter_experimental_prefill_compile_mode(num_tokens)
 
     def _should_use_experimental_prefill_compile(
         self,
@@ -3282,6 +3749,12 @@ class DeepseekV2Model(nn.Module):
     ) -> Union[torch.Tensor, PPProxyTensors]:
         use_experimental_prefill_compile = (
             self._should_use_experimental_prefill_compile(
+                forward_batch, input_embeds, pp_proxy_tensors
+            )
+        )
+        use_experimental_prefill_layer_group_compile = (
+            not use_experimental_prefill_compile
+            and self._should_use_experimental_prefill_layer_group_compile(
                 forward_batch, input_embeds, pp_proxy_tensors
             )
         )
@@ -3455,7 +3928,12 @@ class DeepseekV2Model(nn.Module):
                         exc,
                     )
 
-        with _temporarily_leave_experimental_prefill_compile_mode(self):
+        with ExitStack() as stack:
+            stack.enter_context(_temporarily_leave_experimental_prefill_compile_mode(self))
+            if not use_experimental_prefill_layer_group_compile:
+                stack.enter_context(
+                    self._temporarily_leave_experimental_prefill_layer_group_compile_modes()
+                )
             normal_start_layer = self.start_layer
             normal_end_layer = self.end_layer
             if forward_batch.can_run_tbo:
@@ -3468,7 +3946,31 @@ class DeepseekV2Model(nn.Module):
                     normal_end_layer = normal_start_layer = 0
             aux_hidden_states = []
             topk_indices = None
-            for i in range(normal_start_layer, normal_end_layer):
+            i = normal_start_layer
+            while i < normal_end_layer:
+                layer_group = None
+                if use_experimental_prefill_layer_group_compile:
+                    layer_group = self._experimental_prefill_layer_compile_groups_by_start.get(
+                        i
+                    )
+                    if (
+                        layer_group is not None
+                        and layer_group._experimental_prefill_compile_failed
+                    ):
+                        layer_group = None
+                if layer_group is not None:
+                    hidden_states, residual, topk_indices = layer_group.forward(
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        residual,
+                        zero_allocator,
+                        gemm_output_zero_allocator,
+                        llama_4_scaling,
+                        prev_topk_indices=topk_indices,
+                    )
+                    i = layer_group.end_layer
+                    continue
                 # NOTE: torch dynamo does not support graph break in context manager
                 ctx = (
                     nullcontext()
@@ -3497,6 +3999,7 @@ class DeepseekV2Model(nn.Module):
                         llama_4_scaling,
                         prev_topk_indices=topk_indices,
                     )
+                i += 1
 
             if normal_end_layer != self.end_layer:
                 hidden_states, residual = model_forward_maybe_tbo(

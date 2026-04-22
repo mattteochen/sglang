@@ -184,7 +184,7 @@ def _build_forward_batch(
 
 
 def _build_tiny_compile_test_model(
-    *, num_layers: int = 1
+    *, num_layers: int = 1, first_k_dense_replace: int = 0
 ) -> DeepseekV2ForCausalLM:
     hidden_size = 16
     vocab_size = 32
@@ -193,7 +193,7 @@ def _build_tiny_compile_test_model(
     nn.Module.__init__(model)
     model.padding_id = 0
     model.vocab_size = vocab_size
-    model.first_k_dense_replace = 0
+    model.first_k_dense_replace = first_k_dense_replace
     model.pp_group = FakePPGroup()
     model.nsa_enable_prefill_cp = False
     model.cp_size = None
@@ -216,6 +216,10 @@ def _build_tiny_compile_test_model(
     model._experimental_prefill_compile_logged_success = False
     model._experimental_prefill_compile_warmup_count = 0
     model._experimental_prefill_compile_num_tokens = 1
+    model._experimental_prefill_layer_compile_groups = None
+    model._experimental_prefill_layer_compile_groups_by_start = {}
+    model._experimental_prefill_layer_compile_group_size = None
+    model._experimental_prefill_layer_compile_group_start_cached = None
 
     causal_lm = object.__new__(DeepseekV2ForCausalLM)
     nn.Module.__init__(causal_lm)
@@ -470,6 +474,108 @@ class TestDeepseekV2CompileModeTransitions(unittest.TestCase):
             self.assertTrue(layer.compile_mode_op.is_torch_compile)
             self.assertIs(layer.compile_mode_op._forward_method, compile_method)
 
+    def test_layer_groups_restore_compile_mode_after_decode_fallback(self):
+        torch.manual_seed(0)
+        model = _build_tiny_compile_test_model(
+            num_layers=4, first_k_dense_replace=0
+        ).model
+        prefill_input_ids = torch.tensor([1, 2, 3, 4], dtype=torch.long)
+        prefill_positions = torch.arange(prefill_input_ids.numel(), dtype=torch.long)
+        prefill_batch = _build_forward_batch(prefill_input_ids, prefill_positions)
+
+        decode_input_ids = torch.tensor([5], dtype=torch.long)
+        decode_positions = torch.tensor([4], dtype=torch.long)
+        decode_batch = _build_forward_batch(
+            decode_input_ids,
+            decode_positions,
+            forward_mode=ForwardMode.DECODE,
+        )
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_LAYER.override(True)
+            )
+            stack.enter_context(
+                envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_LAYER_GROUP_SIZE.override(
+                    2
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.models.deepseek_v2.nsa_use_prefill_cp",
+                    return_value=False,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.models.deepseek_v2.get_global_server_args",
+                    return_value=SimpleNamespace(disable_piecewise_cuda_graph=False),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.models.deepseek_v2._prewarm_flashinfer_lazy_modules_for_experimental_prefill_compile",
+                    lambda: None,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.models.deepseek_v2._get_experimental_prefill_compile_options",
+                    lambda: {},
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.models.deepseek_v2.get_compiler_backend",
+                    return_value="aot_eager",
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    model,
+                    "_should_use_experimental_prefill_compile",
+                    return_value=False,
+                )
+            )
+
+            model.forward(prefill_input_ids, prefill_positions, prefill_batch)
+            first_group = model._experimental_prefill_layer_compile_groups_by_start[0]
+            second_group = model._experimental_prefill_layer_compile_groups_by_start[2]
+            self.assertTrue(first_group._experimental_prefill_compile_enabled)
+            self.assertTrue(second_group._experimental_prefill_compile_enabled)
+            compile_methods = [
+                layer.compile_mode_op._forward_method for layer in model.layers
+            ]
+
+            model.forward(decode_input_ids, decode_positions, decode_batch)
+
+        self.assertTrue(first_group._experimental_prefill_compile_enabled)
+        self.assertTrue(second_group._experimental_prefill_compile_enabled)
+        for layer, compile_method in zip(model.layers, compile_methods):
+            self.assertTrue(layer.compile_mode_op.is_torch_compile)
+            self.assertIs(layer.compile_mode_op._forward_method, compile_method)
+
+
+class TestDeepseekV2LayerCompileGrouping(unittest.TestCase):
+    def test_group_builder_starts_at_first_sparse_layer_and_keeps_tail_group(self):
+        model = _build_tiny_compile_test_model(
+            num_layers=8, first_k_dense_replace=3
+        ).model
+
+        with envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_LAYER_GROUP_SIZE.override(
+            2
+        ):
+            groups = model._get_experimental_prefill_layer_compile_groups()
+
+        self.assertEqual(
+            [(group.start_layer, group.end_layer) for group in groups],
+            [(3, 5), (5, 7), (7, 8)],
+        )
+        self.assertEqual(
+            [group.layer_ids for group in groups],
+            [[3, 4], [5, 6], [7]],
+        )
+
 
 class TestDeepseekV2NativeCompileEquivalence(unittest.TestCase):
     def test_prefill_compile_logits_match_eager_across_8_layers(self):
@@ -539,6 +645,95 @@ class TestDeepseekV2NativeCompileEquivalence(unittest.TestCase):
             )
 
         self.assertIsNotNone(compiled_model.model._experimental_prefill_compiled_runner)
+        torch.testing.assert_close(
+            compiled_output.next_token_logits,
+            eager_output.next_token_logits,
+            atol=1e-5,
+            rtol=1e-5,
+        )
+
+    def test_grouped_layer_prefill_compile_logits_match_eager(self):
+        torch.manual_seed(0)
+        input_ids = torch.tensor([1, 2, 3, 4], dtype=torch.long)
+        positions = torch.arange(input_ids.numel(), dtype=torch.long)
+        forward_batch = _build_forward_batch(input_ids, positions)
+
+        eager_model = _build_tiny_compile_test_model(
+            num_layers=8, first_k_dense_replace=3
+        )
+        compiled_model = copy.deepcopy(eager_model)
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                patch(
+                    "sglang.srt.models.deepseek_v2.get_attn_tp_context",
+                    return_value=FakeAttnTpContext(),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.models.deepseek_v2.nsa_use_prefill_cp",
+                    return_value=False,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.models.deepseek_v2.get_global_server_args",
+                    return_value=SimpleNamespace(disable_piecewise_cuda_graph=False),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.models.deepseek_v2._prewarm_flashinfer_lazy_modules_for_experimental_prefill_compile",
+                    lambda: None,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.models.deepseek_v2._get_experimental_prefill_compile_options",
+                    lambda: {},
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.models.deepseek_v2.get_compiler_backend",
+                    return_value="aot_eager",
+                )
+            )
+            stack.enter_context(
+                patch.object(
+                    compiled_model.model,
+                    "_should_use_experimental_prefill_compile",
+                    return_value=False,
+                )
+            )
+
+            with envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_LAYER.override(
+                False
+            ):
+                eager_output = eager_model.forward(input_ids, positions, forward_batch)
+
+            with ExitStack() as compiled_stack:
+                compiled_stack.enter_context(
+                    envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_LAYER.override(
+                        True
+                    )
+                )
+                compiled_stack.enter_context(
+                    envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_LAYER_GROUP_SIZE.override(
+                        3
+                    )
+                )
+                compiled_output = compiled_model.forward(
+                    input_ids, positions, forward_batch
+                )
+
+        self.assertIsNotNone(
+            compiled_model.model._experimental_prefill_layer_compile_groups_by_start[3]._experimental_prefill_compiled_runner
+        )
+        self.assertIsNotNone(
+            compiled_model.model._experimental_prefill_layer_compile_groups_by_start[6]._experimental_prefill_compiled_runner
+        )
         torch.testing.assert_close(
             compiled_output.next_token_logits,
             eager_output.next_token_logits,
