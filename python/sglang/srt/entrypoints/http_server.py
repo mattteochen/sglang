@@ -1836,6 +1836,71 @@ def _admin_api_key_missing_response(
 MINIMUM_PNG_PICTURE_BASE64 = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAgCAYAAABzenr0AAAACXBIWXMAAA7EAAAOxAGVKw4bAAAAbUlEQVRYhe3VsQ2AMAxE0Y/lIgNQULD/OqyCMgCihCKSG4yRuKuiNH6JLsoEbMACOGBcua9HOR7Y6w6swBwMy0qLTpkeI77qdEBpBFAHBBDAGH8WrwJKI4AAegUCfAKgEgpQDvh3CR3oQCuav58qlAw73kKCSgAAAABJRU5ErkJggg=="
 
 
+def _build_startup_warmup_input_ids(prompt_len: int) -> List[int]:
+    # Keep startup warmup token ids simple and deterministic while allowing
+    # exact prompt-length warmup on the real /generate request path.
+    seed_token_ids = [10, 11, 12]
+    repeat = (prompt_len + len(seed_token_ids) - 1) // len(seed_token_ids)
+    return (seed_token_ids * repeat)[:prompt_len]
+
+
+def _build_startup_warmup_generate_payloads(
+    server_args: ServerArgs, prompt_lens: List[int]
+) -> List[Dict[str, Any]]:
+    payloads = []
+    for prompt_len in prompt_lens:
+        prompt_token_ids = _build_startup_warmup_input_ids(prompt_len)
+        payload_input_ids: Union[List[int], List[List[int]]]
+        if server_args.dp_size == 1:
+            payload_input_ids = prompt_token_ids
+        else:
+            payload_input_ids = [
+                list(prompt_token_ids) for _ in range(server_args.dp_size)
+            ]
+        payloads.append(
+            {
+                "input_ids": payload_input_ids,
+                "sampling_params": {
+                    "temperature": 0,
+                    "max_new_tokens": 0,
+                },
+            }
+        )
+    return payloads
+
+
+def _get_explicit_startup_warmup_payloads(
+    server_args: ServerArgs, request_name: str
+) -> Optional[List[Dict[str, Any]]]:
+    if not server_args.warmup_input_lens:
+        return None
+
+    if server_args.debug_tensor_dump_input_file:
+        logger.warning(
+            "Ignoring --warmup-input-lens because --debug-tensor-dump-input-file "
+            "already overrides the startup warmup payload."
+        )
+        return None
+
+    if server_args.disaggregation_mode != "null":
+        logger.warning(
+            "Ignoring --warmup-input-lens because explicit startup warmup lengths "
+            "only support disaggregation_mode=null."
+        )
+        return None
+
+    if request_name != "/generate":
+        logger.warning(
+            "Ignoring --warmup-input-lens because explicit startup warmup lengths "
+            "only support the text generation /generate endpoint."
+        )
+        return None
+
+    return _build_startup_warmup_generate_payloads(
+        server_args, server_args.warmup_input_lens
+    )
+
+
 def _execute_server_warmup(server_args: ServerArgs):
     headers = {}
     url = server_args.url()
@@ -1923,6 +1988,10 @@ def _execute_server_warmup(server_args: ServerArgs):
         if server_args.dp_size == 1:
             json_data["text"] = json_data["text"][0]
 
+    explicit_warmup_payloads = _get_explicit_startup_warmup_payloads(
+        server_args, request_name
+    )
+
     # Config debug dumping
     if server_args.debug_tensor_dump_input_file:
         json_data.pop("text", None)
@@ -1935,14 +2004,30 @@ def _execute_server_warmup(server_args: ServerArgs):
     warmup_timeout = envs.SGLANG_WARMUP_TIMEOUT.get()
     try:
         if server_args.disaggregation_mode == "null":
-            res = requests.post(
-                url + request_name,
-                json=json_data,
-                headers=headers,
-                timeout=warmup_timeout if warmup_timeout > 0 else 600,
-                verify=ssl_verify,
-            )
-            assert res.status_code == 200, f"{res.text}"
+            if explicit_warmup_payloads is not None:
+                for prompt_len, warmup_payload in zip(
+                    server_args.warmup_input_lens, explicit_warmup_payloads
+                ):
+                    logger.info(
+                        "Running startup warmup request with prompt_len=%d.", prompt_len
+                    )
+                    res = requests.post(
+                        url + request_name,
+                        json=warmup_payload,
+                        headers=headers,
+                        timeout=warmup_timeout if warmup_timeout > 0 else 600,
+                        verify=ssl_verify,
+                    )
+                    assert res.status_code == 200, f"{res.text}"
+            else:
+                res = requests.post(
+                    url + request_name,
+                    json=json_data,
+                    headers=headers,
+                    timeout=warmup_timeout if warmup_timeout > 0 else 600,
+                    verify=ssl_verify,
+                )
+                assert res.status_code == 200, f"{res.text}"
             _global_state.tokenizer_manager.server_status = ServerStatus.Up
 
         else:

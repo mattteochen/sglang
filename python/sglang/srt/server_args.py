@@ -319,6 +319,7 @@ class ServerArgs:
     grpc_mode: bool = False
     skip_server_warmup: bool = False
     warmups: Optional[str] = None
+    warmup_input_lens: Optional[List[int]] = None
     nccl_port: Optional[int] = None
     checkpoint_engine_wait_weights_before_ready: bool = False
 
@@ -768,6 +769,9 @@ class ServerArgs:
         self._handle_multimodal()
         # Validate SSL arguments early (before dummy-model short-circuit).
         self._handle_ssl_validation()
+        # Validate startup warmup args early so dummy-model test configs still
+        # exercise the same input contract as real server startup.
+        self._handle_startup_warmup_args()
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -3886,6 +3890,13 @@ class ServerArgs:
             )
             self.enable_mixed_chunk = False
 
+    def _handle_startup_warmup_args(self):
+        if self.warmup_input_lens is not None:
+            if len(self.warmup_input_lens) == 0:
+                raise ValueError("--warmup-input-lens must contain at least one length")
+            if any(prompt_len <= 0 for prompt_len in self.warmup_input_lens):
+                raise ValueError("--warmup-input-lens only supports positive lengths")
+
     def _handle_other_validations(self):
         # Handle model inference tensor dump.
         if self.debug_tensor_dump_output_folder is not None:
@@ -4069,6 +4080,14 @@ class ServerArgs:
             required=False,
             help="Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 "
             "will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",
+        )
+        parser.add_argument(
+            "--warmup-input-lens",
+            type=int,
+            nargs="+",
+            default=ServerArgs.warmup_input_lens,
+            help="Send one exact-length input_ids startup warmup request per provided prompt length before the server is marked ready. "
+            "This is useful for pre-hitting torch.compile prefill graph families on the real request path.",
         )
         parser.add_argument(
             "--nccl-port",

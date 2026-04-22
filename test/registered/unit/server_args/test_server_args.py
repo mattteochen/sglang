@@ -477,5 +477,25 @@ class TestNgramExternalSamArgs(CustomTestCase):
         self.assertIn("external-corpus-max-tokens", str(context.exception))
 
 
+class TestWarmupInputLensArgs(CustomTestCase):
+    def test_prepare_server_args_parses_warmup_input_lens(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--warmup-input-lens",
+                "128",
+                "512",
+                "1024",
+            ]
+        )
+        self.assertEqual(server_args.warmup_input_lens, [128, 512, 1024])
+
+    def test_warmup_input_lens_must_be_positive(self):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(model_path="dummy", warmup_input_lens=[128, 0])
+        self.assertIn("--warmup-input-lens", str(context.exception))
+
+
 if __name__ == "__main__":
     unittest.main()

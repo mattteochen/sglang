@@ -256,7 +256,7 @@ def _prewarm_flashinfer_lazy_modules_for_experimental_prefill_compile() -> None:
 
 def _get_experimental_prefill_compile_options() -> Dict[str, Any]:
     return {
-        # "cpp_wrapper": True,
+        "cpp_wrapper": True,
         "combo_kernels": True,
         # "trace.enabled": True,
     }
@@ -279,7 +279,9 @@ def _mark_experimental_prefill_dynamic_inputs(
     forward_batch: Optional[ForwardBatch] = None,
 ) -> None:
     # Keep this list intentionally narrow. These are the DeepSeek prefill tensors
-    # that previously showed up as length-specialized in Dynamo logs.
+    # that previously showed up as length-specialized in Dynamo logs. In
+    # particular, NSA prefill metadata can change batch size when the scheduler
+    # merges more requests than the startup warmup covered.
     _maybe_mark_dynamic_dim0(positions)
     _maybe_mark_dynamic_dim0(hidden_states)
 
@@ -295,6 +297,11 @@ def _mark_experimental_prefill_dynamic_inputs(
         getattr(forward_metadata, "nsa_seqlens_expanded", None)
     )
     _maybe_mark_dynamic_dim0(getattr(forward_metadata, "token_to_batch_idx", None))
+    _maybe_mark_dynamic_dim0(getattr(forward_metadata, "page_table_1", None))
+    _maybe_mark_dynamic_dim0(getattr(forward_metadata, "real_page_table", None))
+    _maybe_mark_dynamic_dim0(
+        getattr(forward_metadata, "page_table_1_flattened", None)
+    )
 
 
 def _deepseek_prefill_mlp_native_bf16_gemms_enabled() -> bool:

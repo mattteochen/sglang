@@ -23,6 +23,7 @@ from sglang.srt.models.deepseek_v2 import (
     DeepseekV2Model,
     _ExperimentalPrefillCompileLayerGroup,
     _deepseek_prefill_mlp_native_bf16_gemms_enabled,
+    _mark_experimental_prefill_dynamic_inputs,
     _validate_native_compile_linear_semantics,
 )
 from sglang.test.ci.ci_register import register_cuda_ci
@@ -405,6 +406,50 @@ class TestDeepseekV2NativeCompileFlags(unittest.TestCase):
 
         self.assertEqual(kv_buffer_view.dtype, torch.float16)
         self.assertEqual(kv_buffer_view.data_ptr(), kv_buffer_storage.data_ptr())
+
+    def test_dynamic_input_marking_includes_nsa_page_tables(self):
+        positions = torch.arange(4, dtype=torch.int32)
+        hidden_states = torch.randn(4, 8)
+        page_table_1 = torch.zeros((2, 16), dtype=torch.int32)
+        real_page_table = torch.zeros((2, 4), dtype=torch.int32)
+        page_table_1_flattened = torch.zeros(7, dtype=torch.int32)
+        token_to_batch_idx = torch.zeros(7, dtype=torch.int32)
+        nsa_seqlens_expanded = torch.zeros(7, dtype=torch.int32)
+        forward_batch = SimpleNamespace(
+            attn_backend=SimpleNamespace(
+                forward_metadata=SimpleNamespace(
+                    page_table_1=page_table_1,
+                    real_page_table=real_page_table,
+                    page_table_1_flattened=page_table_1_flattened,
+                    token_to_batch_idx=token_to_batch_idx,
+                    nsa_seqlens_expanded=nsa_seqlens_expanded,
+                )
+            )
+        )
+
+        seen = []
+
+        def fake_maybe_mark_dynamic(tensor, dims):
+            seen.append((tensor, tuple(dims)))
+
+        with patch(
+            "sglang.srt.models.deepseek_v2.torch._dynamo.maybe_mark_dynamic",
+            side_effect=fake_maybe_mark_dynamic,
+        ):
+            _mark_experimental_prefill_dynamic_inputs(
+                positions=positions,
+                hidden_states=hidden_states,
+                forward_batch=forward_batch,
+            )
+
+        marked_tensors = {tensor for tensor, dims in seen if dims == (0,)}
+        self.assertIn(positions, marked_tensors)
+        self.assertIn(hidden_states, marked_tensors)
+        self.assertIn(page_table_1, marked_tensors)
+        self.assertIn(real_page_table, marked_tensors)
+        self.assertIn(page_table_1_flattened, marked_tensors)
+        self.assertIn(token_to_batch_idx, marked_tensors)
+        self.assertIn(nsa_seqlens_expanded, marked_tensors)
 
 
 class TestMultiPlatformCompileCallables(unittest.TestCase):
