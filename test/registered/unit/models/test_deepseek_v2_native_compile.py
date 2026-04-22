@@ -685,7 +685,7 @@ class TestDeepseekV2LayerGroupCompileGuards(unittest.TestCase):
 
 
 class TestDeepseekV2LayerCompileGrouping(unittest.TestCase):
-    def test_group_builder_starts_at_first_sparse_layer_and_keeps_tail_group(self):
+    def test_group_builder_starts_at_zero_by_default_and_keeps_tail_group(self):
         model = _build_tiny_compile_test_model(
             num_layers=8, first_k_dense_replace=3
         ).model
@@ -693,6 +693,33 @@ class TestDeepseekV2LayerCompileGrouping(unittest.TestCase):
         with envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_LAYER_GROUP_SIZE.override(
             2
         ):
+            groups = model._get_experimental_prefill_layer_compile_groups()
+
+        self.assertEqual(
+            [(group.start_layer, group.end_layer) for group in groups],
+            [(0, 2), (2, 4), (4, 6), (6, 8)],
+        )
+        self.assertEqual(
+            [group.layer_ids for group in groups],
+            [[0, 1], [2, 3], [4, 5], [6, 7]],
+        )
+
+    def test_group_builder_honors_env_start_index(self):
+        model = _build_tiny_compile_test_model(
+            num_layers=8, first_k_dense_replace=3
+        ).model
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_LAYER_GROUP_SIZE.override(
+                    2
+                )
+            )
+            stack.enter_context(
+                envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_LAYER_GROUP_START.override(
+                    3
+                )
+            )
             groups = model._get_experimental_prefill_layer_compile_groups()
 
         self.assertEqual(
@@ -770,6 +797,9 @@ class TestDeepseekV2NativeCompileEquivalence(unittest.TestCase):
                     input_ids, positions, forward_batch
                 )
 
+        self.assertIsNotNone(
+            compiled_model.model._experimental_prefill_layer_compile_groups_by_start[0]._experimental_prefill_compiled_runner
+        )
         self.assertIsNotNone(
             compiled_model.model._experimental_prefill_layer_compile_groups_by_start[3]._experimental_prefill_compiled_runner
         )

@@ -310,6 +310,13 @@ def _get_experimental_prefill_layer_compile_group_size() -> int:
     )
 
 
+def _get_experimental_prefill_layer_compile_group_start() -> int:
+    return max(
+        int(envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_LAYER_GROUP_START.get()),
+        0,
+    )
+
+
 def _format_experimental_prefill_layer_ids(layer_ids: Iterable[int]) -> str:
     layer_ids = list(layer_ids)
     if not layer_ids:
@@ -3028,10 +3035,10 @@ class DeepseekV2Model(nn.Module):
         return self.embed_tokens
 
     def _get_experimental_prefill_layer_compile_group_start(self) -> int:
-        first_sparse_layer = getattr(self, "first_k_dense_replace", self.start_layer)
-        if first_sparse_layer is None:
-            first_sparse_layer = self.start_layer
-        return max(self.start_layer, int(first_sparse_layer))
+        return max(
+            self.start_layer,
+            _get_experimental_prefill_layer_compile_group_start(),
+        )
 
     def _get_experimental_prefill_layer_compile_groups(
         self,
