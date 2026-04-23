@@ -291,6 +291,9 @@ class NSAMetadata:
     indexer_seq_lens: Optional[torch.Tensor] = None
     # batch index for each token.
     token_to_batch_idx: Optional[torch.Tensor] = None
+    # Explicit native-compile readiness bit so compiled paths do not need to
+    # inspect forward_batch.seq_lens_cpu directly.
+    native_compile_indexer_ready: bool = False
 
 
 class TopkTransformMethod(IntEnum):
@@ -924,6 +927,9 @@ class NativeSparseAttnBackend(
             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
+            native_compile_indexer_ready=(
+                indexer_seq_lens_cpu is not None and indexer_seq_lens is not None
+            ),
         )
         self.forward_metadata = metadata
 

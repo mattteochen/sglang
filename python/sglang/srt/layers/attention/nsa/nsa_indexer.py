@@ -286,10 +286,10 @@ class Indexer(MultiPlatformOp):
         return (
             layer_id,
             forward_batch.forward_mode,
-            forward_batch.seq_lens_cpu is not None,
             id(attn_backend),
             id(forward_metadata),
             getattr(forward_metadata, "max_seq_len_k", None),
+            getattr(forward_metadata, "native_compile_indexer_ready", False),
         )
 
     def get_native_compile_guard_state(
@@ -310,15 +310,14 @@ class Indexer(MultiPlatformOp):
         if metadata is None:
             result = (True, False)
         else:
-            max_kv_len = getattr(
-                getattr(metadata, "attn_metadata", None), "max_seq_len_k", None
-            )
+            attn_metadata = getattr(metadata, "attn_metadata", None)
+            max_kv_len = getattr(attn_metadata, "max_seq_len_k", None)
             result = (
                 _is_cuda
                 and not _is_fp8_fnuz
                 and forward_batch.forward_mode.is_extend_without_speculative()
                 and not self.nsa_enable_prefill_cp
-                and forward_batch.seq_lens_cpu is not None
+                and getattr(attn_metadata, "native_compile_indexer_ready", False)
                 and max_kv_len is not None
                 and max_kv_len <= self.index_topk,
                 True,
@@ -1595,9 +1594,14 @@ class Indexer(MultiPlatformOp):
                 "Indexer forward_native does not support NSA prefill CP."
             )
 
-        if forward_batch.seq_lens_cpu is None:
+        if not getattr(
+            getattr(metadata, "attn_metadata", None),
+            "native_compile_indexer_ready",
+            False,
+        ):
             raise NotImplementedError(
-                "Indexer forward_native requires seq_lens_cpu for short-ISL prefill."
+                "Indexer forward_native requires native-compile seq-len metadata "
+                "for short-ISL prefill."
             )
 
         max_kv_len = forward_batch.attn_backend.forward_metadata.max_seq_len_k

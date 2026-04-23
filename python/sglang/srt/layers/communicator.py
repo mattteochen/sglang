@@ -496,7 +496,12 @@ class LayerCommunicator:
         forward_batch: ForwardBatch,
         quant_format: str = "",
         post_residual_addition: Optional[torch.Tensor] = None,
+        needs_allreduce_fusion: Optional[bool] = None,
     ):
+        if needs_allreduce_fusion is None:
+            needs_allreduce_fusion = bool(
+                getattr(hidden_states, "_sglang_needs_allreduce_fusion", False)
+            )
         if get_attn_tp_context().input_scattered:
             hidden_states, residual = self._tp_reduce_scatter(
                 hidden_states,
@@ -505,11 +510,7 @@ class LayerCommunicator:
         if hidden_states.shape[0] == 0:
             residual = hidden_states
         else:
-            if (
-                residual is not None
-                and hasattr(hidden_states, "_sglang_needs_allreduce_fusion")
-                and hidden_states._sglang_needs_allreduce_fusion
-            ):
+            if residual is not None and needs_allreduce_fusion:
                 if (
                     apply_aiter_all_reduce_fusion(hidden_states)
                     or apply_flashinfer_allreduce_fusion(hidden_states.shape[0])

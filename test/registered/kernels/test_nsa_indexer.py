@@ -494,6 +494,99 @@ class TestNSAIndexer(CustomTestCase):
 
         self.assertEqual(transform_mock.call_count, 1)
 
+    def test_short_isl_extend_prefill_metadata_marks_native_compile_indexer_ready(
+        self,
+    ):
+        self._init_model_runner(
+            {
+                "max_bs": 4,
+                "context_len": 64,
+                "index_topk": 64,
+            }
+        )
+
+        forward_batch = self._create_forward_batch(
+            ForwardMode.EXTEND,
+            batch_size=2,
+            seq_len=48,
+            extend_len=4,
+        )
+        self.backend.init_forward_metadata(forward_batch)
+
+        self.assertTrue(self.backend.forward_metadata.native_compile_indexer_ready)
+
+    @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
+    def test_short_isl_extend_prefill_metadata_native_compile_guard_uses_metadata_flag(
+        self, mock_deep_gemm
+    ):
+        mock_deep_gemm.get_num_sms.return_value = 132
+
+        self._init_model_runner(
+            {
+                "max_bs": 4,
+                "context_len": 64,
+                "index_topk": 64,
+            }
+        )
+
+        forward_batch = self._create_forward_batch(
+            ForwardMode.EXTEND,
+            batch_size=2,
+            seq_len=48,
+            extend_len=4,
+        )
+        self.backend.init_forward_metadata(forward_batch)
+        forward_batch.seq_lens_cpu = None
+
+        indexer = self._create_indexer(index_topk=64)
+        self.assertEqual(
+            indexer.get_native_compile_guard_state(
+                forward_batch, layer_id=self.config["layer_id"]
+            ),
+            (True, True),
+        )
+
+    @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
+    def test_short_isl_extend_prefill_metadata_forward_native_ignores_forward_batch_seq_lens_cpu(
+        self, mock_deep_gemm
+    ):
+        mock_deep_gemm.get_num_sms.return_value = 132
+
+        self._init_model_runner(
+            {
+                "max_bs": 4,
+                "context_len": 64,
+                "index_topk": 64,
+            }
+        )
+
+        forward_batch = self._create_forward_batch(
+            ForwardMode.EXTEND,
+            batch_size=2,
+            seq_len=48,
+            extend_len=4,
+        )
+        self.backend.init_forward_metadata(forward_batch)
+        forward_batch.seq_lens_cpu = None
+
+        indexer = self._create_indexer(index_topk=64)
+        sentinel = torch.full((1, 1), 7, device=self.device, dtype=torch.int32)
+        positions = torch.arange(8, device=self.device, dtype=torch.int64)
+        x = torch.randn(8, self.config["hidden_size"], device=self.device, dtype=self.dtype)
+        q_lora = torch.randn(8, self.config["q_lora_rank"], device=self.device, dtype=self.dtype)
+
+        with patch.object(indexer, "_forward_native_k_only", return_value=sentinel) as mock_forward_native_k_only:
+            out = indexer.forward_native(
+                x=x,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=self.config["layer_id"],
+            )
+
+        self.assertIs(out, sentinel)
+        mock_forward_native_k_only.assert_called_once()
+
     def test_long_isl_extend_prefill_metadata_keeps_runtime_page_table_shape(self):
         self._init_model_runner(
             {

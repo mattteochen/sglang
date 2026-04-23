@@ -272,10 +272,15 @@ def _maybe_mark_dynamic_dim0(tensor: Optional[torch.Tensor]) -> None:
         pass
 
 
+def _get_hidden_states_allreduce_fusion_flag(hidden_states: Any) -> bool:
+    return bool(getattr(hidden_states, "_sglang_needs_allreduce_fusion", False))
+
+
 def _mark_experimental_prefill_dynamic_inputs(
     *,
     positions: Optional[torch.Tensor] = None,
     hidden_states: Optional[torch.Tensor] = None,
+    residual: Optional[torch.Tensor] = None,
     forward_batch: Optional[ForwardBatch] = None,
 ) -> None:
     # Keep this list intentionally narrow. These are the DeepSeek prefill tensors
@@ -284,6 +289,7 @@ def _mark_experimental_prefill_dynamic_inputs(
     # merges more requests than the startup warmup covered.
     _maybe_mark_dynamic_dim0(positions)
     _maybe_mark_dynamic_dim0(hidden_states)
+    _maybe_mark_dynamic_dim0(residual)
 
     if forward_batch is None:
         return
@@ -2440,14 +2446,21 @@ class DeepseekV2DecoderLayer(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
+        needs_allreduce_fusion: bool = False,
         should_allreduce_fusion: bool = False,
         use_reduce_scatter: bool = False,
-    ) -> torch.Tensor:
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        bool,
+    ]:
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
             forward_batch,
             self._gfx95_quant_format,
+            needs_allreduce_fusion=needs_allreduce_fusion,
         )
 
         hidden_states = self.self_attn(
@@ -2479,15 +2492,16 @@ class DeepseekV2DecoderLayer(nn.Module):
             gemm_output_zero_allocator,
         )
 
-        if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
-            hidden_states._sglang_needs_allreduce_fusion = True
+        next_needs_allreduce_fusion = bool(
+            not self.nsa_enable_prefill_cp and should_allreduce_fusion
+        )
 
         if not should_allreduce_fusion:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
 
-        return hidden_states, residual, topk_indices
+        return hidden_states, residual, topk_indices, next_needs_allreduce_fusion
 
     def forward(
         self,
@@ -2500,6 +2514,9 @@ class DeepseekV2DecoderLayer(nn.Module):
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
+        needs_allreduce_fusion = _get_hidden_states_allreduce_fusion_flag(
+            hidden_states
+        )
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
@@ -2508,7 +2525,12 @@ class DeepseekV2DecoderLayer(nn.Module):
         use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
             forward_batch
         )
-        return self._forward_prefill_impl(
+        (
+            hidden_states,
+            residual,
+            topk_indices,
+            next_needs_allreduce_fusion,
+        ) = self._forward_prefill_impl(
             positions,
             hidden_states,
             forward_batch,
@@ -2517,9 +2539,13 @@ class DeepseekV2DecoderLayer(nn.Module):
             gemm_output_zero_allocator,
             llama_4_scaling,
             prev_topk_indices,
+            needs_allreduce_fusion,
             should_allreduce_fusion,
             use_reduce_scatter,
         )
+        if next_needs_allreduce_fusion:
+            hidden_states._sglang_needs_allreduce_fusion = True
+        return hidden_states, residual, topk_indices
 
     def op_comm_prepare_attn(
         self,
@@ -2609,12 +2635,12 @@ class _ExperimentalPrefillCompileLayerGroup:
             int(getattr(layer, "layer_id", layer_idx))
             for layer_idx, layer in zip(range(start_layer, end_layer), self.layers)
         ]
-        self._experimental_prefill_compiled_runner = None
         self._experimental_prefill_compile_failed = False
         self._experimental_prefill_compile_enabled = False
-        self._experimental_prefill_compile_logged_success = False
+        self._experimental_prefill_compile_logged_success_keys = set()
         self._experimental_prefill_nsa_guard_cache_key = None
         self._experimental_prefill_nsa_guard_cache_result: Optional[bool] = None
+        self._experimental_prefill_compiled_runners: Dict[Tuple[Any, ...], Any] = {}
 
     def _format_layer_ids(self) -> str:
         return _format_experimental_prefill_layer_ids(self.layer_ids)
@@ -2700,10 +2726,10 @@ class _ExperimentalPrefillCompileLayerGroup:
         return (
             forward_batch.forward_mode,
             prev_topk_indices is not None,
-            forward_batch.seq_lens_cpu is not None,
             id(attn_backend),
             id(forward_metadata),
             getattr(forward_metadata, "max_seq_len_k", None),
+            getattr(forward_metadata, "native_compile_indexer_ready", False),
         )
 
     def _prepare_experimental_prefill_compile_state(
@@ -2744,7 +2770,7 @@ class _ExperimentalPrefillCompileLayerGroup:
     def _temporarily_leave_experimental_prefill_compile_mode(self):
         should_restore_compile_mode = (
             self._experimental_prefill_compile_enabled
-            and self._experimental_prefill_compiled_runner is not None
+            and bool(self._experimental_prefill_compiled_runners)
             and not self._experimental_prefill_compile_failed
         )
         if should_restore_compile_mode:
@@ -2761,11 +2787,14 @@ class _ExperimentalPrefillCompileLayerGroup:
                 self._enter_experimental_prefill_compile_mode(num_tokens=1)
 
     def _ensure_experimental_prefill_compiled(
-        self, num_tokens: int, forward_batch: ForwardBatch
+        self,
+        num_tokens: int,
+        forward_batch: ForwardBatch,
+        comm_signature: Tuple[bool, Tuple[bool, ...], Tuple[bool, ...]],
     ) -> None:
         if self._experimental_prefill_compile_failed:
             return
-        if self._experimental_prefill_compiled_runner is not None:
+        if comm_signature in self._experimental_prefill_compiled_runners:
             self._enter_experimental_prefill_compile_mode(num_tokens=num_tokens)
             return
 
@@ -2782,13 +2811,44 @@ class _ExperimentalPrefillCompileLayerGroup:
 
         self._prepare_experimental_prefill_compile_state(forward_batch)
         self._enter_experimental_prefill_compile_mode(num_tokens=num_tokens)
+        (
+            needs_allreduce_fusion,
+            should_allreduce_fusion_per_layer,
+            use_reduce_scatter_per_layer,
+        ) = comm_signature
+
+        def compiled_runner(
+            positions: torch.Tensor,
+            hidden_states: torch.Tensor,
+            forward_batch: ForwardBatch,
+            residual: Optional[torch.Tensor],
+            zero_allocator: BumpAllocator,
+            gemm_output_zero_allocator: Optional[BumpAllocator] = None,
+            llama_4_scaling: Optional[torch.Tensor] = None,
+            prev_topk_indices: Optional[torch.Tensor] = None,
+        ):
+            return self._forward_prefill_group_impl(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+                zero_allocator,
+                gemm_output_zero_allocator,
+                llama_4_scaling,
+                prev_topk_indices,
+                needs_allreduce_fusion,
+                should_allreduce_fusion_per_layer,
+                use_reduce_scatter_per_layer,
+            )
+
         log_info_on_rank0(
             logger,
             "Creating experimental compiled DeepSeek prefill runner for "
-            f"layers {self._format_layer_ids()} with num_tokens={num_tokens}.",
+            f"layers {self._format_layer_ids()} with num_tokens={num_tokens} "
+            f"and comm_signature={comm_signature}.",
         )
-        self._experimental_prefill_compiled_runner = torch.compile(
-            self._forward_prefill_group_impl,
+        self._experimental_prefill_compiled_runners[comm_signature] = torch.compile(
+            compiled_runner,
             dynamic=True,
             backend=get_compiler_backend(),
             options=_get_experimental_prefill_compile_options(),
@@ -2796,8 +2856,30 @@ class _ExperimentalPrefillCompileLayerGroup:
 
     def _disable_experimental_prefill_compile(self) -> None:
         self._leave_experimental_prefill_compile_mode()
-        self._experimental_prefill_compiled_runner = None
+        self._experimental_prefill_compiled_runners.clear()
+        self._experimental_prefill_compile_logged_success_keys.clear()
         self._experimental_prefill_compile_failed = True
+
+    def _get_prefill_group_comm_signature(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Tuple[bool, Tuple[bool, ...], Tuple[bool, ...]]:
+        should_allreduce_fusion_per_layer = tuple(
+            layer.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
+            for layer in self.layers
+        )
+        use_reduce_scatter_per_layer = tuple(
+            layer.layer_communicator.should_use_reduce_scatter(forward_batch)
+            for layer in self.layers
+        )
+        return (
+            _get_hidden_states_allreduce_fusion_flag(hidden_states),
+            should_allreduce_fusion_per_layer,
+            use_reduce_scatter_per_layer,
+        )
 
     def _forward_prefill_group_impl(
         self,
@@ -2809,18 +2891,34 @@ class _ExperimentalPrefillCompileLayerGroup:
         gemm_output_zero_allocator: Optional[BumpAllocator] = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
-    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        needs_allreduce_fusion: bool = False,
+        should_allreduce_fusion_per_layer: Tuple[bool, ...] = (),
+        use_reduce_scatter_per_layer: Tuple[bool, ...] = (),
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], bool]:
+        if len(should_allreduce_fusion_per_layer) != len(self.layers):
+            raise ValueError(
+                "Grouped prefill compile expects one allreduce-fusion decision "
+                "per layer."
+            )
+        if len(use_reduce_scatter_per_layer) != len(self.layers):
+            raise ValueError(
+                "Grouped prefill compile expects one reduce-scatter decision "
+                "per layer."
+            )
+
         topk_indices = prev_topk_indices
-        for layer in self.layers:
-            should_allreduce_fusion = (
-                layer.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                    forward_batch
-                )
-            )
-            use_reduce_scatter = layer.layer_communicator.should_use_reduce_scatter(
-                forward_batch
-            )
-            hidden_states, residual, topk_indices = layer._forward_prefill_impl(
+        next_needs_allreduce_fusion = needs_allreduce_fusion
+        for layer, should_allreduce_fusion, use_reduce_scatter in zip(
+            self.layers,
+            should_allreduce_fusion_per_layer,
+            use_reduce_scatter_per_layer,
+        ):
+            (
+                hidden_states,
+                residual,
+                topk_indices,
+                next_needs_allreduce_fusion,
+            ) = layer._forward_prefill_impl(
                 positions,
                 hidden_states,
                 forward_batch,
@@ -2829,10 +2927,11 @@ class _ExperimentalPrefillCompileLayerGroup:
                 gemm_output_zero_allocator,
                 llama_4_scaling,
                 prev_topk_indices=topk_indices,
+                needs_allreduce_fusion=next_needs_allreduce_fusion,
                 should_allreduce_fusion=should_allreduce_fusion,
                 use_reduce_scatter=use_reduce_scatter,
             )
-        return hidden_states, residual, topk_indices
+        return hidden_states, residual, topk_indices, next_needs_allreduce_fusion
 
     def forward(
         self,
@@ -2845,11 +2944,19 @@ class _ExperimentalPrefillCompileLayerGroup:
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        comm_signature = self._get_prefill_group_comm_signature(
+            hidden_states, forward_batch
+        )
         if not self._should_use_experimental_prefill_compile(
             forward_batch, prev_topk_indices
         ):
             with self._temporarily_leave_experimental_prefill_compile_mode():
-                return self._forward_prefill_group_impl(
+                (
+                    hidden_states,
+                    residual,
+                    topk_indices,
+                    next_needs_allreduce_fusion,
+                ) = self._forward_prefill_group_impl(
                     positions,
                     hidden_states,
                     forward_batch,
@@ -2858,16 +2965,21 @@ class _ExperimentalPrefillCompileLayerGroup:
                     gemm_output_zero_allocator,
                     llama_4_scaling,
                     prev_topk_indices,
+                    *comm_signature,
                 )
+                if next_needs_allreduce_fusion:
+                    hidden_states._sglang_needs_allreduce_fusion = True
+                return hidden_states, residual, topk_indices
 
         _mark_experimental_prefill_dynamic_inputs(
             positions=positions,
             hidden_states=hidden_states,
+            residual=residual,
             forward_batch=forward_batch,
         )
         try:
             self._ensure_experimental_prefill_compiled(
-                hidden_states.shape[0], forward_batch
+                hidden_states.shape[0], forward_batch, comm_signature
             )
         except Exception as exc:
             self._disable_experimental_prefill_compile()
@@ -2880,7 +2992,12 @@ class _ExperimentalPrefillCompileLayerGroup:
             )
         else:
             try:
-                out = self._experimental_prefill_compiled_runner(
+                (
+                    hidden_states,
+                    residual,
+                    topk_indices,
+                    next_needs_allreduce_fusion,
+                ) = self._experimental_prefill_compiled_runners[comm_signature](
                     positions,
                     hidden_states,
                     forward_batch,
@@ -2890,14 +3007,22 @@ class _ExperimentalPrefillCompileLayerGroup:
                     llama_4_scaling,
                     prev_topk_indices,
                 )
-                if not self._experimental_prefill_compile_logged_success:
+                if (
+                    comm_signature
+                    not in self._experimental_prefill_compile_logged_success_keys
+                ):
                     log_info_on_rank0(
                         logger,
                         "Experimental DeepSeek prefill layer-group compile is "
-                        f"active for layers {self._format_layer_ids()}.",
+                        f"active for layers {self._format_layer_ids()} with "
+                        f"comm_signature={comm_signature}.",
                     )
-                    self._experimental_prefill_compile_logged_success = True
-                return out
+                    self._experimental_prefill_compile_logged_success_keys.add(
+                        comm_signature
+                    )
+                if next_needs_allreduce_fusion:
+                    hidden_states._sglang_needs_allreduce_fusion = True
+                return hidden_states, residual, topk_indices
             except Exception as exc:
                 self._disable_experimental_prefill_compile()
                 logger.exception(
@@ -2909,7 +3034,12 @@ class _ExperimentalPrefillCompileLayerGroup:
                 )
 
         with self._temporarily_leave_experimental_prefill_compile_mode():
-            return self._forward_prefill_group_impl(
+            (
+                hidden_states,
+                residual,
+                topk_indices,
+                next_needs_allreduce_fusion,
+            ) = self._forward_prefill_group_impl(
                 positions,
                 hidden_states,
                 forward_batch,
@@ -2918,7 +3048,11 @@ class _ExperimentalPrefillCompileLayerGroup:
                 gemm_output_zero_allocator,
                 llama_4_scaling,
                 prev_topk_indices,
+                *comm_signature,
             )
+            if next_needs_allreduce_fusion:
+                hidden_states._sglang_needs_allreduce_fusion = True
+            return hidden_states, residual, topk_indices
 
 
 class DeepseekV2Model(nn.Module):
@@ -3067,7 +3201,7 @@ class DeepseekV2Model(nn.Module):
         should_rebuild_groups = self._experimental_prefill_layer_compile_groups is None
         if not should_rebuild_groups:
             has_active_group_state = any(
-                group._experimental_prefill_compiled_runner is not None
+                bool(group._experimental_prefill_compiled_runners)
                 or group._experimental_prefill_compile_enabled
                 or group._experimental_prefill_compile_failed
                 for group in self._experimental_prefill_layer_compile_groups
@@ -3126,7 +3260,7 @@ class DeepseekV2Model(nn.Module):
             group
             for group in self._get_experimental_prefill_layer_compile_groups()
             if group._experimental_prefill_compile_enabled
-            and group._experimental_prefill_compiled_runner is not None
+            and bool(group._experimental_prefill_compiled_runners)
             and not group._experimental_prefill_compile_failed
         ]
         for group in restore_groups:
