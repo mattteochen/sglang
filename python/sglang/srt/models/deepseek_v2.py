@@ -2772,6 +2772,7 @@ class _ExperimentalPrefillCompileLayerGroup:
         try:
             import torch._dynamo.config as dynamo_config
 
+            dynamo_config.recompile_limit = 128
             dynamo_config.allow_unspec_int_on_nn_module = True
             dynamo_config.ignore_logging_functions.update(
                 {logging.Logger.debug, logging.Logger.info}
