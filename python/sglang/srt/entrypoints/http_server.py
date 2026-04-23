@@ -1844,61 +1844,125 @@ def _build_startup_warmup_input_ids(prompt_len: int) -> List[int]:
     return (seed_token_ids * repeat)[:prompt_len]
 
 
+def _build_startup_warmup_generate_payload(
+    server_args: ServerArgs,
+    prompt_lens: List[int],
+    *,
+    repeat_single_prompt_for_dp: bool,
+) -> Dict[str, Any]:
+    batch_input_ids = [
+        _build_startup_warmup_input_ids(prompt_len) for prompt_len in prompt_lens
+    ]
+    payload_input_ids: Union[List[int], List[List[int]]]
+    if len(batch_input_ids) == 1:
+        if repeat_single_prompt_for_dp and server_args.dp_size > 1:
+            payload_input_ids = [
+                list(batch_input_ids[0]) for _ in range(server_args.dp_size)
+            ]
+        else:
+            payload_input_ids = batch_input_ids[0]
+    else:
+        payload_input_ids = batch_input_ids
+
+    return {
+        "input_ids": payload_input_ids,
+        "sampling_params": {
+            "temperature": 0,
+            "max_new_tokens": 0,
+        },
+    }
+
+
 def _build_startup_warmup_generate_payloads(
     server_args: ServerArgs, prompt_lens: List[int]
 ) -> List[Dict[str, Any]]:
-    payloads = []
-    for prompt_len in prompt_lens:
-        prompt_token_ids = _build_startup_warmup_input_ids(prompt_len)
-        payload_input_ids: Union[List[int], List[List[int]]]
-        if server_args.dp_size == 1:
-            payload_input_ids = prompt_token_ids
-        else:
-            payload_input_ids = [
-                list(prompt_token_ids) for _ in range(server_args.dp_size)
-            ]
-        payloads.append(
-            {
-                "input_ids": payload_input_ids,
-                "sampling_params": {
-                    "temperature": 0,
-                    "max_new_tokens": 0,
-                },
-            }
+    return [
+        _build_startup_warmup_generate_payload(
+            server_args,
+            [prompt_len],
+            repeat_single_prompt_for_dp=True,
         )
-    return payloads
+        for prompt_len in prompt_lens
+    ]
+
+
+def _build_startup_warmup_generate_batch_payloads(
+    server_args: ServerArgs, batch_prompt_lens: List[List[int]]
+) -> List[Dict[str, Any]]:
+    return [
+        _build_startup_warmup_generate_payload(
+            server_args,
+            prompt_lens,
+            repeat_single_prompt_for_dp=False,
+        )
+        for prompt_lens in batch_prompt_lens
+    ]
+
+
+def _get_explicit_startup_warmup_descriptions(server_args: ServerArgs) -> List[str]:
+    descriptions = []
+    if server_args.warmup_input_lens:
+        descriptions.extend(
+            [
+                f"prompt_len={prompt_len}"
+                for prompt_len in server_args.warmup_input_lens
+            ]
+        )
+    if server_args.warmup_batch_input_lens:
+        descriptions.extend(
+            [
+                f"batch_prompt_lens={prompt_lens}"
+                for prompt_lens in server_args.warmup_batch_input_lens
+            ]
+        )
+    return descriptions
 
 
 def _get_explicit_startup_warmup_payloads(
     server_args: ServerArgs, request_name: str
 ) -> Optional[List[Dict[str, Any]]]:
-    if not server_args.warmup_input_lens:
+    if (
+        not server_args.warmup_input_lens
+        and not server_args.warmup_batch_input_lens
+    ):
         return None
 
     if server_args.debug_tensor_dump_input_file:
         logger.warning(
-            "Ignoring --warmup-input-lens because --debug-tensor-dump-input-file "
-            "already overrides the startup warmup payload."
+            "Ignoring explicit startup warmup input specs because "
+            "--debug-tensor-dump-input-file already overrides the startup "
+            "warmup payload."
         )
         return None
 
     if server_args.disaggregation_mode != "null":
         logger.warning(
-            "Ignoring --warmup-input-lens because explicit startup warmup lengths "
-            "only support disaggregation_mode=null."
+            "Ignoring explicit startup warmup input specs because they only "
+            "support disaggregation_mode=null."
         )
         return None
 
     if request_name != "/generate":
         logger.warning(
-            "Ignoring --warmup-input-lens because explicit startup warmup lengths "
-            "only support the text generation /generate endpoint."
+            "Ignoring explicit startup warmup input specs because they only "
+            "support the text generation /generate endpoint."
         )
         return None
 
-    return _build_startup_warmup_generate_payloads(
-        server_args, server_args.warmup_input_lens
-    )
+    payloads = []
+    if server_args.warmup_input_lens:
+        payloads.extend(
+            _build_startup_warmup_generate_payloads(
+                server_args, server_args.warmup_input_lens
+            )
+        )
+    if server_args.warmup_batch_input_lens:
+        payloads.extend(
+            _build_startup_warmup_generate_batch_payloads(
+                server_args, server_args.warmup_batch_input_lens
+            )
+        )
+    return payloads
 
 
 def _execute_server_warmup(server_args: ServerArgs):
@@ -2005,11 +2069,12 @@ def _execute_server_warmup(server_args: ServerArgs):
     try:
         if server_args.disaggregation_mode == "null":
             if explicit_warmup_payloads is not None:
-                for prompt_len, warmup_payload in zip(
-                    server_args.warmup_input_lens, explicit_warmup_payloads
+                for description, warmup_payload in zip(
+                    _get_explicit_startup_warmup_descriptions(server_args),
+                    explicit_warmup_payloads,
                 ):
                     logger.info(
-                        "Running startup warmup request with prompt_len=%d.", prompt_len
+                        "Running startup warmup request with %s.", description
                     )
                     res = requests.post(
                         url + request_name,

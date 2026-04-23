@@ -496,6 +496,36 @@ class TestWarmupInputLensArgs(CustomTestCase):
             ServerArgs(model_path="dummy", warmup_input_lens=[128, 0])
         self.assertIn("--warmup-input-lens", str(context.exception))
 
+    def test_prepare_server_args_parses_warmup_batch_input_lens(self):
+        server_args = prepare_server_args(
+            [
+                "--model-path",
+                "dummy",
+                "--warmup-batch-input-lens",
+                "2x128",
+                "64,3x32",
+            ]
+        )
+        self.assertEqual(
+            server_args.warmup_batch_input_lens,
+            [[128, 128], [64, 32, 32, 32]],
+        )
+
+    def test_warmup_batch_input_lens_must_be_positive(self):
+        with self.assertRaises(ValueError) as context:
+            ServerArgs(model_path="dummy", warmup_batch_input_lens=[[128, 0]])
+        self.assertIn("--warmup-batch-input-lens", str(context.exception))
+
+    def test_warmup_batch_input_lens_normalizes_string_specs(self):
+        server_args = ServerArgs(
+            model_path="dummy",
+            warmup_batch_input_lens=["2x128", "64,2x32"],
+        )
+        self.assertEqual(
+            server_args.warmup_batch_input_lens,
+            [[128, 128], [64, 32, 32]],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
