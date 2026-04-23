@@ -190,6 +190,73 @@ Why:
 
 This directly targets the runtime batch layouts that appeared after `ready`.
 
+## Solving `page_table_1` Without Warming Every Batch Combination
+
+Warmup is only a mitigation for `page_table_1`-driven recompiles. It is not the
+best long-term solution.
+
+Today prefill builds `NSAMetadata(page_table_1=page_table, ...)` using a
+runtime-batch-shaped tensor. When the scheduler merges a different number of
+requests, the compiled path sees a new metadata layout.
+
+The grouped prefill path already tries to mark `page_table_1` dim0 dynamic, but
+the logs show that this is not enough to prevent recompilation in the current
+compile boundary.
+
+### Preferred direction: fixed backing storage for prefill metadata
+
+The decode path already uses a fixed storage pattern for `page_table`, then
+slices the valid rows for the current batch.
+
+The same idea can be applied to prefill:
+
+- Preallocate a fixed `page_table_1` backing tensor for prefill, for example
+  `[max_prefill_batch_size, topk]`
+- Reuse that storage for all prefill batches
+- Pass the active batch size separately, instead of changing the backing tensor
+  shape itself
+
+Benefits:
+
+- Avoids warming every possible `bs`
+- Makes metadata shape more stable for Dynamo
+- Matches an already-established pattern used on the decode side
+
+Limitations:
+
+- This only addresses the metadata-layout part of the problem
+- It does not remove recompiles caused by topology, communication branching, or
+  attribute guards
+
+### Alternative: pass metadata tensors as explicit compiled inputs
+
+Another option is to reduce sensitivity to nested Python object layout by
+passing NSA metadata tensors directly into the compiled runner instead of
+looking them up through `forward_batch.attn_backend.forward_metadata`.
+
+Benefits:
+
+- Reduces guard pressure on nested object structure
+- Makes it easier to reason about exactly which metadata dimensions should be
+  dynamic
+
+Limitations:
+
+- More invasive API change than the fixed-storage approach
+- Still does not solve unrelated structural recompiles by itself
+
+### Bottom line for `page_table_1`
+
+If the goal is to stop chasing runtime batch-layout combinations with warmup,
+the best path is:
+
+1. Keep a small amount of representative warmup coverage
+2. Move prefill `page_table_1` to a fixed backing storage model
+3. Pass batch occupancy separately
+
+That is the cleanest way to make `page_table_1` less compile-sensitive without
+warming every possible concurrency pattern.
+
 ## What Requires Code Changes
 
 ### Priority 1: Hoist communication decisions out of the compiled loop
