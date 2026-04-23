@@ -482,6 +482,8 @@ class NativeSparseAttnBackend(
         self.enable_auto_select_prefill_impl = self.nsa_prefill_impl == "flashmla_auto"
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
+        self._native_compile_prefill_page_table_1: Optional[torch.Tensor] = None
+        self._native_compile_prefill_real_page_table: Optional[torch.Tensor] = None
 
         if _is_hip:
             max_bs = model_runner.req_to_token_pool.size
@@ -544,6 +546,80 @@ class NativeSparseAttnBackend(
             0, max_seqlen_k, page_size, device=page_table.device, dtype=torch.int32
         )
         return page_table[:, strided_indices] // page_size
+
+    def _should_use_fixed_native_compile_prefill_page_table(
+        self,
+        forward_batch: ForwardBatch,
+        max_seqlen_k: int,
+    ) -> bool:
+        return (
+            forward_batch.forward_mode.is_extend_without_speculative()
+            and forward_batch.seq_lens_cpu is not None
+            and max_seqlen_k <= self.nsa_index_topk
+            and not can_nsa_prefill_cp_round_robin_split(forward_batch)
+        )
+
+    def _ensure_fixed_native_compile_prefill_page_table_storage(
+        self,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        page_table = self._native_compile_prefill_page_table_1
+        real_page_table = self._native_compile_prefill_real_page_table
+
+        if page_table is None:
+            max_batch_size = self.req_to_token.shape[0]
+            page_table = torch.full(
+                (max_batch_size, self.nsa_index_topk),
+                fill_value=-1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._native_compile_prefill_page_table_1 = page_table
+
+        if real_page_table is None:
+            if self.real_page_size == 1:
+                real_page_table = page_table
+            else:
+                real_page_table = torch.full(
+                    (
+                        page_table.shape[0],
+                        (self.nsa_index_topk + self.real_page_size - 1)
+                        // self.real_page_size,
+                    ),
+                    fill_value=-1,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            self._native_compile_prefill_real_page_table = real_page_table
+
+        return page_table, real_page_table
+
+    def _bind_fixed_native_compile_prefill_page_table(
+        self,
+        page_table: torch.Tensor,
+        extend_seq_lens_cpu,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
+        storage, real_storage = (
+            self._ensure_fixed_native_compile_prefill_page_table_storage()
+        )
+        storage.fill_(-1)
+        if real_storage is not storage:
+            real_storage.fill_(-1)
+
+        rows, cols = page_table.shape
+        if rows > 0 and cols > 0:
+            storage[:rows, :cols].copy_(page_table)
+            if real_storage is not storage:
+                real_page_table = self._transform_table_1_to_real(page_table)
+                real_rows, real_cols = real_page_table.shape
+                real_storage[:real_rows, :real_cols].copy_(real_page_table)
+
+        if isinstance(extend_seq_lens_cpu, torch.Tensor):
+            extend_seq_lens_list = extend_seq_lens_cpu.tolist()
+        else:
+            extend_seq_lens_list = [int(v) for v in extend_seq_lens_cpu]
+        extend_seq_lens_list.extend([0] * (storage.shape[0] - len(extend_seq_lens_list)))
+
+        return storage, real_storage, extend_seq_lens_list
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -772,6 +848,24 @@ class NativeSparseAttnBackend(
         )
         nsa_cu_seqlens_k = compute_cu_seqlens(nsa_cache_seqlens_int32)
         nsa_cu_seqlens_q = self.get_device_int32_arange(len(nsa_cu_seqlens_k))
+        metadata_page_table = page_table
+        metadata_extend_seq_lens_list = extend_seq_lens_cpu
+
+        if self._should_use_fixed_native_compile_prefill_page_table(
+            forward_batch, max_seqlen_k
+        ):
+            (
+                metadata_page_table,
+                metadata_real_page_table,
+                metadata_extend_seq_lens_list,
+            ) = self._bind_fixed_native_compile_prefill_page_table(
+                page_table,
+                extend_seq_lens_cpu,
+            )
+        else:
+            metadata_real_page_table = self._transform_table_1_to_real(
+                metadata_page_table
+            )
 
         paged_mqa_schedule_metadata = None
         # DeepGEMM paged MQA logits path needs a schedule metadata tensor.
@@ -807,7 +901,7 @@ class NativeSparseAttnBackend(
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             seq_lens_sum=forward_batch.seq_lens_sum,
-            page_table_1=page_table,
+            page_table_1=metadata_page_table,
             page_table_1_flattened=page_table_1_flattened,
             flashmla_metadata=(
                 self._compute_flashmla_metadata(
@@ -822,8 +916,8 @@ class NativeSparseAttnBackend(
             nsa_cu_seqlens_q=nsa_cu_seqlens_q,
             nsa_cu_seqlens_k=nsa_cu_seqlens_k,
             nsa_seqlens_expanded=seqlens_expanded,
-            nsa_extend_seq_lens_list=extend_seq_lens_cpu,
-            real_page_table=self._transform_table_1_to_real(page_table),
+            nsa_extend_seq_lens_list=metadata_extend_seq_lens_list,
+            real_page_table=metadata_real_page_table,
             nsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,
             indexer_k_start_end=indexer_k_start_end,

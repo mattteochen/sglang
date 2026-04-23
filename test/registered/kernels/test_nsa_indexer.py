@@ -9,6 +9,8 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 # Patch DP-attention globals before importing backends
 _dp_attn.get_attention_tp_size = lambda: 1  # TP size = 1 for unit test
+_dp_attn.get_attention_cp_size = lambda: 1  # CP size = 1 for unit test
+_dp_attn.get_attention_cp_rank = lambda: 0  # CP rank = 0 for unit test
 
 from sglang.srt.configs.model_config import AttentionArch
 from sglang.srt.layers.attention.nsa.nsa_indexer import (
@@ -416,6 +418,103 @@ class TestNSAIndexer(CustomTestCase):
             has_padding or topk_indices.shape[1] == topk,
             "Output should have padding or exact topk size",
         )
+
+    def test_short_isl_extend_prefill_metadata_reuses_fixed_page_table_storage(self):
+        self._init_model_runner(
+            {
+                "max_bs": 4,
+                "context_len": 64,
+                "index_topk": 64,
+            }
+        )
+
+        first_batch = self._create_forward_batch(
+            ForwardMode.EXTEND,
+            batch_size=1,
+            seq_len=32,
+            extend_len=8,
+        )
+        self.backend.init_forward_metadata(first_batch)
+        first_metadata = self.backend.forward_metadata
+
+        self.assertEqual(first_metadata.max_seq_len_k, 32)
+        self.assertEqual(first_metadata.page_table_1.shape, (4, 64))
+        self.assertTrue(
+            torch.equal(
+                first_metadata.page_table_1[0, :32],
+                self.model_runner.req_to_token_pool.req_to_token[0, :32],
+            )
+        )
+        self.assertTrue(torch.all(first_metadata.page_table_1[1:, :] == -1))
+        self.assertEqual(first_metadata.nsa_extend_seq_lens_list, [8, 0, 0, 0])
+
+        second_batch = self._create_forward_batch(
+            ForwardMode.EXTEND,
+            batch_size=3,
+            seq_len=48,
+            extend_len=4,
+        )
+        self.backend.init_forward_metadata(second_batch)
+        second_metadata = self.backend.forward_metadata
+
+        self.assertIs(second_metadata.page_table_1, first_metadata.page_table_1)
+        self.assertEqual(second_metadata.max_seq_len_k, 48)
+        self.assertEqual(second_metadata.page_table_1.shape, (4, 64))
+        self.assertTrue(
+            torch.equal(
+                second_metadata.page_table_1[:3, :48],
+                self.model_runner.req_to_token_pool.req_to_token[:3, :48],
+            )
+        )
+        self.assertTrue(torch.all(second_metadata.page_table_1[3:, :] == -1))
+        self.assertEqual(second_metadata.nsa_extend_seq_lens_list, [4, 4, 4, 0])
+
+    def test_short_isl_extend_prefill_metadata_computes_real_page_table_once(self):
+        self._init_model_runner(
+            {
+                "max_bs": 4,
+                "context_len": 64,
+                "index_topk": 64,
+            }
+        )
+
+        forward_batch = self._create_forward_batch(
+            ForwardMode.EXTEND,
+            batch_size=2,
+            seq_len=48,
+            extend_len=4,
+        )
+
+        with patch.object(
+            self.backend,
+            "_transform_table_1_to_real",
+            wraps=self.backend._transform_table_1_to_real,
+        ) as transform_mock:
+            self.backend.init_forward_metadata(forward_batch)
+
+        self.assertEqual(transform_mock.call_count, 1)
+
+    def test_long_isl_extend_prefill_metadata_keeps_runtime_page_table_shape(self):
+        self._init_model_runner(
+            {
+                "max_bs": 4,
+                "context_len": 128,
+                "index_topk": 16,
+            }
+        )
+
+        forward_batch = self._create_forward_batch(
+            ForwardMode.EXTEND,
+            batch_size=2,
+            seq_len=32,
+            extend_len=6,
+        )
+        self.backend.init_forward_metadata(forward_batch)
+        metadata = self.backend.forward_metadata
+
+        self.assertEqual(metadata.max_seq_len_k, 32)
+        self.assertEqual(metadata.page_table_1.shape, (2, 32))
+        self.assertEqual(len(metadata.nsa_extend_seq_lens_list), 2)
 
     @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
     def test_indexer_basic_creation(self, mock_deep_gemm):
