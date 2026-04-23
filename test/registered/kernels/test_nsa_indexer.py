@@ -329,7 +329,12 @@ class TestNSAIndexer(CustomTestCase):
         return indexer
 
     def _create_forward_batch(
-        self, mode, batch_size=None, seq_len=None, extend_len=None
+        self,
+        mode,
+        batch_size=None,
+        seq_len=None,
+        extend_len=None,
+        allow_fixed_native_compile_prefill_page_table=False,
     ):
         """Create a forward batch for testing."""
         batch_size = batch_size or self.batch_size
@@ -362,6 +367,7 @@ class TestNSAIndexer(CustomTestCase):
                 ),
                 extend_seq_lens=torch.tensor([q_len] * batch_size, device=self.device),
                 extend_seq_lens_cpu=torch.tensor([q_len] * batch_size, device="cpu"),
+                allow_fixed_native_compile_prefill_page_table=allow_fixed_native_compile_prefill_page_table,
                 attn_backend=self.backend,
             )
         else:  # ForwardMode.DECODE
@@ -381,6 +387,7 @@ class TestNSAIndexer(CustomTestCase):
                 req_pool_indices=torch.arange(batch_size, device=self.device),
                 seq_lens=torch.tensor([total_len] * batch_size, device=self.device),
                 seq_lens_cpu=torch.tensor([total_len] * batch_size, device="cpu"),
+                allow_fixed_native_compile_prefill_page_table=allow_fixed_native_compile_prefill_page_table,
                 attn_backend=self.backend,
             )
 
@@ -419,6 +426,32 @@ class TestNSAIndexer(CustomTestCase):
             "Output should have padding or exact topk size",
         )
 
+    def test_short_isl_extend_prefill_metadata_keeps_runtime_page_table_without_compile_hint(
+        self,
+    ):
+        self._init_model_runner(
+            {
+                "max_bs": 4,
+                "context_len": 64,
+                "index_topk": 64,
+            }
+        )
+
+        forward_batch = self._create_forward_batch(
+            ForwardMode.EXTEND,
+            batch_size=2,
+            seq_len=48,
+            extend_len=4,
+            allow_fixed_native_compile_prefill_page_table=False,
+        )
+        self.backend.init_forward_metadata(forward_batch)
+        metadata = self.backend.forward_metadata
+
+        self.assertEqual(metadata.max_seq_len_k, 48)
+        self.assertEqual(metadata.page_table_1.shape, (2, 48))
+        self.assertEqual(metadata.real_page_table.shape, (2, 1))
+        self.assertEqual(list(metadata.nsa_extend_seq_lens_list), [4, 4])
+
     def test_short_isl_extend_prefill_metadata_reuses_fixed_page_table_storage(self):
         self._init_model_runner(
             {
@@ -433,6 +466,7 @@ class TestNSAIndexer(CustomTestCase):
             batch_size=1,
             seq_len=32,
             extend_len=8,
+            allow_fixed_native_compile_prefill_page_table=True,
         )
         self.backend.init_forward_metadata(first_batch)
         first_metadata = self.backend.forward_metadata
@@ -453,6 +487,7 @@ class TestNSAIndexer(CustomTestCase):
             batch_size=3,
             seq_len=48,
             extend_len=4,
+            allow_fixed_native_compile_prefill_page_table=True,
         )
         self.backend.init_forward_metadata(second_batch)
         second_metadata = self.backend.forward_metadata
@@ -483,6 +518,7 @@ class TestNSAIndexer(CustomTestCase):
             batch_size=2,
             seq_len=48,
             extend_len=4,
+            allow_fixed_native_compile_prefill_page_table=True,
         )
 
         with patch.object(
@@ -510,6 +546,7 @@ class TestNSAIndexer(CustomTestCase):
             batch_size=2,
             seq_len=48,
             extend_len=4,
+            allow_fixed_native_compile_prefill_page_table=True,
         )
         self.backend.init_forward_metadata(forward_batch)
 
@@ -534,6 +571,7 @@ class TestNSAIndexer(CustomTestCase):
             batch_size=2,
             seq_len=48,
             extend_len=4,
+            allow_fixed_native_compile_prefill_page_table=True,
         )
         self.backend.init_forward_metadata(forward_batch)
         forward_batch.seq_lens_cpu = None

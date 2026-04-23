@@ -3580,6 +3580,13 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
+    def prepare_attn_metadata_hints(self, forward_batch: ForwardBatch) -> None:
+        forward_batch.allow_fixed_native_compile_prefill_page_table = bool(
+            self.model._should_use_experimental_prefill_layer_group_compile(
+                forward_batch
+            )
+        )
+
     @torch.no_grad()
     def forward(
         self,

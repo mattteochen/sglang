@@ -556,7 +556,8 @@ class NativeSparseAttnBackend(
         max_seqlen_k: int,
     ) -> bool:
         return (
-            forward_batch.forward_mode.is_extend_without_speculative()
+            forward_batch.allow_fixed_native_compile_prefill_page_table
+            and forward_batch.forward_mode.is_extend_without_speculative()
             and forward_batch.seq_lens_cpu is not None
             and max_seqlen_k <= self.nsa_index_topk
             and not can_nsa_prefill_cp_round_robin_split(forward_batch)

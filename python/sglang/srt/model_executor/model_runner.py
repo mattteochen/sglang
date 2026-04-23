@@ -2727,6 +2727,13 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     def update_decode_attn_backend(self, stream_idx: int):
         self.decode_attn_backend = self.decode_attn_backend_group[stream_idx]
 
+    def _prepare_forward_batch_attn_metadata_hints(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        forward_batch.allow_fixed_native_compile_prefill_page_table = False
+        if hasattr(self.model, "prepare_attn_metadata_hints"):
+            self.model.prepare_attn_metadata_hints(forward_batch)
+
     def forward_decode(
         self,
         forward_batch: ForwardBatch,
@@ -2734,6 +2741,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         pp_proxy_tensors=None,
     ) -> Union[LogitsProcessorOutput, PPProxyTensors]:
         if not skip_attn_backend_init:
+            self._prepare_forward_batch_attn_metadata_hints(forward_batch)
             if self.server_args.enable_pdmux:
                 self.decode_attn_backend.init_forward_metadata(forward_batch)
                 forward_batch.attn_backend = self.decode_attn_backend
@@ -2789,6 +2797,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             )
 
         if not skip_attn_backend_init:
+            self._prepare_forward_batch_attn_metadata_hints(forward_batch)
             self.attn_backend.init_forward_metadata(forward_batch)
 
         return (
@@ -2808,6 +2817,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         # in this case, we need to reinit the forward metadata, otherwise the stale
         # metadata causes batch_size mismatch in attention kernel(e.g. NSA Indexer).
         if forward_batch.batch_size > 0:
+            self._prepare_forward_batch_attn_metadata_hints(forward_batch)
             self.attn_backend.init_forward_metadata(forward_batch)
 
         kwargs = {}
@@ -2827,6 +2837,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         forward_count: int = 1,
     ) -> LogitsProcessorOutput:
         if forward_batch.split_index == 0 or reinit_attn_backend:
+            self._prepare_forward_batch_attn_metadata_hints(forward_batch)
             self.attn_backend.init_forward_metadata(forward_batch)
         next_split_index = min(
             forward_batch.split_index + forward_count,

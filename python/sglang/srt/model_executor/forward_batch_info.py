@@ -335,6 +335,9 @@ class ForwardBatch(ForwardBatchDeepSeekMHAMixin):
     extend_seq_lens_cpu: Optional[List[int]] = None
     extend_logprob_start_lens_cpu: Optional[List[int]] = None
     extend_input_logprob_token_ids_gpu: Optional[torch.Tensor] = None
+    # Enable fixed-shape short-ISL NSA page-table metadata for native/grouped
+    # prefill compile. Keep eager batches on runtime-sized page tables.
+    allow_fixed_native_compile_prefill_page_table: bool = False
 
     # For split prefill
     # intermediate values for split prefill
