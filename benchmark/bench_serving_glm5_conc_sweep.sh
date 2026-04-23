@@ -14,6 +14,7 @@ set -euo pipefail
 OUT_DIR="${OUT_DIR:-.}"
 mkdir -p "${OUT_DIR}"
 
+PORT="${PORT:-30000}"
 STAMP="${STAMP:-$(date +%Y%m%d_%H%M%S)}"
 JSONL_OUT="${OUT_DIR}/bench_glm5_fp8_conc_sweep_${STAMP}.jsonl"
 JSON_OUT="${OUT_DIR}/bench_glm5_fp8_conc_sweep_${STAMP}.json"
@@ -22,7 +23,7 @@ JSON_OUT="${OUT_DIR}/bench_glm5_fp8_conc_sweep_${STAMP}.json"
 # Truncate so repeated runs with the same STAMP do not append to old data
 : > "${JSONL_OUT}"
 
-for CONC in 1 4 8 16 32; do
+for CONC in 4 8 16 32; do
   NUM_PROMPTS=$((CONC * 8))
   echo "== max_concurrency=${CONC} num_prompts=${NUM_PROMPTS} =="
   CMD=(python3 -m sglang.bench_serving --backend sglang)
@@ -38,6 +39,7 @@ for CONC in 1 4 8 16 32; do
     --max-concurrency "${CONC}"
     --request-rate inf
     --output-file "${JSONL_OUT}"
+    --port "${PORT}"
   )
   "${CMD[@]}"
 done
