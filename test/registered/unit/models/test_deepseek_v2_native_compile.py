@@ -66,6 +66,9 @@ class FakeCompileModeOp(MultiPlatformOp):
     def forward_native(self, x):
         return x
 
+    def forward_cuda(self, x):
+        return x
+
     def forward_cpu(self, x):
         return x
 
@@ -165,6 +168,61 @@ class FakeIndexer:
         return self.get_native_compile_guard_state(forward_batch, layer_id)[0]
 
 
+class FakeGuardedNativeIndexer(MultiPlatformOp):
+    def __init__(self, index_topk: int):
+        super().__init__()
+        self.index_topk = index_topk
+        self.eager_call_count = 0
+        self.native_call_count = 0
+
+    def dispatch_forward(self):
+        return self.forward_cpu
+
+    def get_native_compile_guard_state(self, forward_batch, layer_id):
+        del layer_id
+        max_kv_len = forward_batch.attn_backend.forward_metadata.max_seq_len_k
+        supported = max_kv_len <= self.index_topk
+        return supported, True
+
+    def supports_native_compile_for_batch(self, forward_batch, layer_id):
+        return self.get_native_compile_guard_state(forward_batch, layer_id)[0]
+
+    def _forward_eager(self, forward_batch):
+        self.eager_call_count += 1
+        return torch.zeros((forward_batch.extend_num_tokens, 1), dtype=torch.int32)
+
+    def forward_native(self, forward_batch):
+        self.native_call_count += 1
+        max_kv_len = forward_batch.attn_backend.forward_metadata.max_seq_len_k
+        if max_kv_len > self.index_topk:
+            raise NotImplementedError(
+                "Indexer forward_native only supports the short-ISL k-only path."
+            )
+        return self._forward_eager(forward_batch)
+
+    def forward_cuda(self, forward_batch):
+        return self._forward_eager(forward_batch)
+
+    def forward_cpu(self, forward_batch):
+        return self._forward_eager(forward_batch)
+
+
+class FakeNSACompileSelfAttn(nn.Module):
+    def __init__(
+        self,
+        *,
+        indexer,
+        skip_topk: bool = False,
+        next_skip_topk: bool = False,
+    ):
+        super().__init__()
+        self.use_nsa = True
+        self.q_lora_rank = 1
+        self.skip_topk = skip_topk
+        self.next_skip_topk = next_skip_topk
+        self.indexer = indexer
+
+
 class FakeNSACompileLayer(FakePrefillCompileLayer):
     def __init__(
         self,
@@ -176,13 +234,53 @@ class FakeNSACompileLayer(FakePrefillCompileLayer):
         next_skip_topk: bool = False,
     ):
         super().__init__(hidden_size, layer_id)
-        self.self_attn = SimpleNamespace(
-            use_nsa=True,
-            q_lora_rank=1,
+        self.self_attn = FakeNSACompileSelfAttn(
+            indexer=FakeIndexer(indexer_supported),
             skip_topk=skip_topk,
             next_skip_topk=next_skip_topk,
-            indexer=FakeIndexer(indexer_supported),
         )
+
+
+class FakeNSAFallbackRegressionLayer(FakePrefillCompileLayer):
+    def __init__(
+        self,
+        hidden_size: int,
+        layer_id: int,
+        *,
+        index_topk: int,
+    ):
+        super().__init__(hidden_size, layer_id)
+        self.self_attn = FakeNSACompileSelfAttn(
+            indexer=FakeGuardedNativeIndexer(index_topk)
+        )
+
+    def _forward_prefill_impl(
+        self,
+        positions,
+        hidden_states,
+        forward_batch,
+        residual,
+        zero_allocator,
+        gemm_output_zero_allocator,
+        llama_4_scaling,
+        prev_topk_indices=None,
+        should_allreduce_fusion=False,
+        use_reduce_scatter=False,
+    ):
+        hidden_states, residual, _ = super()._forward_prefill_impl(
+            positions,
+            hidden_states,
+            forward_batch,
+            residual,
+            zero_allocator,
+            gemm_output_zero_allocator,
+            llama_4_scaling,
+            prev_topk_indices=prev_topk_indices,
+            should_allreduce_fusion=should_allreduce_fusion,
+            use_reduce_scatter=use_reduce_scatter,
+        )
+        topk_indices = self.self_attn.indexer(forward_batch)
+        return hidden_states, residual, topk_indices
 
 
 class FakeLogitsProcessor(nn.Module):
@@ -575,6 +673,74 @@ class TestDeepseekV2CompileModeTransitions(unittest.TestCase):
 
 
 class TestDeepseekV2LayerGroupCompileGuards(unittest.TestCase):
+    def test_fallback_temporarily_leaves_compile_mode_for_long_isl_nsa(self):
+        torch.manual_seed(0)
+        positions = torch.arange(4, dtype=torch.long)
+        hidden_states = torch.randn(4, 16)
+        input_ids = torch.tensor([1, 2, 3, 4], dtype=torch.long)
+        forward_batch = _build_forward_batch(input_ids, positions)
+        forward_batch.attn_backend = _build_fake_nsa_attn_backend(
+            metadata_present=True,
+            max_seq_len_k=4096,
+        )
+
+        group = _ExperimentalPrefillCompileLayerGroup(
+            layers=[
+                FakeNSAFallbackRegressionLayer(
+                    16,
+                    layer_id=0,
+                    index_topk=2048,
+                ),
+                FakePrefillCompileLayer(16, layer_id=1),
+            ],
+            start_layer=0,
+            end_layer=2,
+        )
+        group._experimental_prefill_compiled_runner = object()
+        group._enter_experimental_prefill_compile_mode(num_tokens=1)
+        indexer = group.layers[0].self_attn.indexer
+
+        with ExitStack() as stack:
+            stack.enter_context(
+                envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_LAYER_GROUP_SIZE.override(
+                    2
+                )
+            )
+            stack.enter_context(
+                patch("sglang.srt.models.deepseek_v2._is_cuda", True)
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.models.deepseek_v2.nsa_use_prefill_cp",
+                    return_value=False,
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.models.deepseek_v2.get_moe_a2a_backend",
+                    return_value=SimpleNamespace(is_none=lambda: True),
+                )
+            )
+            stack.enter_context(
+                patch(
+                    "sglang.srt.models.deepseek_v2.get_moe_runner_backend",
+                    return_value=SimpleNamespace(is_flashinfer_trtllm=lambda: True),
+                )
+            )
+            actual = group.forward(
+                positions,
+                hidden_states,
+                forward_batch,
+                None,
+                None,
+            )
+
+        self.assertEqual(indexer.eager_call_count, 1)
+        self.assertEqual(indexer.native_call_count, 0)
+        self.assertTrue(indexer.is_torch_compile)
+        self.assertTrue(group._experimental_prefill_compile_enabled)
+        self.assertEqual(actual[0].shape, hidden_states.shape)
+
     def test_skips_compiled_runner_for_unsupported_nsa_indexer_native_path(self):
         torch.manual_seed(0)
         positions = torch.arange(4, dtype=torch.long)

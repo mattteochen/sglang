@@ -2847,16 +2847,17 @@ class _ExperimentalPrefillCompileLayerGroup:
         if not self._should_use_experimental_prefill_compile(
             forward_batch, prev_topk_indices
         ):
-            return self._forward_prefill_group_impl(
-                positions,
-                hidden_states,
-                forward_batch,
-                residual,
-                zero_allocator,
-                gemm_output_zero_allocator,
-                llama_4_scaling,
-                prev_topk_indices,
-            )
+            with self._temporarily_leave_experimental_prefill_compile_mode():
+                return self._forward_prefill_group_impl(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                    zero_allocator,
+                    gemm_output_zero_allocator,
+                    llama_4_scaling,
+                    prev_topk_indices,
+                )
 
         _mark_experimental_prefill_dynamic_inputs(
             positions=positions,
