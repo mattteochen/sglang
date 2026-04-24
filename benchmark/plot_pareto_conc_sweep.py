@@ -105,7 +105,7 @@ def _load_series(specs: Sequence[str]) -> List[Series]:
     return series
 
 
-def _plot(series: Sequence[Series], output_path: str, title: str) -> None:
+def _plot(series: Sequence[Series], output_path: str, title: str, log_scale: bool = False) -> None:
     fig, (ax_out, ax_tot) = plt.subplots(1, 2, figsize=(14, 5.5), sharex=True)
 
     colors = plt.rcParams["axes.prop_cycle"].by_key()["color"]
@@ -134,6 +134,9 @@ def _plot(series: Sequence[Series], output_path: str, title: str) -> None:
         ax.set_title(ylabel)
         ax.grid(True, linestyle=":", alpha=0.5)
         ax.legend()
+        if log_scale:
+            ax.set_xscale("log")
+            ax.set_yscale("log")
 
     fig.suptitle(title)
     fig.tight_layout()
@@ -178,11 +181,17 @@ def main() -> None:
         default="Pareto Frontier",
         help="Figure suptitle (default: 'Pareto Frontier').",
     )
+    parser.add_argument(
+        "--log-scale",
+        action="store_true",
+        default=False,
+        help="Use log-log axes.",
+    )
     args = parser.parse_args()
 
     series = _load_series(args.input)
     _print_table(series)
-    _plot(series, args.output, args.title)
+    _plot(series, args.output, args.title, log_scale=args.log_scale)
 
 
 if __name__ == "__main__":
