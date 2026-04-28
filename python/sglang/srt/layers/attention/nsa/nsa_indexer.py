@@ -32,7 +32,6 @@ _is_hip = is_hip()
 _is_npu = is_npu()
 _use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_fp8_fnuz = is_fp8_fnuz()
-_use_aiter = get_bool_env_var("SGLANG_USE_AITER") and _is_hip
 _is_gfx95_supported = is_gfx95_supported()
 if _is_cuda:
     try:
@@ -164,9 +163,7 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
             out = out.reshape(-1, hidden_size // (2 * step), 2, step)
             lhs = out[..., 0, :]
             rhs = out[..., 1, :]
-            out = torch.stack((lhs + rhs, lhs - rhs), dim=-2).reshape(
-                -1, hidden_size
-            )
+            out = torch.stack((lhs + rhs, lhs - rhs), dim=-2).reshape(-1, hidden_size)
             step *= 2
         return out.mul(hidden_size**-0.5).reshape(x_shape)
     return hadamard_transform(x, scale=hidden_size**-0.5)
@@ -260,7 +257,9 @@ class Indexer(MultiPlatformOp):
         self._native_compile_guard_cache_key = None
         self._native_compile_guard_cache_result: Optional[Tuple[bool, bool]] = None
 
-    def prepare_native_compile_state(self, forward_batch: Optional[ForwardBatch] = None):
+    def prepare_native_compile_state(
+        self, forward_batch: Optional[ForwardBatch] = None
+    ):
         # Avoid a first-run None -> Tensor guard inside torch.compile by
         # materializing the bf16 weight cache ahead of tracing.
         self._get_wk_native_weight_bf16()
@@ -326,13 +325,6 @@ class Indexer(MultiPlatformOp):
         self._native_compile_guard_cache_key = cache_key
         self._native_compile_guard_cache_result = result
         return result
-
-    def supports_native_compile_for_batch(
-        self,
-        forward_batch: ForwardBatch,
-        layer_id: int,
-    ) -> bool:
-        return self.get_native_compile_guard_state(forward_batch, layer_id)[0]
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -544,7 +536,9 @@ class Indexer(MultiPlatformOp):
                     "Indexer forward_native short-ISL path requires "
                     "topk_indices_offset for fused ragged topk."
                 )
-            topk_indices_offset = topk_indices_offset.to(device=device, dtype=torch.int32)
+            topk_indices_offset = topk_indices_offset.to(
+                device=device, dtype=torch.int32
+            )
             if topk_indices_offset.ndim == 1:
                 topk_indices_offset = topk_indices_offset.unsqueeze(1)
             return torch.where(valid_mask, topk_range + topk_indices_offset, result)
@@ -645,9 +639,7 @@ class Indexer(MultiPlatformOp):
     ) -> torch.Tensor:
         x_bf16 = self._extract_bf16_input(x)
         weight_bf16 = self._get_wk_native_weight_bf16()
-        key = torch.nn.functional.linear(
-            x_bf16, weight_bf16, self._wk_native_bias_bf16
-        )
+        key = torch.nn.functional.linear(x_bf16, weight_bf16, self._wk_native_bias_bf16)
 
         key = self.k_norm(key)
         k_rope, _ = torch.split(
