@@ -6,6 +6,7 @@ import triton.language as tl
 
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.utils import is_cuda
+from sglang.srt.utils.custom_op import register_custom_op
 
 _FLASHMLA_CREATE_KV_BLOCK_SIZE = 4096
 FLASHMLA_CREATE_KV_BLOCK_SIZE_TRITON = tl.constexpr(_FLASHMLA_CREATE_KV_BLOCK_SIZE)
@@ -14,9 +15,6 @@ _is_cuda = is_cuda()
 
 if _is_cuda:
     from sgl_kernel import concat_mla_absorb_q
-    from sglang.srt.utils.custom_op import register_custom_op
-else:
-    register_custom_op = lambda *args, **kwargs: (lambda fn: fn)
 
 
 @triton.jit
