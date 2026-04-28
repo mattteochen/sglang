@@ -85,7 +85,6 @@ from sglang.srt.utils import (
     maybe_reindex_device_id,
     require_mlp_sync,
     require_mlp_tp_gather,
-    set_random_seed,
     set_gpu_proc_affinity,
     suppress_other_loggers,
 )
@@ -203,7 +202,6 @@ class BenchArgs:
     profile_filename_prefix: str = "profile"
     profile_start_step: Optional[int] = None
     profile_steps: Optional[int] = None
-    save_prefill_logits_filename: Optional[str] = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -270,12 +268,6 @@ class BenchArgs:
             type=int,
             default=None,
             help="Number of decode steps to profile starting from profile-start-step. If not specified, profiles only one step.",
-        )
-        parser.add_argument(
-            "--save-prefill-logits-filename",
-            type=str,
-            default=BenchArgs.save_prefill_logits_filename,
-            help="If set, save the full prefill next-token logits and inputs to this file.",
         )
 
     @classmethod
@@ -532,10 +524,18 @@ class _MlxBenchRunner:
     def __init__(self, model_runner, server_args):
         from sglang.srt.hardware_backend.mlx.model_runner import MlxModelRunner
 
-        self.mlx_runner = MlxModelRunner(
+        # Radix cache requires the scheduler's allocator/trie; disable in
+        # standalone bench mode where no scheduler is present.
+        init_kwargs = dict(
             model_path=server_args.model_path,
             trust_remote_code=server_args.trust_remote_code,
+            disable_radix_cache=True,
+            mem_fraction_static=server_args.mem_fraction_static,
         )
+        if server_args.max_total_tokens is not None:
+            init_kwargs["pool_size"] = server_args.max_total_tokens
+        self.mlx_runner = MlxModelRunner(**init_kwargs)
+        self.mlx_runner.init_kv_pool(req_to_token_pool=None)
         self.fake_torch_runner = model_runner
 
     def clear(self):
@@ -543,9 +543,19 @@ class _MlxBenchRunner:
 
     def extend(self, reqs):
         req_ids = [str(req.rid) for req in reqs]
-        token_ids_list = [[int(t) for t in req.fill_ids] for req in reqs]
-        next_token_ids = self.mlx_runner.prefill_batch(req_ids, token_ids_list)
-        return torch.tensor(next_token_ids), None, req_ids
+        results = []
+        for rid, req in zip(req_ids, reqs):
+            token_ids = [int(t) for t in req.fill_ids]
+            next_token = self.mlx_runner.prefill(
+                req_id=rid,
+                new_token_ids=token_ids,
+                full_token_ids=token_ids,
+                prefix_slot_ids=[],
+                new_slot_ids=[],
+                req_pool_idx=0,
+            )
+            results.append(next_token)
+        return torch.tensor(results), None, req_ids
 
     def decode(self, next_token_ids, req_ids):
         next_token_ids = self.mlx_runner.decode_batch(req_ids)
@@ -599,25 +609,6 @@ def _save_profile_trace_results(profiler, filename):
     )
 
 
-def _save_prefill_logits_results(
-    filename,
-    next_token_logits,
-    reqs,
-):
-    if not filename:
-        return
-    if next_token_logits is None:
-        raise ValueError("Prefill logits are unavailable and cannot be saved.")
-
-    parent_dir = os.path.dirname(os.path.abspath(filename))
-    os.makedirs(parent_dir, exist_ok=True)
-    payload = {
-        "input_ids": [[int(token_id) for token_id in req.fill_ids] for req in reqs],
-        "next_token_logits": next_token_logits.detach().cpu(),
-    }
-    torch.save(payload, filename)
-
-
 def correctness_test(
     server_args,
     port_args,
@@ -628,9 +619,6 @@ def correctness_test(
     # Configure the logger
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
-
-    if server_args.random_seed is not None:
-        set_random_seed(server_args.random_seed)
 
     # Load the model
     model_runner, tokenizer = load_model(server_args, port_args, gpu_id, tp_rank)
@@ -656,12 +644,6 @@ def correctness_test(
     # Extend (prefill w/ KV cache)
     next_token_ids, next_token_logits, batch = model_runner.extend(reqs)
     rank_print(f"prefill logits (final): {next_token_logits} \n")
-    if tp_rank == 0:
-        _save_prefill_logits_results(
-            bench_args.save_prefill_logits_filename,
-            next_token_logits,
-            reqs,
-        )
 
     # Decode
     output_ids = [input_ids[i] + [next_token_ids[i]] for i in range(len(input_ids))]
@@ -699,7 +681,6 @@ def latency_test_run_once(
     profile_filename_prefix,
     profile_stage,
     tp_rank,
-    save_prefill_logits_filename=None,
     profile_start_step=None,
     profile_steps=None,
 ):
@@ -737,16 +718,9 @@ def latency_test_run_once(
 
     model_runner.synchronize()
     tic = time.perf_counter()
-    next_token_ids, next_token_logits, batch = model_runner.extend(reqs)
+    next_token_ids, _, batch = model_runner.extend(reqs)
     model_runner.synchronize()
     prefill_latency = time.perf_counter() - tic
-
-    if tp_rank == 0:
-        _save_prefill_logits_results(
-            save_prefill_logits_filename,
-            next_token_logits,
-            reqs,
-        )
 
     if enable_profile_prefill:
         stop_profile(
@@ -856,15 +830,10 @@ def latency_test(
     configure_logger(server_args, prefix=f" TP{tp_rank}")
     rank_print = print if tp_rank == 0 else lambda *args, **kwargs: None
 
-    if server_args.random_seed is not None:
-        set_random_seed(server_args.random_seed)
-
     # Load the model
     model_runner, tokenizer = load_model(server_args, port_args, gpu_id, tp_rank)
 
     # Prepare inputs for warm up
-    if server_args.random_seed is not None:
-        set_random_seed(server_args.random_seed)
     reqs = prepare_synthetic_inputs_for_latency_test(
         bench_args.batch_size[0], bench_args.input_len[0]
     )
@@ -886,7 +855,6 @@ def latency_test(
         profile_filename_prefix="",
         profile_stage="all",
         tp_rank=tp_rank,
-        save_prefill_logits_filename=None,
         profile_start_step=None,
         profile_steps=None,
     )
@@ -898,19 +866,9 @@ def latency_test(
     custom_input_len = len(custom_inputs)
 
     # Run the sweep
-    num_data_points = (
-        len(bench_args.batch_size) * len(bench_args.input_len) * len(bench_args.output_len)
-    )
-    if bench_args.save_prefill_logits_filename and num_data_points != 1:
-        raise ValueError(
-            "--save-prefill-logits-filename requires exactly one batch-size/input-len/output-len combination."
-        )
-
     result_list = []
-    for data_point_idx, (bs, il, ol) in enumerate(
-        itertools.product(
-            bench_args.batch_size, bench_args.input_len, bench_args.output_len
-        )
+    for bs, il, ol in itertools.product(
+        bench_args.batch_size, bench_args.input_len, bench_args.output_len
     ):
         bs_aligned_inputs = []
         if custom_inputs:
@@ -932,8 +890,6 @@ def latency_test(
                     [bs_aligned_inputs[-1]] * (bs - custom_input_len)
                 )
 
-        if server_args.random_seed is not None and not bs_aligned_inputs:
-            set_random_seed(server_args.random_seed + data_point_idx)
         reqs = prepare_synthetic_inputs_for_latency_test(bs, il, bs_aligned_inputs)
         ret = latency_test_run_once(
             bench_args.run_name,
@@ -950,7 +906,6 @@ def latency_test(
             bench_args.profile_filename_prefix,
             bench_args.profile_stage,
             tp_rank,
-            bench_args.save_prefill_logits_filename,
             bench_args.profile_start_step,
             bench_args.profile_steps,
         )
