@@ -15,6 +15,10 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
+from sglang.srt.layers.quantization.fp8_utils import (
+    _unpack_ue8m0_scale_for_triton,
+    block_quant_dequant,
+)
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import (
     add_prefix,
@@ -606,8 +610,36 @@ class Indexer(MultiPlatformOp):
         ):
             return cached_weight
 
+        weight_scale_inv = getattr(self.wk, "weight_scale_inv", None)
         weight_scale = getattr(self.wk, "weight_scale", None)
-        if weight_scale is None:
+        if weight_scale_inv is not None:
+            quant_method = getattr(self.wk, "quant_method", None)
+            quant_config = getattr(quant_method, "quant_config", None)
+            block_size = getattr(quant_config, "weight_block_size", None) or [128, 128]
+            if len(block_size) != 2:
+                raise ValueError(f"Unexpected block quant size {block_size}.")
+
+            if weight_scale_inv.dtype == torch.int32:
+                weight_scale = _unpack_ue8m0_scale_for_triton(
+                    weight_scale_inv,
+                    tuple(weight.shape),
+                    block_size,
+                )
+            elif weight_scale_inv.dtype == torch.float32:
+                weight_scale = weight_scale_inv
+            else:
+                raise ValueError(
+                    "Indexer forward_native only supports float32 or packed int32 "
+                    f"block scales for wk; got {weight_scale_inv.dtype}."
+                )
+
+            weight_bf16 = block_quant_dequant(
+                weight,
+                weight_scale,
+                block_size,
+                torch.bfloat16,
+            ).contiguous()
+        elif weight_scale is None:
             weight_bf16 = (
                 weight if weight.dtype == torch.bfloat16 else weight.to(torch.bfloat16)
             )
