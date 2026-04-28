@@ -262,6 +262,7 @@ def _prewarm_flashinfer_lazy_modules_for_experimental_prefill_compile() -> None:
 
 def _get_experimental_prefill_compile_options() -> Dict[str, Any]:
     return {
+        "max_autotune": True,
         "cpp_wrapper": True,
         "combo_kernels": True,
         # "trace.enabled": True,
