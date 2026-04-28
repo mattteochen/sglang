@@ -15,6 +15,10 @@ from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import attn_tp_all_gather_into_tensor
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype, is_fp8_fnuz
+from sglang.srt.layers.quantization.fp8_utils import (
+    _unpack_ue8m0_scale_for_triton,
+    block_quant_dequant,
+)
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.utils import (
     add_prefix,
@@ -156,6 +160,19 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
     assert (
         hidden_size & (hidden_size - 1)
     ) == 0, "Hidden size must be a power of 2 for Hadamard transform."
+    if torch._dynamo.is_compiling():
+        x_shape = x.shape
+        out = x.reshape(-1, hidden_size)
+        if out.stride(-1) != 1:
+            out = out.contiguous()
+        step = 1
+        while step < hidden_size:
+            out = out.reshape(-1, hidden_size // (2 * step), 2, step)
+            lhs = out[..., 0, :]
+            rhs = out[..., 1, :]
+            out = torch.stack((lhs + rhs, lhs - rhs), dim=-2).reshape(-1, hidden_size)
+            step *= 2
+        return out.mul(hidden_size**-0.5).reshape(x_shape)
     return hadamard_transform(x, scale=hidden_size**-0.5)
 
 
@@ -240,6 +257,81 @@ class Indexer(MultiPlatformOp):
         self.block_size = block_size
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
+        self._wk_native_weight_bf16: Optional[torch.Tensor] = None
+        self._wk_native_bias_bf16: Optional[torch.Tensor] = None
+        self._native_index_k_with_scale_buffer: Optional[torch.Tensor] = None
+        self._native_index_page_size: Optional[int] = None
+        self._native_compile_guard_cache_key = None
+        self._native_compile_guard_cache_result: Optional[Tuple[bool, bool]] = None
+
+    def prepare_native_compile_state(
+        self, forward_batch: Optional[ForwardBatch] = None
+    ):
+        # Avoid a first-run None -> Tensor guard inside torch.compile by
+        # materializing the bf16 weight cache ahead of tracing.
+        self._get_wk_native_weight_bf16()
+        if (
+            forward_batch is not None
+            and getattr(forward_batch, "token_to_kv_pool", None) is not None
+            and hasattr(forward_batch.token_to_kv_pool, "get_index_k_with_scale_buffer")
+        ):
+            self._native_index_k_with_scale_buffer = (
+                forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                    layer_id=self.layer_id
+                )
+            )
+            self._native_index_page_size = forward_batch.token_to_kv_pool.page_size
+
+    def _get_native_compile_guard_cache_key(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+    ) -> Tuple[Any, ...]:
+        attn_backend = getattr(forward_batch, "attn_backend", None)
+        forward_metadata = getattr(attn_backend, "forward_metadata", None)
+        return (
+            layer_id,
+            forward_batch.forward_mode,
+            id(attn_backend),
+            id(forward_metadata),
+            getattr(forward_metadata, "max_seq_len_k", None),
+            getattr(forward_metadata, "native_compile_indexer_ready", False),
+        )
+
+    def get_native_compile_guard_state(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+    ) -> Tuple[bool, bool]:
+        cache_key = self._get_native_compile_guard_cache_key(forward_batch, layer_id)
+        if (
+            self._native_compile_guard_cache_key == cache_key
+            and self._native_compile_guard_cache_result is not None
+        ):
+            return self._native_compile_guard_cache_result
+
+        metadata = forward_batch.attn_backend.get_indexer_metadata(
+            layer_id, forward_batch
+        )
+        if metadata is None:
+            result = (True, False)
+        else:
+            attn_metadata = getattr(metadata, "attn_metadata", None)
+            max_kv_len = getattr(attn_metadata, "max_seq_len_k", None)
+            result = (
+                _is_cuda
+                and not _is_fp8_fnuz
+                and forward_batch.forward_mode.is_extend_without_speculative()
+                and not self.nsa_enable_prefill_cp
+                and getattr(attn_metadata, "native_compile_indexer_ready", False)
+                and max_kv_len is not None
+                and max_kv_len <= self.index_topk,
+                True,
+            )
+
+        self._native_compile_guard_cache_key = cache_key
+        self._native_compile_guard_cache_result = result
+        return result
 
     @contextlib.contextmanager
     def _with_real_sm_count(self):
@@ -412,9 +504,238 @@ class Indexer(MultiPlatformOp):
     def _update_rope_guarded(dst: torch.Tensor, src: torch.Tensor) -> None:
         # On AMD with in-place RoPE kernels, self-aliasing can occur;
         # skip write-back when src/dst tensors point to a single memory.
-        if src.data_ptr() == dst.data_ptr():
+        if _is_hip and src.data_ptr() == dst.data_ptr():
             return
         dst.copy_(src)
+
+    def _build_short_isl_topk_result_native(
+        self,
+        metadata: BaseIndexerMetadata,
+        device: torch.device,
+    ) -> torch.Tensor:
+        seq_lens_expanded = metadata.get_seqlens_expanded().to(
+            device=device, dtype=torch.int32
+        )
+        num_tokens = seq_lens_expanded.shape[0]
+        if num_tokens == 0:
+            return torch.empty((0, self.index_topk), dtype=torch.int32, device=device)
+
+        topk_range = torch.arange(self.index_topk, device=device, dtype=torch.int32)
+        topk_range = topk_range.unsqueeze(0).expand(num_tokens, -1)
+        valid_mask = topk_range < seq_lens_expanded.unsqueeze(1)
+        result = torch.full(
+            (num_tokens, self.index_topk),
+            -1,
+            dtype=torch.int32,
+            device=device,
+        )
+
+        force_unfused_topk = getattr(metadata, "force_unfused_topk", False)
+        if not envs.SGLANG_NSA_FUSE_TOPK.get() or force_unfused_topk:
+            return torch.where(valid_mask, topk_range, result)
+
+        topk_transform_method = getattr(metadata, "topk_transform_method", None)
+        transform_method_name = getattr(topk_transform_method, "name", "")
+        if transform_method_name == "RAGGED":
+            attn_metadata = getattr(metadata, "attn_metadata", None)
+            topk_indices_offset = getattr(attn_metadata, "topk_indices_offset", None)
+            if topk_indices_offset is None:
+                raise NotImplementedError(
+                    "Indexer forward_native short-ISL path requires "
+                    "topk_indices_offset for fused ragged topk."
+                )
+            topk_indices_offset = topk_indices_offset.to(
+                device=device, dtype=torch.int32
+            )
+            if topk_indices_offset.ndim == 1:
+                topk_indices_offset = topk_indices_offset.unsqueeze(1)
+            return torch.where(valid_mask, topk_range + topk_indices_offset, result)
+
+        token_to_batch_idx = metadata.get_token_to_batch_idx().to(
+            device=device, dtype=torch.long
+        )
+        page_table_1 = metadata.get_page_table_1().to(device=device, dtype=torch.int32)
+        page_table_rows = page_table_1.index_select(0, token_to_batch_idx)
+        copy_cols = min(page_table_rows.shape[1], self.index_topk)
+        if copy_cols > 0:
+            result[:, :copy_cols] = torch.where(
+                valid_mask[:, :copy_cols],
+                page_table_rows[:, :copy_cols],
+                result[:, :copy_cols],
+            )
+        return result
+
+    def _extract_bf16_input(
+        self, x: Union[torch.Tensor, Tuple[torch.Tensor, ...]]
+    ) -> torch.Tensor:
+        if not isinstance(x, tuple):
+            return x if x.dtype == torch.bfloat16 else x.to(torch.bfloat16)
+
+        if _use_aiter and _is_gfx95_supported and len(x) == 3:
+            return x[2]
+
+        assert len(x) in (
+            2,
+            3,
+        ), "For tuple input, only (x, x_s) or (x, x_s, y) formats are accepted"
+
+        x_q, x_s = x[0], x[1]
+        if (
+            x_s is not None
+            and x_q.dim() == 2
+            and x_s.dim() == 2
+            and x_q.shape[0] == x_s.shape[0]
+        ):
+            m, n = x_q.shape
+            ng = x_s.shape[1]
+            if ng > 0 and n % ng == 0:
+                group = n // ng
+                return (
+                    x_q.to(torch.float32)
+                    .view(m, ng, group)
+                    .mul_(x_s.to(torch.float32).unsqueeze(-1))
+                    .view(m, n)
+                    .to(torch.bfloat16)
+                )
+
+        return x_q if x_q.dtype == torch.bfloat16 else x_q.to(torch.bfloat16)
+
+    def _get_wk_native_weight_bf16(self) -> torch.Tensor:
+        weight = self.wk.weight
+        cached_weight = self._wk_native_weight_bf16
+        if (
+            cached_weight is not None
+            and cached_weight.device == weight.device
+            and cached_weight.shape == weight.shape
+        ):
+            return cached_weight
+
+        weight_scale_inv = getattr(self.wk, "weight_scale_inv", None)
+        weight_scale = getattr(self.wk, "weight_scale", None)
+        if weight_scale_inv is not None:
+            quant_method = getattr(self.wk, "quant_method", None)
+            quant_config = getattr(quant_method, "quant_config", None)
+            block_size = getattr(quant_config, "weight_block_size", None) or [128, 128]
+            if len(block_size) != 2:
+                raise ValueError(f"Unexpected block quant size {block_size}.")
+
+            if weight_scale_inv.dtype == torch.int32:
+                weight_scale = _unpack_ue8m0_scale_for_triton(
+                    weight_scale_inv,
+                    tuple(weight.shape),
+                    block_size,
+                )
+            elif weight_scale_inv.dtype == torch.float32:
+                weight_scale = weight_scale_inv
+            else:
+                raise ValueError(
+                    "Indexer forward_native only supports float32 or packed int32 "
+                    f"block scales for wk; got {weight_scale_inv.dtype}."
+                )
+
+            weight_bf16 = block_quant_dequant(
+                weight,
+                weight_scale,
+                block_size,
+                torch.bfloat16,
+            ).contiguous()
+        elif weight_scale is None:
+            weight_bf16 = (
+                weight if weight.dtype == torch.bfloat16 else weight.to(torch.bfloat16)
+            )
+        else:
+            scale = weight_scale.to(torch.float32)
+            if scale.numel() == 1:
+                scale = scale.reshape(1, 1)
+            elif scale.numel() == weight.shape[1]:
+                scale = scale.reshape(1, weight.shape[1])
+            elif scale.numel() == weight.shape[0]:
+                scale = scale.reshape(weight.shape[0], 1)
+            else:
+                raise NotImplementedError(
+                    "Indexer forward_native only supports scalar or per-channel "
+                    f"FP8 scales for wk; got weight={tuple(weight.shape)} and "
+                    f"weight_scale={tuple(weight_scale.shape)}."
+                )
+            weight_bf16 = (weight.to(torch.float32) * scale).to(torch.bfloat16)
+
+        bias = self.wk.bias
+        self._wk_native_weight_bf16 = weight_bf16
+        self._wk_native_bias_bf16 = (
+            None
+            if bias is None
+            else (bias if bias.dtype == torch.bfloat16 else bias.to(torch.bfloat16))
+        )
+        return weight_bf16
+
+    def _get_k_bf16_native(
+        self,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        positions: torch.Tensor,
+    ) -> torch.Tensor:
+        x_bf16 = self._extract_bf16_input(x)
+        weight_bf16 = self._get_wk_native_weight_bf16()
+        key = torch.nn.functional.linear(x_bf16, weight_bf16, self._wk_native_bias_bf16)
+
+        key = self.k_norm(key)
+        k_rope, _ = torch.split(
+            key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+        )
+        _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
+        self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
+        return rotate_activation(key)
+
+    def _store_index_k_cache_native(
+        self,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        key: torch.Tensor,
+    ) -> None:
+        if TYPE_CHECKING:
+            assert isinstance(forward_batch.token_to_kv_pool, NSATokenToKVPool)
+
+        page_size = self._native_index_page_size
+        if page_size is None:
+            page_size = forward_batch.token_to_kv_pool.page_size
+        if (not _is_cuda) or _is_fp8_fnuz:
+            raise NotImplementedError(
+                "Indexer forward_native short-ISL path requires the fused NSA "
+                "store kernel on CUDA."
+            )
+
+        out_loc = forward_batch.out_cache_loc
+        if not out_loc.is_contiguous():
+            out_loc = out_loc.contiguous()
+        buf = self._native_index_k_with_scale_buffer
+        if buf is None:
+            buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                layer_id=layer_id
+            )
+        fused_store_index_k_cache(key, buf, out_loc, page_size)
+
+    def _forward_native_k_only(
+        self,
+        x: Union[torch.Tensor, Tuple[torch.Tensor, ...]],
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        metadata: BaseIndexerMetadata,
+        return_indices: bool = True,
+    ) -> Optional[torch.Tensor]:
+        assert forward_batch.forward_mode.is_extend_without_speculative()
+        x_meta = x[0] if isinstance(x, tuple) else x
+
+        key = self._get_k_bf16_native(x, positions)
+        self._store_index_k_cache_native(
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            key=key,
+        )
+
+        if not return_indices:
+            return None
+
+        return self._build_short_isl_topk_result_native(metadata, x_meta.device)
 
     def _get_topk_paged(
         self,
@@ -438,9 +759,11 @@ class Indexer(MultiPlatformOp):
             block_tables = metadata.get_page_table_64()
 
         max_seq_len = block_tables.shape[1] * page_size
-        kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
-            layer_id=layer_id
-        )
+        kv_cache_fp8 = self._native_index_k_with_scale_buffer
+        if kv_cache_fp8 is None:
+            kv_cache_fp8 = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                layer_id=layer_id
+            )
 
         blocksize = page_size
         if (
@@ -1020,9 +1343,11 @@ class Indexer(MultiPlatformOp):
             )
         ):
             # NOTE: wrapper already normalizes shape/contiguity and asserts dtypes.
-            buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
-                layer_id=layer_id
-            )
+            buf = self._native_index_k_with_scale_buffer
+            if buf is None:
+                buf = forward_batch.token_to_kv_pool.get_index_k_with_scale_buffer(
+                    layer_id=layer_id
+                )
             fused_store_index_k_cache(
                 key,
                 buf,
@@ -1287,6 +1612,56 @@ class Indexer(MultiPlatformOp):
                 layer_id=layer_id,
             )
         return topk_result
+
+    def forward_native(
+        self,
+        x: torch.Tensor,
+        q_lora: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        layer_id: int,
+        return_indices: bool = True,
+    ) -> Optional[torch.Tensor]:
+        metadata = forward_batch.attn_backend.get_indexer_metadata(
+            layer_id, forward_batch
+        )
+        if metadata is None:
+            return None
+
+        if not forward_batch.forward_mode.is_extend_without_speculative():
+            raise NotImplementedError(
+                "Indexer forward_native only supports short-ISL prefill."
+            )
+
+        if self.nsa_enable_prefill_cp:
+            raise NotImplementedError(
+                "Indexer forward_native does not support NSA prefill CP."
+            )
+
+        if not getattr(
+            getattr(metadata, "attn_metadata", None),
+            "native_compile_indexer_ready",
+            False,
+        ):
+            raise NotImplementedError(
+                "Indexer forward_native requires native-compile seq-len metadata "
+                "for short-ISL prefill."
+            )
+
+        max_kv_len = forward_batch.attn_backend.forward_metadata.max_seq_len_k
+        if max_kv_len > self.index_topk:
+            raise NotImplementedError(
+                "Indexer forward_native only supports the short-ISL k-only path."
+            )
+
+        return self._forward_native_k_only(
+            x=x,
+            positions=positions,
+            forward_batch=forward_batch,
+            layer_id=layer_id,
+            metadata=metadata,
+            return_indices=return_indices,
+        )
 
     def forward_npu(
         self,

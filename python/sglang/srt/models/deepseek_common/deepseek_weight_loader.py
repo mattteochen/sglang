@@ -413,6 +413,10 @@ class DeepseekV2WeightLoaderMixin:
             is_nextn: Whether processing NextN weights
             weight_names: Optional list of loaded weight names to determine which layers to process
         """
+        check_weight_update_allowed = getattr(self, "check_weight_update_allowed", None)
+        if callable(check_weight_update_allowed):
+            check_weight_update_allowed()
+
         if is_nextn:
             layer_ids = [self.config.num_hidden_layers]
         else:
@@ -427,11 +431,16 @@ class DeepseekV2WeightLoaderMixin:
                             layer_ids.add(layer_id)
 
         for layer_id in layer_ids:
+            layer = self.model.layers[layer_id] if not is_nextn else self.model.decoder
             self_attn = (
-                self.model.layers[layer_id].self_attn
-                if not is_nextn
-                else self.model.decoder.self_attn
+                layer.self_attn if not is_nextn else self.model.decoder.self_attn
             )
+            if hasattr(self_attn, "reset_native_compile_state"):
+                self_attn.reset_native_compile_state()
+            if hasattr(layer, "mlp") and hasattr(
+                layer.mlp, "reset_native_compile_state"
+            ):
+                layer.mlp.reset_native_compile_state()
 
             if hasattr(self_attn.kv_b_proj, "qweight"):
                 # awq compatible, dequantize the weight if supported

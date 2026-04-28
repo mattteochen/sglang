@@ -98,6 +98,67 @@ LOAD_FORMAT_CHOICES = [
     "runai_streamer",
 ]
 
+
+def parse_startup_warmup_batch_spec(spec: str) -> List[int]:
+    """Parse one startup warmup batch spec.
+
+    The accepted format is a comma-separated list where each segment is either:
+    - ``LEN`` to append a single prompt length
+    - ``NxLEN`` to append ``N`` prompts of the same length
+    """
+
+    prompt_lens: List[int] = []
+    for raw_segment in spec.split(","):
+        segment = raw_segment.strip()
+        if not segment:
+            raise argparse.ArgumentTypeError(
+                "--warmup-batch-input-lens does not allow empty segments"
+            )
+
+        lowered = segment.lower()
+        if "x" in lowered:
+            if lowered.count("x") != 1:
+                raise argparse.ArgumentTypeError(
+                    f"Invalid --warmup-batch-input-lens segment: {segment!r}"
+                )
+            repeat_str, prompt_len_str = lowered.split("x", 1)
+            if not repeat_str or not prompt_len_str:
+                raise argparse.ArgumentTypeError(
+                    f"Invalid --warmup-batch-input-lens segment: {segment!r}"
+                )
+            try:
+                repeat = int(repeat_str)
+                prompt_len = int(prompt_len_str)
+            except ValueError as exc:
+                raise argparse.ArgumentTypeError(
+                    f"Invalid --warmup-batch-input-lens segment: {segment!r}"
+                ) from exc
+            if repeat <= 0 or prompt_len <= 0:
+                raise argparse.ArgumentTypeError(
+                    "--warmup-batch-input-lens only supports positive batch sizes "
+                    "and prompt lengths"
+                )
+            prompt_lens.extend([prompt_len] * repeat)
+        else:
+            try:
+                prompt_len = int(segment)
+            except ValueError as exc:
+                raise argparse.ArgumentTypeError(
+                    f"Invalid --warmup-batch-input-lens segment: {segment!r}"
+                ) from exc
+            if prompt_len <= 0:
+                raise argparse.ArgumentTypeError(
+                    "--warmup-batch-input-lens only supports positive prompt lengths"
+                )
+            prompt_lens.append(prompt_len)
+
+    if not prompt_lens:
+        raise argparse.ArgumentTypeError(
+            "--warmup-batch-input-lens must contain at least one prompt length"
+        )
+    return prompt_lens
+
+
 QUANTIZATION_CHOICES = [
     "awq",
     "fp8",
@@ -322,6 +383,8 @@ class ServerArgs:
     grpc_mode: bool = False
     skip_server_warmup: bool = False
     warmups: Optional[str] = None
+    warmup_input_lens: Optional[List[int]] = None
+    warmup_batch_input_lens: Optional[List[List[int]]] = None
     nccl_port: Optional[int] = None
     checkpoint_engine_wait_weights_before_ready: bool = False
 
@@ -777,6 +840,9 @@ class ServerArgs:
         self._handle_multimodal()
         # Validate SSL arguments early (before dummy-model short-circuit).
         self._handle_ssl_validation()
+        # Validate startup warmup args early so dummy-model test configs still
+        # exercise the same input contract as real server startup.
+        self._handle_startup_warmup_args()
 
         if self.model_path.lower() in ["none", "dummy"]:
             # Skip for dummy models
@@ -4031,6 +4097,37 @@ class ServerArgs:
             )
             self.enable_mixed_chunk = False
 
+    def _handle_startup_warmup_args(self):
+        if self.warmup_input_lens is not None:
+            if len(self.warmup_input_lens) == 0:
+                raise ValueError("--warmup-input-lens must contain at least one length")
+            if any(prompt_len <= 0 for prompt_len in self.warmup_input_lens):
+                raise ValueError("--warmup-input-lens only supports positive lengths")
+        if self.warmup_batch_input_lens is not None:
+            if len(self.warmup_batch_input_lens) == 0:
+                raise ValueError(
+                    "--warmup-batch-input-lens must contain at least one batch spec"
+                )
+
+            normalized_batch_specs: List[List[int]] = []
+            for batch_spec in self.warmup_batch_input_lens:
+                if isinstance(batch_spec, str):
+                    batch_prompt_lens = parse_startup_warmup_batch_spec(batch_spec)
+                else:
+                    batch_prompt_lens = list(batch_spec)
+
+                if len(batch_prompt_lens) == 0:
+                    raise ValueError(
+                        "--warmup-batch-input-lens does not allow empty batch specs"
+                    )
+                if any(prompt_len <= 0 for prompt_len in batch_prompt_lens):
+                    raise ValueError(
+                        "--warmup-batch-input-lens only supports positive prompt lengths"
+                    )
+                normalized_batch_specs.append(batch_prompt_lens)
+
+            self.warmup_batch_input_lens = normalized_batch_specs
+
     def _handle_other_validations(self):
         # Handle model inference tensor dump.
         if self.debug_tensor_dump_output_folder is not None:
@@ -4223,6 +4320,23 @@ class ServerArgs:
             required=False,
             help="Specify custom warmup functions (csv) to run before server starts eg. --warmups=warmup_name1,warmup_name2 "
             "will run the functions `warmup_name1` and `warmup_name2` specified in warmup.py before the server starts listening for requests",
+        )
+        parser.add_argument(
+            "--warmup-input-lens",
+            type=int,
+            nargs="+",
+            default=ServerArgs.warmup_input_lens,
+            help="Send one exact-length input_ids startup warmup request per provided prompt length before the server is marked ready. "
+            "This is useful for pre-hitting torch.compile prefill graph families on the real request path.",
+        )
+        parser.add_argument(
+            "--warmup-batch-input-lens",
+            type=parse_startup_warmup_batch_spec,
+            nargs="+",
+            default=ServerArgs.warmup_batch_input_lens,
+            help="Send one exact input_ids startup warmup request per provided batch spec before the server is marked ready. "
+            "Each batch spec is a comma-separated list of prompt lengths where segments may be LEN or NxLEN, "
+            "for example: --warmup-batch-input-lens 2x1024 1024,2049.",
         )
         parser.add_argument(
             "--nccl-port",

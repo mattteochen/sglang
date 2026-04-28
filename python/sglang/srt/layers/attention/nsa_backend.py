@@ -16,7 +16,10 @@ from sglang.srt.layers.attention.nsa.nsa_backend_mtp_precompute import (
     compute_cu_seqlens,
 )
 from sglang.srt.layers.attention.nsa.nsa_indexer import BaseIndexerMetadata
-from sglang.srt.layers.attention.nsa.quant_k_cache import quantize_k_cache
+from sglang.srt.layers.attention.nsa.quant_k_cache import (
+    quantize_k_cache,
+    quantize_k_cache_separate,
+)
 from sglang.srt.layers.attention.nsa.transform_index import (
     transform_index_page_table_decode,
     transform_index_page_table_prefill,
@@ -32,9 +35,15 @@ from sglang.srt.layers.attention.nsa.utils import (
 from sglang.srt.layers.attention.utils import (
     concat_mla_absorb_q_general,
     mla_quantize_and_rope_for_fp8,
+    mla_quantize_and_rope_for_fp8_native,
     seqlens_expand_triton,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
+from sglang.srt.layers.quantization.fp8_kernel import fp8_dtype
+from sglang.srt.mem_cache.utils import (
+    set_mla_kv_buffer_triton,
+    set_mla_kv_buffer_triton_fp8_quant,
+)
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.utils import is_cuda, is_hip
 
@@ -45,6 +54,7 @@ if TYPE_CHECKING:
 
 
 _is_hip = is_hip()
+_is_cuda = is_cuda()
 
 if _is_hip:
     from sglang.srt.layers.attention.nsa.triton_kernel import get_valid_kv_indices
@@ -65,6 +75,142 @@ else:
         flash_attn_varlen_func,
         flash_attn_with_kvcache,
     )
+
+if _is_cuda:
+    from sglang.srt.utils.custom_op import register_custom_op
+
+    def _fake_trtllm_batch_decode_with_kv_cache_mla(
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        qk_nope_head_dim: int,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_seq_len: int,
+        sparse_mla_top_k: int,
+        bmm1_scale: float,
+        skip_softmax_threshold_scale_factor: Optional[float],
+        v_head_dim: int,
+    ) -> torch.Tensor:
+        del (
+            kv_cache,
+            workspace_buffer,
+            qk_nope_head_dim,
+            kv_lora_rank,
+            qk_rope_head_dim,
+            block_tables,
+            seq_lens,
+            max_seq_len,
+            sparse_mla_top_k,
+            bmm1_scale,
+            skip_softmax_threshold_scale_factor,
+        )
+        return query.new_empty(
+            (*query.shape[:-1], v_head_dim), dtype=torch.bfloat16
+        )
+
+    @register_custom_op(fake_impl=_fake_trtllm_batch_decode_with_kv_cache_mla)
+    def _trtllm_batch_decode_with_kv_cache_mla_op(
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        workspace_buffer: torch.Tensor,
+        qk_nope_head_dim: int,
+        kv_lora_rank: int,
+        qk_rope_head_dim: int,
+        block_tables: torch.Tensor,
+        seq_lens: torch.Tensor,
+        max_seq_len: int,
+        sparse_mla_top_k: int,
+        bmm1_scale: float,
+        skip_softmax_threshold_scale_factor: Optional[float],
+        v_head_dim: int,
+    ) -> torch.Tensor:
+        import flashinfer.decode
+
+        del v_head_dim
+        return flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+            query=query,
+            kv_cache=kv_cache,
+            workspace_buffer=workspace_buffer,
+            qk_nope_head_dim=qk_nope_head_dim,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+            block_tables=block_tables,
+            seq_lens=seq_lens,
+            max_seq_len=max_seq_len,
+            sparse_mla_top_k=sparse_mla_top_k,
+            bmm1_scale=bmm1_scale,
+            backend="trtllm-gen",
+            skip_softmax_threshold_scale_factor=skip_softmax_threshold_scale_factor,
+        )
+else:
+    _trtllm_batch_decode_with_kv_cache_mla_op = None
+
+
+def _set_mla_kv_buffer_direct(
+    kv_buffer: torch.Tensor,
+    loc: torch.Tensor,
+    cache_k_nope: torch.Tensor,
+    cache_k_rope: torch.Tensor,
+    *,
+    dtype: torch.dtype,
+    store_dtype: torch.dtype,
+    nsa_kv_cache_store_fp8: bool,
+    use_nsa: bool,
+) -> None:
+    if _is_hip and use_nsa and dtype == fp8_dtype:
+        set_mla_kv_buffer_triton_fp8_quant(
+            kv_buffer,
+            loc,
+            cache_k_nope,
+            cache_k_rope,
+            fp8_dtype,
+        )
+        return
+
+    if nsa_kv_cache_store_fp8:
+        cache_k_nope_fp8, cache_k_rope_fp8 = quantize_k_cache_separate(
+            cache_k_nope, cache_k_rope
+        )
+        set_mla_kv_buffer_triton(
+            kv_buffer,
+            loc,
+            cache_k_nope_fp8,
+            cache_k_rope_fp8,
+        )
+        return
+
+    if cache_k_nope.dtype != dtype:
+        cache_k_nope = cache_k_nope.to(dtype)
+        cache_k_rope = cache_k_rope.to(dtype)
+    if store_dtype != dtype:
+        cache_k_nope = cache_k_nope.view(store_dtype)
+        cache_k_rope = cache_k_rope.view(store_dtype)
+
+    set_mla_kv_buffer_triton(
+        kv_buffer,
+        loc,
+        cache_k_nope,
+        cache_k_rope,
+    )
+
+
+def _get_cached_mla_kv_buffer_view(
+    layer: RadixAttention,
+) -> Optional[torch.Tensor]:
+    kv_buffer = getattr(layer, "_experimental_prefill_kv_buffer_storage", None)
+    if kv_buffer is None:
+        return None
+
+    kv_cache_dtype = getattr(layer, "_experimental_prefill_kv_cache_dtype", None)
+    kv_store_dtype = getattr(layer, "_experimental_prefill_kv_store_dtype", None)
+    if kv_cache_dtype is None or kv_store_dtype is None:
+        return kv_buffer
+    if kv_store_dtype != kv_cache_dtype:
+        return kv_buffer.view(kv_cache_dtype)
+    return kv_buffer
 
 
 # Reuse this workspace buffer across all NSA backend instances
@@ -145,6 +291,9 @@ class NSAMetadata:
     indexer_seq_lens: Optional[torch.Tensor] = None
     # batch index for each token.
     token_to_batch_idx: Optional[torch.Tensor] = None
+    # Explicit native-compile readiness bit so compiled paths do not need to
+    # inspect forward_batch.seq_lens_cpu directly.
+    native_compile_indexer_ready: bool = False
 
 
 class TopkTransformMethod(IntEnum):
@@ -336,6 +485,8 @@ class NativeSparseAttnBackend(
         self.enable_auto_select_prefill_impl = self.nsa_prefill_impl == "flashmla_auto"
 
         self._arange_buf = torch.arange(16384, device=self.device, dtype=torch.int32)
+        self._native_compile_prefill_page_table_1: Optional[torch.Tensor] = None
+        self._native_compile_prefill_real_page_table: Optional[torch.Tensor] = None
 
         if _is_hip:
             max_bs = model_runner.req_to_token_pool.size
@@ -398,6 +549,81 @@ class NativeSparseAttnBackend(
             0, max_seqlen_k, page_size, device=page_table.device, dtype=torch.int32
         )
         return page_table[:, strided_indices] // page_size
+
+    def _should_use_fixed_native_compile_prefill_page_table(
+        self,
+        forward_batch: ForwardBatch,
+        max_seqlen_k: int,
+    ) -> bool:
+        return (
+            forward_batch.allow_fixed_native_compile_prefill_page_table
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and forward_batch.seq_lens_cpu is not None
+            and max_seqlen_k <= self.nsa_index_topk
+            and not can_nsa_prefill_cp_round_robin_split(forward_batch)
+        )
+
+    def _ensure_fixed_native_compile_prefill_page_table_storage(
+        self,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        page_table = self._native_compile_prefill_page_table_1
+        real_page_table = self._native_compile_prefill_real_page_table
+
+        if page_table is None:
+            max_batch_size = self.req_to_token.shape[0]
+            page_table = torch.full(
+                (max_batch_size, self.nsa_index_topk),
+                fill_value=-1,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            self._native_compile_prefill_page_table_1 = page_table
+
+        if real_page_table is None:
+            if self.real_page_size == 1:
+                real_page_table = page_table
+            else:
+                real_page_table = torch.full(
+                    (
+                        page_table.shape[0],
+                        (self.nsa_index_topk + self.real_page_size - 1)
+                        // self.real_page_size,
+                    ),
+                    fill_value=-1,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
+            self._native_compile_prefill_real_page_table = real_page_table
+
+        return page_table, real_page_table
+
+    def _bind_fixed_native_compile_prefill_page_table(
+        self,
+        page_table: torch.Tensor,
+        extend_seq_lens_cpu,
+    ) -> Tuple[torch.Tensor, torch.Tensor, List[int]]:
+        storage, real_storage = (
+            self._ensure_fixed_native_compile_prefill_page_table_storage()
+        )
+        storage.fill_(-1)
+        if real_storage is not storage:
+            real_storage.fill_(-1)
+
+        rows, cols = page_table.shape
+        if rows > 0 and cols > 0:
+            storage[:rows, :cols].copy_(page_table)
+            if real_storage is not storage:
+                real_page_table = self._transform_table_1_to_real(page_table)
+                real_rows, real_cols = real_page_table.shape
+                real_storage[:real_rows, :real_cols].copy_(real_page_table)
+
+        if isinstance(extend_seq_lens_cpu, torch.Tensor):
+            extend_seq_lens_list = extend_seq_lens_cpu.tolist()
+        else:
+            extend_seq_lens_list = [int(v) for v in extend_seq_lens_cpu]
+        extend_seq_lens_list.extend([0] * (storage.shape[0] - len(extend_seq_lens_list)))
+
+        return storage, real_storage, extend_seq_lens_list
 
     def init_forward_metadata(self, forward_batch: ForwardBatch):
         """Init the metadata for a forward pass."""
@@ -626,6 +852,24 @@ class NativeSparseAttnBackend(
         )
         nsa_cu_seqlens_k = compute_cu_seqlens(nsa_cache_seqlens_int32)
         nsa_cu_seqlens_q = self.get_device_int32_arange(len(nsa_cu_seqlens_k))
+        metadata_page_table = page_table
+        metadata_extend_seq_lens_list = extend_seq_lens_cpu
+
+        if self._should_use_fixed_native_compile_prefill_page_table(
+            forward_batch, max_seqlen_k
+        ):
+            (
+                metadata_page_table,
+                metadata_real_page_table,
+                metadata_extend_seq_lens_list,
+            ) = self._bind_fixed_native_compile_prefill_page_table(
+                page_table,
+                extend_seq_lens_cpu,
+            )
+        else:
+            metadata_real_page_table = self._transform_table_1_to_real(
+                metadata_page_table
+            )
 
         paged_mqa_schedule_metadata = None
         # DeepGEMM paged MQA logits path needs a schedule metadata tensor.
@@ -661,7 +905,7 @@ class NativeSparseAttnBackend(
             cu_seqlens_q=cu_seqlens_q,
             cu_seqlens_k=cu_seqlens_k,
             seq_lens_sum=forward_batch.seq_lens_sum,
-            page_table_1=page_table,
+            page_table_1=metadata_page_table,
             page_table_1_flattened=page_table_1_flattened,
             flashmla_metadata=(
                 self._compute_flashmla_metadata(
@@ -676,14 +920,17 @@ class NativeSparseAttnBackend(
             nsa_cu_seqlens_q=nsa_cu_seqlens_q,
             nsa_cu_seqlens_k=nsa_cu_seqlens_k,
             nsa_seqlens_expanded=seqlens_expanded,
-            nsa_extend_seq_lens_list=extend_seq_lens_cpu,
-            real_page_table=self._transform_table_1_to_real(page_table),
+            nsa_extend_seq_lens_list=metadata_extend_seq_lens_list,
+            real_page_table=metadata_real_page_table,
             nsa_max_seqlen_q=1,
             topk_indices_offset=topk_indices_offset,
             indexer_k_start_end=indexer_k_start_end,
             indexer_seq_lens_cpu=indexer_seq_lens_cpu,
             indexer_seq_lens=indexer_seq_lens,
             token_to_batch_idx=token_to_batch_idx,
+            native_compile_indexer_ready=(
+                indexer_seq_lens_cpu is not None and indexer_seq_lens is not None
+            ),
         )
         self.forward_metadata = metadata
 
@@ -1334,12 +1581,27 @@ class NativeSparseAttnBackend(
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                forward_batch.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
-                    layer,
-                    cache_loc,
-                    k,
-                    k_rope,
+                cached_kv_buffer = getattr(
+                    layer, "_experimental_prefill_kv_buffer_storage", None
                 )
+                if cached_kv_buffer is not None:
+                    _set_mla_kv_buffer_direct(
+                        cached_kv_buffer,
+                        cache_loc,
+                        k,
+                        k_rope,
+                        dtype=layer._experimental_prefill_kv_cache_dtype,
+                        store_dtype=layer._experimental_prefill_kv_store_dtype,
+                        nsa_kv_cache_store_fp8=layer._experimental_prefill_nsa_kv_cache_store_fp8,
+                        use_nsa=layer._experimental_prefill_use_nsa,
+                    )
+                else:
+                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
+                        layer,
+                        cache_loc,
+                        k,
+                        k_rope,
+                    )
 
         # Use MHA kernel if in MHA_ONE_SHOT mode
         if self.use_mha:
@@ -1359,7 +1621,9 @@ class NativeSparseAttnBackend(
 
         # Do absorbed multi-latent attention (MLA path)
         assert q_rope is not None
-        kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_cache = _get_cached_mla_kv_buffer_view(layer)
+        if kv_cache is None:
+            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
 
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
@@ -1534,15 +1798,32 @@ class NativeSparseAttnBackend(
                     if not layer.is_cross_attention
                     else forward_batch.encoder_out_cache_loc
                 )
-                forward_batch.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
-                    layer,
-                    cache_loc,
-                    k,
-                    k_rope,
+                cached_kv_buffer = getattr(
+                    layer, "_experimental_prefill_kv_buffer_storage", None
                 )
+                if cached_kv_buffer is not None:
+                    _set_mla_kv_buffer_direct(
+                        cached_kv_buffer,
+                        cache_loc,
+                        k,
+                        k_rope,
+                        dtype=layer._experimental_prefill_kv_cache_dtype,
+                        store_dtype=layer._experimental_prefill_kv_store_dtype,
+                        nsa_kv_cache_store_fp8=layer._experimental_prefill_nsa_kv_cache_store_fp8,
+                        use_nsa=layer._experimental_prefill_use_nsa,
+                    )
+                else:
+                    forward_batch.token_to_kv_pool.set_mla_kv_buffer(  # type: ignore
+                        layer,
+                        cache_loc,
+                        k,
+                        k_rope,
+                    )
 
         # Do absorbed multi-latent attention
-        kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        kv_cache = _get_cached_mla_kv_buffer_view(layer)
+        if kv_cache is None:
+            kv_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         if q_rope is not None:
             q_nope = q.view(-1, layer.tp_q_head_num, layer.v_head_dim)
             q_rope = q_rope.view(
@@ -2012,8 +2293,6 @@ class NativeSparseAttnBackend(
         is_prefill: bool = False,
     ) -> torch.Tensor:
         """Forward using TRT-LLM sparse MLA kernel."""
-        import flashinfer.decode
-
         metadata = self.forward_metadata
 
         merge_query = q_rope is not None
@@ -2026,7 +2305,12 @@ class NativeSparseAttnBackend(
                 cos_sin_cache is not None
             ), "For FP8 path cos_sin_cache should not be None."
 
-            q, k, k_rope = mla_quantize_and_rope_for_fp8(
+            quantize_rope_impl = (
+                mla_quantize_and_rope_for_fp8_native
+                if torch._dynamo.is_compiling()
+                else mla_quantize_and_rope_for_fp8
+            )
+            q, k, k_rope = quantize_rope_impl(
                 q,
                 q_rope,
                 k.squeeze(1),
@@ -2049,11 +2333,28 @@ class NativeSparseAttnBackend(
                 if not layer.is_cross_attention
                 else forward_batch.encoder_out_cache_loc
             )
-            forward_batch.token_to_kv_pool.set_mla_kv_buffer(
-                layer, cache_loc, k, k_rope
+            cached_kv_buffer = getattr(
+                layer, "_experimental_prefill_kv_buffer_storage", None
             )
+            if cached_kv_buffer is not None:
+                _set_mla_kv_buffer_direct(
+                    cached_kv_buffer,
+                    cache_loc,
+                    k,
+                    k_rope,
+                    dtype=layer._experimental_prefill_kv_cache_dtype,
+                    store_dtype=layer._experimental_prefill_kv_store_dtype,
+                    nsa_kv_cache_store_fp8=layer._experimental_prefill_nsa_kv_cache_store_fp8,
+                    use_nsa=layer._experimental_prefill_use_nsa,
+                )
+            else:
+                forward_batch.token_to_kv_pool.set_mla_kv_buffer(
+                    layer, cache_loc, k, k_rope
+                )
 
-        k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
+        k_cache = _get_cached_mla_kv_buffer_view(layer)
+        if k_cache is None:
+            k_cache = forward_batch.token_to_kv_pool.get_key_buffer(layer.layer_id)
         kv_cache = k_cache.view(-1, self.real_page_size, self.kv_cache_dim).unsqueeze(1)
 
         if merge_query:
@@ -2101,7 +2402,7 @@ class NativeSparseAttnBackend(
         block_tables = page_table_1.unsqueeze(1)
         seq_lens = metadata.cache_seqlens_int32 if seq_lens is None else seq_lens
 
-        out = flashinfer.decode.trtllm_batch_decode_with_kv_cache_mla(
+        out = _trtllm_batch_decode_with_kv_cache_mla_op(
             query=q,
             kv_cache=kv,
             workspace_buffer=self.workspace_buffer,
@@ -2113,8 +2414,8 @@ class NativeSparseAttnBackend(
             max_seq_len=metadata.max_seq_len_k,
             sparse_mla_top_k=self.nsa_index_topk,
             bmm1_scale=bmm1_scale,
-            backend="trtllm-gen",
             skip_softmax_threshold_scale_factor=envs.SGLANG_SKIP_SOFTMAX_DECODE_THRESHOLD_SCALE_FACTOR.get(),
+            v_head_dim=layer.v_head_dim,
         )
         # Output: [batch, q_len=1, heads, v_dim] -> [batch, heads, v_dim]
         return out.squeeze(1)

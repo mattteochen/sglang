@@ -727,7 +727,13 @@ def _unpack_ue8m0_scale_for_triton(
 
     # Unpack int32 -> 4x uint8 -> float32
     # Each uint8 represents an exponent in UE8M0 format
-    sf_u8 = sf_packed.contiguous().view(torch.uint8).view(mn_repeat, k_packed)
+    # If the packed K dimension collapses to size 1 after sharding, PyTorch can
+    # still treat the tensor as contiguous while keeping a non-unit last stride.
+    # Reinterpret-casting int32 -> uint8 via view() requires the last stride to
+    # be exactly 1, so flatten first to force a canonical 1D layout.
+    sf_u8 = (
+        sf_packed.contiguous().reshape(-1).view(torch.uint8).view(mn_repeat, k_packed)
+    )
     sf_fp32 = (sf_u8.to(torch.int32) << 23).view(torch.float32)
 
     # Handle row dimension - may have 128x replication or direct mapping

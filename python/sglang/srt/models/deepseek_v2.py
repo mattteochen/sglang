@@ -18,8 +18,9 @@
 
 from __future__ import annotations
 
+import functools
 import logging
-from contextlib import nullcontext
+from contextlib import ExitStack, contextmanager, nullcontext
 from typing import Any, Dict, Iterable, List, Optional, Tuple, Union
 
 import torch
@@ -106,9 +107,13 @@ from sglang.srt.layers.moe.utils import (
 )
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8 import Fp8Config
+from sglang.srt.layers.quantization.fp8_utils import (
+    _unpack_ue8m0_scale_for_triton,
+    block_quant_dequant,
+)
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
-from sglang.srt.layers.utils import PPMissingLayer
+from sglang.srt.layers.utils import MultiPlatformOp, PPMissingLayer
 from sglang.srt.layers.utils.cp_utils import (
     cp_all_gather_rerange_output,
     cp_split_and_rebuild_data,
@@ -154,6 +159,7 @@ from sglang.srt.utils import (
     BumpAllocator,
     LazyValue,
     add_prefix,
+    get_compiler_backend,
     is_non_idle_and_non_empty,
     log_info_on_rank0,
     make_layers,
@@ -190,6 +196,166 @@ else:
     pass
 
 logger = logging.getLogger(__name__)
+
+
+def _validate_native_compile_linear_semantics(
+    module: nn.Module,
+    *,
+    module_name: str,
+    allow_bias: bool = False,
+) -> None:
+    if getattr(module, "gather_output", False):
+        raise RuntimeError(
+            "Experimental DeepSeek native BF16 compile path does not support "
+            f"{module_name} ({module.__class__.__name__}) with gather_output=True; "
+            "the native wrapper does not issue the required TP all-gather."
+        )
+    if hasattr(module, "input_is_parallel") and not getattr(
+        module, "input_is_parallel"
+    ):
+        raise RuntimeError(
+            "Experimental DeepSeek native BF16 compile path does not support "
+            f"{module_name} ({module.__class__.__name__}) with "
+            "input_is_parallel=False; the native wrapper expects shard-local "
+            "inputs and does not split them for TP."
+        )
+    if getattr(module, "skip_bias_add", False):
+        raise RuntimeError(
+            "Experimental DeepSeek native BF16 compile path does not support "
+            f"{module_name} ({module.__class__.__name__}) with "
+            "skip_bias_add=True; the native wrapper does not return a "
+            "separate output_bias tensor."
+        )
+    if not allow_bias and getattr(module, "bias", None) is not None:
+        raise RuntimeError(
+            "Experimental DeepSeek native BF16 compile path does not support "
+            f"{module_name} ({module.__class__.__name__}) with bias; the native "
+            "wrapper only handles bias-free modules here."
+        )
+
+
+def _set_multi_platform_compile_mode(
+    module: torch.nn.Module, *, reverse: bool, num_tokens: int
+):
+    for sub in module._modules.values():
+        if isinstance(sub, MultiPlatformOp):
+            if reverse:
+                sub.leave_torch_compile()
+            else:
+                sub.enter_torch_compile(num_tokens=num_tokens)
+        if isinstance(sub, torch.nn.Module):
+            _set_multi_platform_compile_mode(
+                sub, reverse=reverse, num_tokens=num_tokens
+            )
+
+
+@functools.lru_cache(maxsize=1)
+def _prewarm_flashinfer_lazy_modules_for_experimental_prefill_compile() -> None:
+    # Trigger FlashInfer's lazy build/load paths outside Dynamo so the
+    # compiled layer does not trip over filesystem-bound module loading.
+    import flashinfer.mla
+    import flashinfer.rope
+
+    flashinfer.rope.get_rope_module()
+    flashinfer.mla.get_trtllm_gen_fmha_module()
+
+
+def _get_experimental_prefill_compile_options() -> Dict[str, Any]:
+    options = {
+        "max_autotune": True,
+    }
+    if hasattr(torch._inductor.config, "combo_kernels"):
+        options["combo_kernels"] = True
+    if hasattr(torch._inductor.config, "cpp_wrapper"):
+        options["cpp_wrapper"] = True
+    return options
+
+
+def _maybe_mark_dynamic_dim0(tensor: Optional[torch.Tensor]) -> None:
+    if not isinstance(tensor, torch.Tensor) or tensor.ndim == 0:
+        return
+
+    try:
+        torch._dynamo.maybe_mark_dynamic(tensor, [0])
+    except Exception:
+        pass
+
+
+def _get_hidden_states_allreduce_fusion_flag(hidden_states: Any) -> bool:
+    return bool(getattr(hidden_states, "_sglang_needs_allreduce_fusion", False))
+
+
+def _mark_experimental_prefill_dynamic_inputs(
+    *,
+    positions: Optional[torch.Tensor] = None,
+    hidden_states: Optional[torch.Tensor] = None,
+    residual: Optional[torch.Tensor] = None,
+    forward_batch: Optional[ForwardBatch] = None,
+) -> None:
+    # Keep this list intentionally narrow. These are the DeepSeek prefill tensors
+    # that previously showed up as length-specialized in Dynamo logs. In
+    # particular, NSA prefill metadata can change batch size when the scheduler
+    # merges more requests than the startup warmup covered.
+    _maybe_mark_dynamic_dim0(positions)
+    _maybe_mark_dynamic_dim0(hidden_states)
+    _maybe_mark_dynamic_dim0(residual)
+
+    if forward_batch is None:
+        return
+
+    forward_metadata = getattr(
+        getattr(forward_batch, "attn_backend", None),
+        "forward_metadata",
+        None,
+    )
+    _maybe_mark_dynamic_dim0(getattr(forward_metadata, "nsa_seqlens_expanded", None))
+    _maybe_mark_dynamic_dim0(getattr(forward_metadata, "token_to_batch_idx", None))
+    _maybe_mark_dynamic_dim0(getattr(forward_metadata, "page_table_1", None))
+    _maybe_mark_dynamic_dim0(getattr(forward_metadata, "real_page_table", None))
+    _maybe_mark_dynamic_dim0(getattr(forward_metadata, "page_table_1_flattened", None))
+
+
+def _deepseek_prefill_mlp_native_bf16_gemms_enabled() -> bool:
+    return (
+        not envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_DISABLE_MLP_BF16_GEMMS.get()
+    )
+
+
+def _get_experimental_prefill_layer_compile_group_size() -> int:
+    return max(
+        int(envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_LAYER_GROUP_SIZE.get()),
+        1,
+    )
+
+
+def _get_experimental_prefill_layer_compile_group_start() -> int:
+    return max(
+        int(envs.SGLANG_EXPERIMENTAL_COMPILE_DEEPSEEK_PREFILL_LAYER_GROUP_START.get()),
+        0,
+    )
+
+
+def _format_experimental_prefill_layer_ids(layer_ids: Iterable[int]) -> str:
+    layer_ids = list(layer_ids)
+    if not layer_ids:
+        return "none"
+    if layer_ids == list(range(layer_ids[0], layer_ids[-1] + 1)):
+        return (
+            str(layer_ids[0])
+            if len(layer_ids) == 1
+            else f"{layer_ids[0]}-{layer_ids[-1]}"
+        )
+    return ",".join(str(layer_id) for layer_id in layer_ids)
+
+
+def _experimental_prefill_compile_supports_moe_backend() -> bool:
+    # The current compiled DeepSeek grouped-prefill strategy assumes the
+    # non-routed flashinfer_trtllm MoE path. In that backend, TopK stays as a
+    # thin metadata wrapper and the real routing remains fused inside the
+    # monolithic flashinfer_trtllm MoE kernel. Guard grouped compile on that
+    # backend so the compile-mode MultiPlatformOp swaps do not silently change
+    # the MoE routing path.
+    return get_moe_runner_backend().is_flashinfer_trtllm()
 
 
 class DeepseekV2MLP(nn.Module):
@@ -240,6 +406,149 @@ class DeepseekV2MLP(nn.Module):
                 "Only silu is supported for now."
             )
         self.act_fn = SiluAndMul()
+        self._gate_up_proj_native_weight_bf16: Optional[torch.Tensor] = None
+        self._down_proj_native_weight_bf16: Optional[torch.Tensor] = None
+
+    def reset_native_compile_state(self) -> None:
+        self._gate_up_proj_native_weight_bf16 = None
+        self._down_proj_native_weight_bf16 = None
+
+    @staticmethod
+    def _is_supported_block_fp8_linear_native_compile_module(
+        module: Optional[nn.Module],
+    ) -> bool:
+        if module is None:
+            return False
+        weight = getattr(module, "weight", None)
+        weight_scale_inv = getattr(module, "weight_scale_inv", None)
+        fp8_dtypes = tuple(
+            dtype
+            for dtype in (
+                getattr(torch, "float8_e4m3fn", None),
+                getattr(torch, "float8_e4m3fnuz", None),
+            )
+            if dtype is not None
+        )
+        return (
+            weight is not None
+            and weight_scale_inv is not None
+            and weight.dtype in fp8_dtypes
+            and weight_scale_inv.dtype in (torch.int32, torch.float32)
+        )
+
+    def _get_block_fp8_linear_native_weight_bf16(
+        self,
+        module: nn.Module,
+        cache_attr: str,
+        *,
+        module_name: str,
+        allow_bias: bool = False,
+    ) -> torch.Tensor:
+        _validate_native_compile_linear_semantics(
+            module, module_name=module_name, allow_bias=allow_bias
+        )
+        weight = getattr(module, "weight", None)
+        cached_weight = getattr(self, cache_attr)
+        if (
+            weight is not None
+            and cached_weight is not None
+            and cached_weight.device == weight.device
+            and cached_weight.shape == weight.shape
+        ):
+            return cached_weight
+
+        assert weight is not None
+        weight_scale_inv = getattr(module, "weight_scale_inv", None)
+        if weight_scale_inv is None:
+            raise ValueError(
+                f"{module.__class__.__name__} does not expose weight_scale_inv."
+            )
+
+        quant_method = getattr(module, "quant_method", None)
+        quant_config = getattr(quant_method, "quant_config", None)
+        block_size = getattr(quant_config, "weight_block_size", None) or [128, 128]
+        if len(block_size) != 2:
+            raise ValueError(f"Unexpected block quant size {block_size}.")
+
+        if weight_scale_inv.dtype == torch.int32:
+            weight_scale = _unpack_ue8m0_scale_for_triton(
+                weight_scale_inv,
+                tuple(weight.shape),
+                block_size,
+            )
+        elif weight_scale_inv.dtype == torch.float32:
+            weight_scale = weight_scale_inv
+        else:
+            raise ValueError(
+                "Native compile BF16 path only supports float32 or packed int32 "
+                f"block scales, got {weight_scale_inv.dtype}."
+            )
+
+        weight_bf16 = block_quant_dequant(
+            weight,
+            weight_scale,
+            block_size,
+            torch.bfloat16,
+        ).contiguous()
+        setattr(self, cache_attr, weight_bf16)
+        return weight_bf16
+
+    def _should_use_native_bf16_compile_path(self) -> bool:
+        if not _deepseek_prefill_mlp_native_bf16_gemms_enabled():
+            return False
+        return self._is_supported_block_fp8_linear_native_compile_module(
+            self.gate_up_proj
+        ) and self._is_supported_block_fp8_linear_native_compile_module(self.down_proj)
+
+    def _forward_gate_up_proj_native_compile(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(
+            x.to(torch.bfloat16),
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.gate_up_proj,
+                "_gate_up_proj_native_weight_bf16",
+                module_name="gate_up_proj",
+            ),
+        )
+
+    def _forward_down_proj_native_compile(
+        self,
+        x: torch.Tensor,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
+    ) -> torch.Tensor:
+        output_parallel = F.linear(
+            x.to(torch.bfloat16),
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.down_proj,
+                "_down_proj_native_weight_bf16",
+                module_name="down_proj",
+            ),
+        )
+        if (
+            self.down_proj.reduce_results
+            and self.down_proj.tp_size > 1
+            and not (should_allreduce_fusion or use_reduce_scatter)
+        ):
+            if self.down_proj.use_dp_attention_reduce:
+                return get_attention_tp_group().all_reduce(output_parallel)
+            return tensor_model_parallel_all_reduce(output_parallel)
+        return output_parallel
+
+    def prepare_native_compile_state(
+        self, forward_batch: Optional[ForwardBatch] = None
+    ) -> None:
+        del forward_batch
+        if self._should_use_native_bf16_compile_path():
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.gate_up_proj,
+                "_gate_up_proj_native_weight_bf16",
+                module_name="gate_up_proj",
+            )
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.down_proj,
+                "_down_proj_native_weight_bf16",
+                module_name="down_proj",
+            )
 
     def forward(
         self,
@@ -251,6 +560,15 @@ class DeepseekV2MLP(nn.Module):
     ):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
+
+        if torch._dynamo.is_compiling() and self._should_use_native_bf16_compile_path():
+            gate_up = self._forward_gate_up_proj_native_compile(x)
+            x = self.act_fn(gate_up)
+            return self._forward_down_proj_native_compile(
+                x,
+                should_allreduce_fusion=should_allreduce_fusion,
+                use_reduce_scatter=use_reduce_scatter,
+            )
 
         if (
             gemm_output_zero_allocator is not None
@@ -585,6 +903,22 @@ class DeepseekV2MoE(nn.Module):
                 name, x, self.experts.num_local_experts
             )
         ]
+
+    def reset_native_compile_state(self) -> None:
+        shared_experts = getattr(self, "shared_experts", None)
+        if shared_experts is not None and hasattr(
+            shared_experts, "reset_native_compile_state"
+        ):
+            shared_experts.reset_native_compile_state()
+
+    def prepare_native_compile_state(
+        self, forward_batch: Optional[ForwardBatch] = None
+    ) -> None:
+        shared_experts = getattr(self, "shared_experts", None)
+        if shared_experts is not None and hasattr(
+            shared_experts, "prepare_native_compile_state"
+        ):
+            shared_experts.prepare_native_compile_state(forward_batch)
 
     def forward(
         self,
@@ -1346,6 +1680,13 @@ class DeepseekV2AttentionMLA(
         self.w_scale_k = None
         self.w_scale_v = None
         self.use_deep_gemm_bmm = False
+        self._fused_qkv_a_proj_native_weight_bf16: Optional[torch.Tensor] = None
+        self._q_b_proj_native_weight_bf16: Optional[torch.Tensor] = None
+        self._q_proj_native_weight_bf16: Optional[torch.Tensor] = None
+        self._kv_a_proj_with_mqa_native_weight_bf16: Optional[torch.Tensor] = None
+        self._o_proj_native_weight_bf16: Optional[torch.Tensor] = None
+        self._w_kc_native_weight_bf16: Optional[torch.Tensor] = None
+        self._w_vc_native_weight_bf16: Optional[torch.Tensor] = None
 
         self.current_attention_backend = (
             None  # Attention backend used by current forward batch
@@ -1372,6 +1713,288 @@ class DeepseekV2AttentionMLA(
         self.init_mla_forward()
         self.init_mla_fused_rope_rocm_forward()
         self.init_mla_fused_rope_cpu_forward()
+
+    def reset_native_compile_state(self) -> None:
+        self._fused_qkv_a_proj_native_weight_bf16 = None
+        self._q_b_proj_native_weight_bf16 = None
+        self._q_proj_native_weight_bf16 = None
+        self._kv_a_proj_with_mqa_native_weight_bf16 = None
+        self._o_proj_native_weight_bf16 = None
+        self._w_kc_native_weight_bf16 = None
+        self._w_vc_native_weight_bf16 = None
+
+    def _should_use_absorb_native_bf16_compile_path(
+        self, weight: Optional[torch.Tensor]
+    ) -> bool:
+        if weight is None:
+            return False
+        fp8_dtypes = tuple(
+            dtype
+            for dtype in (
+                getattr(torch, "float8_e4m3fn", None),
+                getattr(torch, "float8_e4m3fnuz", None),
+            )
+            if dtype is not None
+        )
+        return self.use_deep_gemm_bmm or weight.dtype in fp8_dtypes
+
+    @staticmethod
+    def _is_supported_block_fp8_linear_native_compile_module(
+        module: Optional[nn.Module],
+    ) -> bool:
+        if module is None:
+            return False
+        weight = getattr(module, "weight", None)
+        weight_scale_inv = getattr(module, "weight_scale_inv", None)
+        fp8_dtypes = tuple(
+            dtype
+            for dtype in (
+                getattr(torch, "float8_e4m3fn", None),
+                getattr(torch, "float8_e4m3fnuz", None),
+            )
+            if dtype is not None
+        )
+        return (
+            weight is not None
+            and weight_scale_inv is not None
+            and weight.dtype in fp8_dtypes
+            and weight_scale_inv.dtype in (torch.int32, torch.float32)
+        )
+
+    def _get_block_fp8_linear_native_weight_bf16(
+        self,
+        module: nn.Module,
+        cache_attr: str,
+        *,
+        module_name: str,
+        allow_bias: bool = False,
+    ) -> torch.Tensor:
+        _validate_native_compile_linear_semantics(
+            module, module_name=module_name, allow_bias=allow_bias
+        )
+        weight = getattr(module, "weight", None)
+        cached_weight = getattr(self, cache_attr)
+        if (
+            weight is not None
+            and cached_weight is not None
+            and cached_weight.device == weight.device
+            and cached_weight.shape == weight.shape
+        ):
+            return cached_weight
+
+        assert weight is not None
+        weight_scale_inv = getattr(module, "weight_scale_inv", None)
+        if weight_scale_inv is None:
+            raise ValueError(
+                f"{module.__class__.__name__} does not expose weight_scale_inv."
+            )
+
+        quant_method = getattr(module, "quant_method", None)
+        quant_config = getattr(quant_method, "quant_config", None)
+        block_size = getattr(quant_config, "weight_block_size", None) or [128, 128]
+        if len(block_size) != 2:
+            raise ValueError(f"Unexpected block quant size {block_size}.")
+
+        if weight_scale_inv.dtype == torch.int32:
+            weight_scale = _unpack_ue8m0_scale_for_triton(
+                weight_scale_inv,
+                tuple(weight.shape),
+                block_size,
+            )
+        elif weight_scale_inv.dtype == torch.float32:
+            weight_scale = weight_scale_inv
+        else:
+            raise ValueError(
+                "Native compile BF16 path only supports float32 or packed int32 "
+                f"block scales, got {weight_scale_inv.dtype}."
+            )
+
+        weight_bf16 = block_quant_dequant(
+            weight,
+            weight_scale,
+            block_size,
+            torch.bfloat16,
+        ).contiguous()
+        setattr(self, cache_attr, weight_bf16)
+        return weight_bf16
+
+    def _forward_fused_qkv_a_proj_with_mqa_native_compile(
+        self, hidden_states: torch.Tensor
+    ) -> torch.Tensor:
+        return F.linear(
+            hidden_states.to(torch.bfloat16),
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.fused_qkv_a_proj_with_mqa,
+                "_fused_qkv_a_proj_native_weight_bf16",
+                module_name="fused_qkv_a_proj_with_mqa",
+            ),
+        )
+
+    def _forward_q_b_proj_native_compile(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(
+            x.to(torch.bfloat16),
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.q_b_proj,
+                "_q_b_proj_native_weight_bf16",
+                module_name="q_b_proj",
+            ),
+        )
+
+    def _forward_q_proj_native_compile(self, x: torch.Tensor) -> torch.Tensor:
+        return F.linear(
+            x.to(torch.bfloat16),
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.q_proj,
+                "_q_proj_native_weight_bf16",
+                module_name="q_proj",
+            ),
+        )
+
+    def _forward_kv_a_proj_with_mqa_native_compile(
+        self, x: torch.Tensor
+    ) -> torch.Tensor:
+        return F.linear(
+            x.to(torch.bfloat16),
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.kv_a_proj_with_mqa,
+                "_kv_a_proj_with_mqa_native_weight_bf16",
+                module_name="kv_a_proj_with_mqa",
+            ),
+        )
+
+    def _forward_o_proj_native_compile(self, x: torch.Tensor) -> torch.Tensor:
+        bias = None
+        if (
+            getattr(self.o_proj, "bias", None) is not None
+            and self.o_proj.tp_rank == 0
+            and not self.o_proj.skip_bias_add
+        ):
+            bias = self.o_proj.bias
+        output_parallel = F.linear(
+            x.to(torch.bfloat16),
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.o_proj,
+                "_o_proj_native_weight_bf16",
+                module_name="o_proj",
+                allow_bias=True,
+            ),
+            bias,
+        )
+        if self.o_proj.reduce_results and self.o_proj.tp_size > 1:
+            if self.o_proj.use_dp_attention_reduce:
+                return get_attention_tp_group().all_reduce(output_parallel)
+            return tensor_model_parallel_all_reduce(output_parallel)
+        return output_parallel
+
+    def _get_w_kc_native_weight_bf16(self) -> torch.Tensor:
+        weight = self.w_kc
+        cached_weight = self._w_kc_native_weight_bf16
+        if (
+            weight is not None
+            and cached_weight is not None
+            and cached_weight.device == weight.device
+            and cached_weight.shape
+            == (self.num_local_heads, self.qk_nope_head_dim, self.kv_lora_rank)
+        ):
+            return cached_weight
+
+        assert weight is not None
+        if self.use_deep_gemm_bmm:
+            weight_bf16 = block_quant_dequant(
+                weight,
+                self.w_scale_k,
+                [128, 128],
+                torch.bfloat16,
+            ).transpose(-1, -2)
+        elif self._should_use_absorb_native_bf16_compile_path(weight):
+            weight_bf16 = (weight.to(torch.float32) * self.w_scale).to(torch.bfloat16)
+        else:
+            weight_bf16 = (
+                weight if weight.dtype == torch.bfloat16 else weight.to(torch.bfloat16)
+            )
+
+        self._w_kc_native_weight_bf16 = weight_bf16.contiguous()
+        return self._w_kc_native_weight_bf16
+
+    def _get_w_vc_native_weight_bf16(self) -> torch.Tensor:
+        weight = self.w_vc
+        cached_weight = self._w_vc_native_weight_bf16
+        if (
+            weight is not None
+            and cached_weight is not None
+            and cached_weight.device == weight.device
+            and cached_weight.shape
+            == (self.num_local_heads, self.kv_lora_rank, self.v_head_dim)
+        ):
+            return cached_weight
+
+        assert weight is not None
+        if self.use_deep_gemm_bmm:
+            weight_bf16 = block_quant_dequant(
+                weight,
+                self.w_scale_v,
+                [128, 128],
+                torch.bfloat16,
+            ).transpose(-1, -2)
+        elif self._should_use_absorb_native_bf16_compile_path(weight):
+            weight_bf16 = (weight.to(torch.float32) * self.w_scale).to(torch.bfloat16)
+        else:
+            weight_bf16 = (
+                weight if weight.dtype == torch.bfloat16 else weight.to(torch.bfloat16)
+            )
+
+        self._w_vc_native_weight_bf16 = weight_bf16.contiguous()
+        return self._w_vc_native_weight_bf16
+
+    def prepare_native_compile_state(
+        self, forward_batch: Optional[ForwardBatch] = None
+    ) -> None:
+        del forward_batch
+        if self._is_supported_block_fp8_linear_native_compile_module(
+            getattr(self, "fused_qkv_a_proj_with_mqa", None)
+        ):
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.fused_qkv_a_proj_with_mqa,
+                "_fused_qkv_a_proj_native_weight_bf16",
+                module_name="fused_qkv_a_proj_with_mqa",
+            )
+        if self._is_supported_block_fp8_linear_native_compile_module(
+            getattr(self, "q_b_proj", None)
+        ):
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.q_b_proj,
+                "_q_b_proj_native_weight_bf16",
+                module_name="q_b_proj",
+            )
+        if self._is_supported_block_fp8_linear_native_compile_module(
+            getattr(self, "q_proj", None)
+        ):
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.q_proj,
+                "_q_proj_native_weight_bf16",
+                module_name="q_proj",
+            )
+        if self._is_supported_block_fp8_linear_native_compile_module(
+            getattr(self, "kv_a_proj_with_mqa", None)
+        ):
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.kv_a_proj_with_mqa,
+                "_kv_a_proj_with_mqa_native_weight_bf16",
+                module_name="kv_a_proj_with_mqa",
+            )
+        if self._is_supported_block_fp8_linear_native_compile_module(
+            getattr(self, "o_proj", None)
+        ):
+            self._get_block_fp8_linear_native_weight_bf16(
+                self.o_proj,
+                "_o_proj_native_weight_bf16",
+                module_name="o_proj",
+                allow_bias=True,
+            )
+        if self._should_use_absorb_native_bf16_compile_path(self.w_kc):
+            self._get_w_kc_native_weight_bf16()
+        if self._should_use_absorb_native_bf16_compile_path(self.w_vc):
+            self._get_w_vc_native_weight_bf16()
 
     def dispatch_attn_forward_method(
         self, forward_batch: ForwardBatch
@@ -1562,6 +2185,13 @@ class DeepseekV2AttentionMLA(
     ):
         assert self.q_lora_rank is not None
         if (
+            torch._dynamo.is_compiling()
+            and self._is_supported_block_fp8_linear_native_compile_module(
+                self.fused_qkv_a_proj_with_mqa
+            )
+        ):
+            return self._forward_fused_qkv_a_proj_with_mqa_native_compile(hidden_states)
+        if (
             (not isinstance(hidden_states, tuple))
             and hidden_states.shape[0] >= 1
             and hidden_states.shape[0] <= 16
@@ -1691,6 +2321,7 @@ class DeepseekV2DecoderLayer(nn.Module):
                 tp_rank=mlp_tp_rank,
                 tp_size=mlp_tp_size,
             )
+        self._mlp_is_dense = isinstance(self.mlp, DeepseekV2MLP)
 
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
@@ -1743,7 +2374,68 @@ class DeepseekV2DecoderLayer(nn.Module):
             and layer_id % self.config.moe_layer_freq == 0
         )
 
-    def forward(
+    def _prepare_experimental_prefill_compile_state(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        try:
+            _prewarm_flashinfer_lazy_modules_for_experimental_prefill_compile()
+        except Exception as exc:
+            logger.warning(
+                "Experimental DeepSeek prefill compile could not prewarm "
+                "FlashInfer lazy modules for layer %s with %s: %r",
+                self.layer_id,
+                type(exc).__name__,
+                exc,
+            )
+        if hasattr(self.self_attn, "prepare_native_compile_state"):
+            self.self_attn.prepare_native_compile_state(forward_batch)
+        indexer = getattr(self.self_attn, "indexer", None)
+        if indexer is not None and hasattr(indexer, "prepare_native_compile_state"):
+            indexer.prepare_native_compile_state(forward_batch)
+        if hasattr(self.mlp, "prepare_native_compile_state"):
+            self.mlp.prepare_native_compile_state(forward_batch)
+        token_to_kv_pool = getattr(forward_batch, "token_to_kv_pool", None)
+        if token_to_kv_pool is not None and hasattr(
+            token_to_kv_pool, "get_key_buffer_storage"
+        ):
+            try:
+                kv_buffer_storage = token_to_kv_pool.get_key_buffer_storage(
+                    self.layer_id
+                )
+                kv_cache_dtype = token_to_kv_pool.dtype
+                kv_store_dtype = token_to_kv_pool.store_dtype
+                nsa_kv_cache_store_fp8 = token_to_kv_pool.nsa_kv_cache_store_fp8
+                use_nsa = token_to_kv_pool.use_nsa
+
+                # The compile-time KV cache fast path is consumed off the
+                # RadixAttention instance in nsa_backend, so mirror the cached
+                # handles onto attn_mqa in addition to the wrapper module. Keep
+                # only the storage tensor cached here; the readable dtype view is
+                # rebuilt inside nsa_backend so AOTAutograd does not see two
+                # aliased graph inputs with different dtypes.
+                kv_cache_targets = [self.self_attn]
+                attn_mqa = getattr(self.self_attn, "attn_mqa", None)
+                if attn_mqa is not None:
+                    kv_cache_targets.append(attn_mqa)
+
+                for target in kv_cache_targets:
+                    target._experimental_prefill_kv_buffer_storage = kv_buffer_storage
+                    target._experimental_prefill_kv_cache_dtype = kv_cache_dtype
+                    target._experimental_prefill_kv_store_dtype = kv_store_dtype
+                    target._experimental_prefill_nsa_kv_cache_store_fp8 = (
+                        nsa_kv_cache_store_fp8
+                    )
+                    target._experimental_prefill_use_nsa = use_nsa
+            except Exception as exc:
+                logger.warning(
+                    "Experimental DeepSeek prefill compile could not cache KV "
+                    "buffer handles for layer %s with %s: %r",
+                    self.layer_id,
+                    type(exc).__name__,
+                    exc,
+                )
+
+    def _forward_prefill_impl(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
@@ -1753,12 +2445,21 @@ class DeepseekV2DecoderLayer(nn.Module):
         gemm_output_zero_allocator: BumpAllocator = None,
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
+        needs_allreduce_fusion: bool = False,
+        should_allreduce_fusion: bool = False,
+        use_reduce_scatter: bool = False,
+    ) -> Tuple[
+        torch.Tensor,
+        Optional[torch.Tensor],
+        Optional[torch.Tensor],
+        bool,
+    ]:
         hidden_states, residual = self.layer_communicator.prepare_attn(
             hidden_states,
             residual,
             forward_batch,
             getattr(self, "_gfx95_quant_format", ""),
+            needs_allreduce_fusion=needs_allreduce_fusion,
         )
 
         hidden_states = self.self_attn(
@@ -1779,18 +2480,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states, residual, forward_batch
         )
 
-        should_allreduce_fusion = (
-            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
-                forward_batch
-            )
-        )
-
-        # For DP with padding, reduce scatter can be used instead of all-reduce.
-        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
-            forward_batch
-        )
-
-        if isinstance(self.mlp, DeepseekV2MLP):
+        if self._mlp_is_dense:
             gemm_output_zero_allocator = None
 
         hidden_states = self.mlp(
@@ -1801,14 +2491,57 @@ class DeepseekV2DecoderLayer(nn.Module):
             gemm_output_zero_allocator,
         )
 
-        if not self.nsa_enable_prefill_cp and should_allreduce_fusion:
-            hidden_states._sglang_needs_allreduce_fusion = True
+        next_needs_allreduce_fusion = bool(
+            not self.nsa_enable_prefill_cp and should_allreduce_fusion
+        )
 
         if not should_allreduce_fusion:
             hidden_states, residual = self.layer_communicator.postprocess_layer(
                 hidden_states, residual, forward_batch
             )
 
+        return hidden_states, residual, topk_indices, next_needs_allreduce_fusion
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
+        gemm_output_zero_allocator: BumpAllocator = None,
+        llama_4_scaling: Optional[torch.Tensor] = None,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        needs_allreduce_fusion = _get_hidden_states_allreduce_fusion_flag(hidden_states)
+        should_allreduce_fusion = (
+            self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
+        )
+        use_reduce_scatter = self.layer_communicator.should_use_reduce_scatter(
+            forward_batch
+        )
+        (
+            hidden_states,
+            residual,
+            topk_indices,
+            next_needs_allreduce_fusion,
+        ) = self._forward_prefill_impl(
+            positions,
+            hidden_states,
+            forward_batch,
+            residual,
+            zero_allocator,
+            gemm_output_zero_allocator,
+            llama_4_scaling,
+            prev_topk_indices,
+            needs_allreduce_fusion,
+            should_allreduce_fusion,
+            use_reduce_scatter,
+        )
+        if next_needs_allreduce_fusion:
+            hidden_states._sglang_needs_allreduce_fusion = True
         return hidden_states, residual, topk_indices
 
     def op_comm_prepare_attn(
@@ -1882,6 +2615,441 @@ class DeepseekV2DecoderLayer(nn.Module):
             }
         )
         return output
+
+
+class _ExperimentalPrefillCompileLayerGroup:
+    def __init__(
+        self,
+        *,
+        layers: List[DeepseekV2DecoderLayer],
+        start_layer: int,
+        end_layer: int,
+    ) -> None:
+        self.layers = tuple(layers)
+        self.start_layer = start_layer
+        self.end_layer = end_layer
+        self.layer_ids = [
+            int(getattr(layer, "layer_id", layer_idx))
+            for layer_idx, layer in zip(range(start_layer, end_layer), self.layers)
+        ]
+        self._experimental_prefill_compile_failed = False
+        self._experimental_prefill_compile_enabled = False
+        self._experimental_prefill_compile_logged_success_keys = set()
+        self._experimental_prefill_nsa_guard_cache_key = None
+        self._experimental_prefill_nsa_guard_cache_result: Optional[bool] = None
+        self._experimental_prefill_compiled_runners: Dict[Tuple[Any, ...], Any] = {}
+
+    def _format_layer_ids(self) -> str:
+        return _format_experimental_prefill_layer_ids(self.layer_ids)
+
+    def _should_use_experimental_prefill_compile(
+        self,
+        forward_batch: ForwardBatch,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> bool:
+        return (
+            _get_experimental_prefill_layer_compile_group_size() > 1
+            and _is_cuda
+            and _experimental_prefill_compile_supports_moe_backend()
+            and not self._experimental_prefill_compile_failed
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and not forward_batch.can_run_tbo
+            and not nsa_use_prefill_cp(forward_batch)
+            and get_moe_a2a_backend().is_none()
+            and self._supports_nsa_indexer_native_prefill_compile(
+                forward_batch, prev_topk_indices
+            )
+        )
+
+    def _supports_nsa_indexer_native_prefill_compile(
+        self,
+        forward_batch: ForwardBatch,
+        prev_topk_indices: Optional[torch.Tensor],
+    ) -> bool:
+        cache_key = self._get_nsa_indexer_native_prefill_compile_cache_key(
+            forward_batch, prev_topk_indices
+        )
+        if (
+            self._experimental_prefill_nsa_guard_cache_key == cache_key
+            and self._experimental_prefill_nsa_guard_cache_result is not None
+        ):
+            return self._experimental_prefill_nsa_guard_cache_result
+
+        has_prev_topk_indices = prev_topk_indices is not None
+        result = True
+
+        for layer in self.layers:
+            self_attn = getattr(layer, "self_attn", None)
+            indexer = getattr(self_attn, "indexer", None)
+            if (
+                self_attn is None
+                or indexer is None
+                or not getattr(self_attn, "use_nsa", False)
+                or getattr(self_attn, "q_lora_rank", None) is None
+            ):
+                has_prev_topk_indices = False
+                continue
+
+            if getattr(self_attn, "skip_topk", False) and has_prev_topk_indices:
+                layer_topk_indices_available = True
+            else:
+                (
+                    layer_supports_native_compile,
+                    layer_topk_indices_available,
+                ) = indexer.get_native_compile_guard_state(
+                    forward_batch,
+                    getattr(layer, "layer_id", self.start_layer),
+                )
+                if not layer_supports_native_compile:
+                    result = False
+                    break
+
+            has_prev_topk_indices = (
+                bool(getattr(self_attn, "next_skip_topk", False))
+                and layer_topk_indices_available
+            )
+
+        self._experimental_prefill_nsa_guard_cache_key = cache_key
+        self._experimental_prefill_nsa_guard_cache_result = result
+        return result
+
+    def _get_nsa_indexer_native_prefill_compile_cache_key(
+        self,
+        forward_batch: ForwardBatch,
+        prev_topk_indices: Optional[torch.Tensor],
+    ) -> Tuple[Any, ...]:
+        attn_backend = getattr(forward_batch, "attn_backend", None)
+        forward_metadata = getattr(attn_backend, "forward_metadata", None)
+        return (
+            forward_batch.forward_mode,
+            prev_topk_indices is not None,
+            id(attn_backend),
+            id(forward_metadata),
+            getattr(forward_metadata, "max_seq_len_k", None),
+            getattr(forward_metadata, "native_compile_indexer_ready", False),
+        )
+
+    def _prepare_experimental_prefill_compile_state(
+        self, forward_batch: ForwardBatch
+    ) -> None:
+        try:
+            _prewarm_flashinfer_lazy_modules_for_experimental_prefill_compile()
+        except Exception as exc:
+            logger.warning(
+                "Experimental DeepSeek prefill layer-group compile could not "
+                "prewarm FlashInfer lazy modules for layers %s with %s: %r",
+                self._format_layer_ids(),
+                type(exc).__name__,
+                exc,
+            )
+        for layer in self.layers:
+            if hasattr(layer, "_prepare_experimental_prefill_compile_state"):
+                layer._prepare_experimental_prefill_compile_state(forward_batch)
+
+    def _enter_experimental_prefill_compile_mode(self, num_tokens: int) -> None:
+        if self._experimental_prefill_compile_enabled:
+            return
+        num_tokens = max(int(num_tokens), 1)
+        for layer in self.layers:
+            _set_multi_platform_compile_mode(
+                layer, reverse=False, num_tokens=num_tokens
+            )
+        self._experimental_prefill_compile_enabled = True
+
+    def _leave_experimental_prefill_compile_mode(self) -> None:
+        if not self._experimental_prefill_compile_enabled:
+            return
+        for layer in self.layers:
+            _set_multi_platform_compile_mode(layer, reverse=True, num_tokens=1)
+        self._experimental_prefill_compile_enabled = False
+
+    @contextmanager
+    def _temporarily_leave_experimental_prefill_compile_mode(self):
+        should_restore_compile_mode = (
+            self._experimental_prefill_compile_enabled
+            and bool(self._experimental_prefill_compiled_runners)
+            and not self._experimental_prefill_compile_failed
+        )
+        if should_restore_compile_mode:
+            self._leave_experimental_prefill_compile_mode()
+        try:
+            yield
+        finally:
+            if should_restore_compile_mode:
+                # Grouped prefill compile is guarded to non-routed
+                # flashinfer_trtllm MoE, where the compile-mode
+                # MultiPlatformOp selection no longer depends on the request
+                # token count. Restore with a canonical value instead of
+                # tracking the last-seen prefill length.
+                self._enter_experimental_prefill_compile_mode(num_tokens=1)
+
+    def _ensure_experimental_prefill_compiled(
+        self,
+        num_tokens: int,
+        forward_batch: ForwardBatch,
+        comm_signature: Tuple[bool, Tuple[bool, ...], Tuple[bool, ...]],
+    ) -> None:
+        if self._experimental_prefill_compile_failed:
+            return
+        if comm_signature in self._experimental_prefill_compiled_runners:
+            self._enter_experimental_prefill_compile_mode(num_tokens=num_tokens)
+            return
+
+        try:
+            import torch._dynamo.config as dynamo_config
+
+            dynamo_config.recompile_limit = 128
+            dynamo_config.allow_unspec_int_on_nn_module = True
+            dynamo_config.ignore_logging_functions.update(
+                {logging.Logger.debug, logging.Logger.info}
+            )
+        except Exception:
+            pass
+
+        self._prepare_experimental_prefill_compile_state(forward_batch)
+        self._enter_experimental_prefill_compile_mode(num_tokens=num_tokens)
+        (
+            needs_allreduce_fusion,
+            should_allreduce_fusion_per_layer,
+            use_reduce_scatter_per_layer,
+        ) = comm_signature
+
+        def compiled_runner(
+            positions: torch.Tensor,
+            hidden_states: torch.Tensor,
+            forward_batch: ForwardBatch,
+            residual: Optional[torch.Tensor],
+            zero_allocator: BumpAllocator,
+            gemm_output_zero_allocator: Optional[BumpAllocator] = None,
+            llama_4_scaling: Optional[torch.Tensor] = None,
+            prev_topk_indices: Optional[torch.Tensor] = None,
+        ):
+            return self._forward_prefill_group_impl(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+                zero_allocator,
+                gemm_output_zero_allocator,
+                llama_4_scaling,
+                prev_topk_indices,
+                needs_allreduce_fusion,
+                should_allreduce_fusion_per_layer,
+                use_reduce_scatter_per_layer,
+            )
+
+        log_info_on_rank0(
+            logger,
+            "Creating experimental compiled DeepSeek prefill runner for "
+            f"layers {self._format_layer_ids()} with num_tokens={num_tokens} "
+            f"and comm_signature={comm_signature}.",
+        )
+        self._experimental_prefill_compiled_runners[comm_signature] = torch.compile(
+            compiled_runner,
+            dynamic=True,
+            backend=get_compiler_backend(),
+            options=_get_experimental_prefill_compile_options(),
+        )
+
+    def _disable_experimental_prefill_compile(self) -> None:
+        self._leave_experimental_prefill_compile_mode()
+        self._experimental_prefill_compiled_runners.clear()
+        self._experimental_prefill_compile_logged_success_keys.clear()
+        self._experimental_prefill_compile_failed = True
+
+    def _get_prefill_group_comm_signature(
+        self,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+    ) -> Tuple[bool, Tuple[bool, ...], Tuple[bool, ...]]:
+        should_allreduce_fusion_per_layer = tuple(
+            layer.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
+                forward_batch
+            )
+            for layer in self.layers
+        )
+        use_reduce_scatter_per_layer = tuple(
+            layer.layer_communicator.should_use_reduce_scatter(forward_batch)
+            for layer in self.layers
+        )
+        return (
+            _get_hidden_states_allreduce_fusion_flag(hidden_states),
+            should_allreduce_fusion_per_layer,
+            use_reduce_scatter_per_layer,
+        )
+
+    def _forward_prefill_group_impl(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
+        gemm_output_zero_allocator: Optional[BumpAllocator] = None,
+        llama_4_scaling: Optional[torch.Tensor] = None,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+        needs_allreduce_fusion: bool = False,
+        should_allreduce_fusion_per_layer: Tuple[bool, ...] = (),
+        use_reduce_scatter_per_layer: Tuple[bool, ...] = (),
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor], bool]:
+        if len(should_allreduce_fusion_per_layer) != len(self.layers):
+            raise ValueError(
+                "Grouped prefill compile expects one allreduce-fusion decision "
+                "per layer."
+            )
+        if len(use_reduce_scatter_per_layer) != len(self.layers):
+            raise ValueError(
+                "Grouped prefill compile expects one reduce-scatter decision "
+                "per layer."
+            )
+
+        topk_indices = prev_topk_indices
+        next_needs_allreduce_fusion = needs_allreduce_fusion
+        for layer, should_allreduce_fusion, use_reduce_scatter in zip(
+            self.layers,
+            should_allreduce_fusion_per_layer,
+            use_reduce_scatter_per_layer,
+        ):
+            (
+                hidden_states,
+                residual,
+                topk_indices,
+                next_needs_allreduce_fusion,
+            ) = layer._forward_prefill_impl(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+                zero_allocator,
+                gemm_output_zero_allocator,
+                llama_4_scaling,
+                prev_topk_indices=topk_indices,
+                needs_allreduce_fusion=next_needs_allreduce_fusion,
+                should_allreduce_fusion=should_allreduce_fusion,
+                use_reduce_scatter=use_reduce_scatter,
+            )
+        return hidden_states, residual, topk_indices, next_needs_allreduce_fusion
+
+    def forward(
+        self,
+        positions: torch.Tensor,
+        hidden_states: torch.Tensor,
+        forward_batch: ForwardBatch,
+        residual: Optional[torch.Tensor],
+        zero_allocator: BumpAllocator,
+        gemm_output_zero_allocator: Optional[BumpAllocator] = None,
+        llama_4_scaling: Optional[torch.Tensor] = None,
+        prev_topk_indices: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor], Optional[torch.Tensor]]:
+        comm_signature = self._get_prefill_group_comm_signature(
+            hidden_states, forward_batch
+        )
+        if not self._should_use_experimental_prefill_compile(
+            forward_batch, prev_topk_indices
+        ):
+            with self._temporarily_leave_experimental_prefill_compile_mode():
+                (
+                    hidden_states,
+                    residual,
+                    topk_indices,
+                    next_needs_allreduce_fusion,
+                ) = self._forward_prefill_group_impl(
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                    zero_allocator,
+                    gemm_output_zero_allocator,
+                    llama_4_scaling,
+                    prev_topk_indices,
+                    *comm_signature,
+                )
+                if next_needs_allreduce_fusion:
+                    hidden_states._sglang_needs_allreduce_fusion = True
+                return hidden_states, residual, topk_indices
+
+        _mark_experimental_prefill_dynamic_inputs(
+            positions=positions,
+            hidden_states=hidden_states,
+            residual=residual,
+            forward_batch=forward_batch,
+        )
+        try:
+            self._ensure_experimental_prefill_compiled(
+                hidden_states.shape[0], forward_batch, comm_signature
+            )
+        except Exception as exc:
+            self._disable_experimental_prefill_compile()
+            logger.exception(
+                "Disable experimental DeepSeek prefill layer-group compile while "
+                "building compiled runner for layers %s with %s: %r",
+                self._format_layer_ids(),
+                type(exc).__name__,
+                exc,
+            )
+        else:
+            try:
+                (
+                    hidden_states,
+                    residual,
+                    topk_indices,
+                    next_needs_allreduce_fusion,
+                ) = self._experimental_prefill_compiled_runners[comm_signature](
+                    positions,
+                    hidden_states,
+                    forward_batch,
+                    residual,
+                    zero_allocator,
+                    gemm_output_zero_allocator,
+                    llama_4_scaling,
+                    prev_topk_indices,
+                )
+                if (
+                    comm_signature
+                    not in self._experimental_prefill_compile_logged_success_keys
+                ):
+                    log_info_on_rank0(
+                        logger,
+                        "Experimental DeepSeek prefill layer-group compile is "
+                        f"active for layers {self._format_layer_ids()} with "
+                        f"comm_signature={comm_signature}.",
+                    )
+                    self._experimental_prefill_compile_logged_success_keys.add(
+                        comm_signature
+                    )
+                if next_needs_allreduce_fusion:
+                    hidden_states._sglang_needs_allreduce_fusion = True
+                return hidden_states, residual, topk_indices
+            except Exception as exc:
+                self._disable_experimental_prefill_compile()
+                logger.exception(
+                    "Disable experimental DeepSeek prefill layer-group compile "
+                    "while executing compiled runner for layers %s with %s: %r",
+                    self._format_layer_ids(),
+                    type(exc).__name__,
+                    exc,
+                )
+
+        with self._temporarily_leave_experimental_prefill_compile_mode():
+            (
+                hidden_states,
+                residual,
+                topk_indices,
+                next_needs_allreduce_fusion,
+            ) = self._forward_prefill_group_impl(
+                positions,
+                hidden_states,
+                forward_batch,
+                residual,
+                zero_allocator,
+                gemm_output_zero_allocator,
+                llama_4_scaling,
+                prev_topk_indices,
+                *comm_signature,
+            )
+            if next_needs_allreduce_fusion:
+                hidden_states._sglang_needs_allreduce_fusion = True
+            return hidden_states, residual, topk_indices
 
 
 class DeepseekV2Model(nn.Module):
@@ -2008,9 +3176,97 @@ class DeepseekV2Model(nn.Module):
 
         # llama_4_scaling: for supporting Mistral-Large-3 model
         self.llama_4_scaling_config = getattr(config, "llama_4_scaling", None)
+        self._experimental_prefill_layer_compile_groups = None
+        self._experimental_prefill_layer_compile_groups_by_start = {}
+        self._experimental_prefill_layer_compile_group_size = None
+        self._experimental_prefill_layer_compile_group_start_cached = None
 
     def get_input_embeddings(self) -> torch.Tensor:
         return self.embed_tokens
+
+    def _get_experimental_prefill_layer_compile_group_start(self) -> int:
+        return max(
+            self.start_layer,
+            _get_experimental_prefill_layer_compile_group_start(),
+        )
+
+    def _get_experimental_prefill_layer_compile_groups(
+        self,
+    ) -> List[_ExperimentalPrefillCompileLayerGroup]:
+        group_size = _get_experimental_prefill_layer_compile_group_size()
+        group_start_layer = self._get_experimental_prefill_layer_compile_group_start()
+        should_rebuild_groups = self._experimental_prefill_layer_compile_groups is None
+        if not should_rebuild_groups:
+            has_active_group_state = any(
+                bool(group._experimental_prefill_compiled_runners)
+                or group._experimental_prefill_compile_enabled
+                or group._experimental_prefill_compile_failed
+                for group in self._experimental_prefill_layer_compile_groups
+            )
+            should_rebuild_groups = not has_active_group_state and (
+                self._experimental_prefill_layer_compile_group_size != group_size
+                or self._experimental_prefill_layer_compile_group_start_cached
+                != group_start_layer
+            )
+        if not should_rebuild_groups:
+            return self._experimental_prefill_layer_compile_groups
+
+        groups: List[_ExperimentalPrefillCompileLayerGroup] = []
+        if group_size > 1 and group_start_layer < self.end_layer:
+            for start_layer in range(group_start_layer, self.end_layer, group_size):
+                end_layer = min(start_layer + group_size, self.end_layer)
+                groups.append(
+                    _ExperimentalPrefillCompileLayerGroup(
+                        layers=[self.layers[i] for i in range(start_layer, end_layer)],
+                        start_layer=start_layer,
+                        end_layer=end_layer,
+                    )
+                )
+        self._experimental_prefill_layer_compile_groups = groups
+        self._experimental_prefill_layer_compile_groups_by_start = {
+            group.start_layer: group for group in groups
+        }
+        self._experimental_prefill_layer_compile_group_size = group_size
+        self._experimental_prefill_layer_compile_group_start_cached = group_start_layer
+        return groups
+
+    def _should_use_experimental_prefill_layer_group_compile(
+        self,
+        forward_batch: ForwardBatch,
+    ) -> bool:
+        return (
+            self._is_experimental_prefill_layer_group_compile_enabled()
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and not forward_batch.can_run_tbo
+            and not nsa_use_prefill_cp(forward_batch)
+        )
+
+    def _is_experimental_prefill_layer_group_compile_enabled(self) -> bool:
+        return (
+            _get_experimental_prefill_layer_compile_group_size() > 1
+            and bool(self._get_experimental_prefill_layer_compile_groups())
+            and _is_cuda
+            and _experimental_prefill_compile_supports_moe_backend()
+            and not self.layers_to_capture
+            and get_moe_a2a_backend().is_none()
+        )
+
+    @contextmanager
+    def _temporarily_leave_experimental_prefill_layer_group_compile_modes(self):
+        restore_groups = [
+            group
+            for group in self._get_experimental_prefill_layer_compile_groups()
+            if group._experimental_prefill_compile_enabled
+            and bool(group._experimental_prefill_compiled_runners)
+            and not group._experimental_prefill_compile_failed
+        ]
+        for group in restore_groups:
+            group._leave_experimental_prefill_compile_mode()
+        try:
+            yield
+        finally:
+            for group in restore_groups:
+                group._enter_experimental_prefill_compile_mode(num_tokens=1)
 
     def forward(
         self,
@@ -2020,6 +3276,10 @@ class DeepseekV2Model(nn.Module):
         input_embeds: torch.Tensor = None,
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> Union[torch.Tensor, PPProxyTensors]:
+        use_experimental_prefill_layer_group_compile = (
+            self._should_use_experimental_prefill_layer_group_compile(forward_batch)
+        )
+
         total_num_layers = self.end_layer - self.start_layer
         if self.pp_group.is_first_rank:
             if input_embeds is None:
@@ -2070,85 +3330,115 @@ class DeepseekV2Model(nn.Module):
                 positions=positions,
             )
 
-        normal_start_layer = self.start_layer
-        normal_end_layer = self.end_layer
-        if forward_batch.can_run_tbo:
-            if (
-                self.first_k_dense_replace > normal_start_layer
-                and self.first_k_dense_replace < normal_end_layer
-            ):
-                normal_end_layer = self.first_k_dense_replace
-            elif self.first_k_dense_replace < normal_start_layer:
-                normal_end_layer = normal_start_layer = 0
-        aux_hidden_states = []
-        topk_indices = None
-        for i in range(normal_start_layer, normal_end_layer):
-            # NOTE: torch dynamo does not support graph break in context manager
-            ctx = (
-                nullcontext()
-                if not get_global_server_args().disable_piecewise_cuda_graph
-                else get_global_expert_distribution_recorder().with_current_layer(i)
-            )
-            with ctx:
-                if i in self.layers_to_capture:
-                    if self.enable_a2a_moe and i > self.first_k_dense_replace:
-                        aux_hidden_state = get_attention_tp_group().all_gather(
-                            hidden_states + residual, dim=0
-                        )
-                        aux_hidden_states.append(aux_hidden_state)
-                    else:
-                        aux_hidden_states.append(hidden_states + residual)
-                layer = self.layers[i]
-                hidden_states, residual, topk_indices = layer(
-                    positions,
-                    hidden_states,
-                    forward_batch,
-                    residual,
-                    zero_allocator,
-                    gemm_output_zero_allocator,
-                    llama_4_scaling,
-                    prev_topk_indices=topk_indices,
+        with ExitStack() as stack:
+            if not use_experimental_prefill_layer_group_compile:
+                stack.enter_context(
+                    self._temporarily_leave_experimental_prefill_layer_group_compile_modes()
+                )
+            normal_start_layer = self.start_layer
+            normal_end_layer = self.end_layer
+            if forward_batch.can_run_tbo:
+                if (
+                    self.first_k_dense_replace > normal_start_layer
+                    and self.first_k_dense_replace < normal_end_layer
+                ):
+                    normal_end_layer = self.first_k_dense_replace
+                elif self.first_k_dense_replace < normal_start_layer:
+                    normal_end_layer = normal_start_layer = 0
+            aux_hidden_states = []
+            topk_indices = None
+            i = normal_start_layer
+            while i < normal_end_layer:
+                layer_group = None
+                if use_experimental_prefill_layer_group_compile:
+                    layer_group = (
+                        self._experimental_prefill_layer_compile_groups_by_start.get(i)
+                    )
+                    if (
+                        layer_group is not None
+                        and layer_group._experimental_prefill_compile_failed
+                    ):
+                        layer_group = None
+                if layer_group is not None:
+                    hidden_states, residual, topk_indices = layer_group.forward(
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        residual,
+                        zero_allocator,
+                        gemm_output_zero_allocator,
+                        llama_4_scaling,
+                        prev_topk_indices=topk_indices,
+                    )
+                    i = layer_group.end_layer
+                    continue
+                # NOTE: torch dynamo does not support graph break in context manager
+                ctx = (
+                    nullcontext()
+                    if not get_global_server_args().disable_piecewise_cuda_graph
+                    else get_global_expert_distribution_recorder().with_current_layer(i)
+                )
+                with ctx:
+                    if i in self.layers_to_capture:
+                        if self.enable_a2a_moe and i > self.first_k_dense_replace:
+                            aux_hidden_state = get_attention_tp_group().all_gather(
+                                hidden_states + residual, dim=0
+                            )
+                            aux_hidden_states.append(aux_hidden_state)
+                        else:
+                            aux_hidden_states.append(hidden_states + residual)
+                    layer = self.layers[i]
+                    hidden_states, residual, topk_indices = layer(
+                        positions,
+                        hidden_states,
+                        forward_batch,
+                        residual,
+                        zero_allocator,
+                        gemm_output_zero_allocator,
+                        llama_4_scaling,
+                        prev_topk_indices=topk_indices,
+                    )
+                i += 1
+
+            if normal_end_layer != self.end_layer:
+                hidden_states, residual = model_forward_maybe_tbo(
+                    layers=self.layers[normal_end_layer : self.end_layer],
+                    enable_tbo=True,
+                    positions=positions,
+                    forward_batch=forward_batch,
+                    hidden_states=hidden_states,
+                    residual=residual,
+                    input_data_scatter_mode=self.layers[
+                        normal_end_layer - 1
+                    ].layer_scatter_modes.layer_output_mode,
+                    zero_allocator=zero_allocator,
                 )
 
-        if normal_end_layer != self.end_layer:
-            hidden_states, residual = model_forward_maybe_tbo(
-                layers=self.layers[normal_end_layer : self.end_layer],
-                enable_tbo=True,
-                positions=positions,
-                forward_batch=forward_batch,
-                hidden_states=hidden_states,
-                residual=residual,
-                input_data_scatter_mode=self.layers[
-                    normal_end_layer - 1
-                ].layer_scatter_modes.layer_output_mode,
-                zero_allocator=zero_allocator,
-            )
+            if not self.pp_group.is_last_rank:
+                return PPProxyTensors(
+                    {
+                        "hidden_states": hidden_states,
+                        "residual": residual,
+                    }
+                )
+            else:
+                if not forward_batch.forward_mode.is_idle():
+                    if residual is None:
+                        hidden_states = self.norm(hidden_states)
+                    else:
+                        hidden_states, _ = self.norm(hidden_states, residual)
 
-        if not self.pp_group.is_last_rank:
-            return PPProxyTensors(
-                {
-                    "hidden_states": hidden_states,
-                    "residual": residual,
-                }
-            )
-        else:
-            if not forward_batch.forward_mode.is_idle():
-                if residual is None:
-                    hidden_states = self.norm(hidden_states)
-                else:
-                    hidden_states, _ = self.norm(hidden_states, residual)
-
-        if self.pp_group.is_last_rank and nsa_use_prefill_cp(forward_batch):
-            # allgather + rerrange
-            hidden_states = cp_all_gather_rerange_output(
-                hidden_states,
-                self.cp_size,
-                forward_batch,
-                torch.cuda.current_stream(),
-            )
-        if len(aux_hidden_states) == 0:
-            return hidden_states
-        return hidden_states, aux_hidden_states
+            if self.pp_group.is_last_rank and nsa_use_prefill_cp(forward_batch):
+                # allgather + rerrange
+                hidden_states = cp_all_gather_rerange_output(
+                    hidden_states,
+                    self.cp_size,
+                    forward_batch,
+                    torch.cuda.current_stream(),
+                )
+            if len(aux_hidden_states) == 0:
+                return hidden_states
+            return hidden_states, aux_hidden_states
 
 
 class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
@@ -2288,6 +3578,18 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     def get_input_embeddings(self) -> nn.Embedding:
         return self.model.embed_tokens
 
+    def prepare_attn_metadata_hints(self, forward_batch: ForwardBatch) -> None:
+        should_use_compile = getattr(
+            self.model,
+            "_should_use_experimental_prefill_layer_group_compile",
+            None,
+        )
+        forward_batch.allow_fixed_native_compile_prefill_page_table = bool(
+            should_use_compile(forward_batch)
+            if should_use_compile is not None
+            else False
+        )
+
     @torch.no_grad()
     def forward(
         self,
@@ -2331,8 +3633,26 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     def end_layer(self):
         return self.model.end_layer
 
+    def check_weight_update_allowed(self) -> None:
+        is_compile_enabled = getattr(
+            self.model,
+            "_is_experimental_prefill_layer_group_compile_enabled",
+            None,
+        )
+        compile_enabled = (
+            is_compile_enabled() if is_compile_enabled is not None else False
+        )
+        if compile_enabled and getattr(self, "_deepseek_weight_load_complete", False):
+            raise RuntimeError(
+                "DeepSeek V2 experimental prefill compile is configured for static "
+                "inference and does not support in-process weight updates after the "
+                "initial weight load. Restart the engine with the new weights instead."
+            )
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        self.check_weight_update_allowed()
         self.do_load_weights(weights, is_nextn)
+        self._deepseek_weight_load_complete = True
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

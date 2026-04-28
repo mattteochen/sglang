@@ -1,4 +1,4 @@
-from typing import Callable, ClassVar
+from typing import Callable, ClassVar, Optional
 
 from torch import nn
 
@@ -40,6 +40,48 @@ class MultiPlatformOp(nn.Module):
         # States for torch.compile
         self._original_forward_method = None
         self.is_torch_compile = False
+        self._cached_torch_compile_forward_method: Optional[Callable] = None
+        self._cached_topk_compile_forward_method: Optional[Callable] = None
+
+    # TODO(mattteochen): cache result
+    def _should_keep_moe_cuda_forward_for_torch_compile(self) -> bool:
+        try:
+            from sglang.srt.layers.moe import get_moe_runner_backend
+        except Exception:
+            return False
+        # DeepSeek grouped prefill compile works by switching MultiPlatformOp
+        # modules onto their torch.compile-friendly forwards. For non-routed
+        # flashinfer_trtllm MoE, that strategy must keep the CUDA path intact:
+        # DeepSeek still calls TopK as a thin wrapper, but the actual routing is
+        # consumed by the monolithic flashinfer_trtllm MoE kernel via raw router
+        # logits. Switching TopK/FusedMoE to the num_tokens==1 native path would
+        # de-fuse that compiled DeepSeek forward strategy.
+        return get_moe_runner_backend().is_flashinfer_trtllm()
+
+    def _get_torch_compile_forward_method(self, num_tokens: int) -> Callable:
+        if "FusedMoE" in self.__class__.__name__:
+            if self._should_keep_moe_cuda_forward_for_torch_compile():
+                return self._forward_method
+            if num_tokens == 1:
+                from sglang.srt.layers.moe.fused_moe_native import (
+                    fused_moe_forward_native,
+                )
+
+                return fused_moe_forward_native
+            return self._forward_method
+
+        if "TopK" in self.__class__.__name__:
+            if self._should_keep_moe_cuda_forward_for_torch_compile():
+                return self._forward_method
+            if num_tokens == 1:
+                if self._cached_topk_compile_forward_method is None:
+                    self._cached_topk_compile_forward_method = self.forward_native
+                return self._cached_topk_compile_forward_method
+            return self._forward_method
+
+        if self._cached_torch_compile_forward_method is None:
+            self._cached_torch_compile_forward_method = self.forward_native
+        return self._cached_torch_compile_forward_method
 
     def enter_torch_compile(self, num_tokens: int):
         # Skip if Op is already entered compile mode.
@@ -51,21 +93,7 @@ class MultiPlatformOp(nn.Module):
             return
 
         self._original_forward_method = self._forward_method
-        # NOTE: Temporarily workaround MoE
-        # The performance of torch.compile on this layer is not always good when bs > 1,
-        # so we decide to only use torch.compile when bs=1
-        if "FusedMoE" in self.__class__.__name__:
-            if num_tokens == 1:
-                from sglang.srt.layers.moe.fused_moe_native import (
-                    fused_moe_forward_native,
-                )
-
-                self._forward_method = fused_moe_forward_native
-        elif "TopK" in self.__class__.__name__:
-            if num_tokens == 1:
-                self._forward_method = self.forward_native
-        else:
-            self._forward_method = self.forward_native
+        self._forward_method = self._get_torch_compile_forward_method(num_tokens)
         self.is_torch_compile = True
 
     def leave_torch_compile(self):

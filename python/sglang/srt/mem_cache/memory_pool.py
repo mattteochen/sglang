@@ -1589,6 +1589,11 @@ class MLATokenToKVPool(KVCache):
 
         return self.kv_buffer[layer_id - self.start_layer]
 
+    def get_key_buffer_storage(self, layer_id: int):
+        if self.layer_transfer_counter is not None:
+            self.layer_transfer_counter.wait_until(layer_id - self.start_layer)
+        return self.kv_buffer[layer_id - self.start_layer]
+
     def get_value_buffer(self, layer_id: int):
         if self.layer_transfer_counter is not None:
             self.layer_transfer_counter.wait_until(layer_id - self.start_layer)

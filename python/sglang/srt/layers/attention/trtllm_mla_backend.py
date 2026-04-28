@@ -25,6 +25,7 @@ from sglang.srt.layers.attention.utils import (
     create_flashmla_kv_indices_triton,
     get_num_page_per_block_flashmla,
     mla_quantize_and_rope_for_fp8,
+    mla_quantize_and_rope_for_fp8_native,
 )
 from sglang.srt.layers.dp_attention import get_attention_tp_size
 from sglang.srt.layers.quantization.fp8_kernel import scaled_fp8_quant
@@ -777,7 +778,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert all(
                 x is not None for x in [q_rope, k_rope, cos_sin_cache]
             ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
-            q, k, k_rope = mla_quantize_and_rope_for_fp8(
+            quantize_rope_impl = (
+                mla_quantize_and_rope_for_fp8_native
+                if torch._dynamo.is_compiling()
+                else mla_quantize_and_rope_for_fp8
+            )
+            q, k, k_rope = quantize_rope_impl(
                 q,
                 q_rope,
                 k.squeeze(1),
@@ -917,7 +923,12 @@ class TRTLLMMLABackend(FlashInferMLAAttnBackend):
             assert all(
                 x is not None for x in [q_rope, k_rope, cos_sin_cache]
             ), "For FP8 path and using flashinfer.rope.mla_rope_quantize we need all of q_rope, k_rope and cos_sin_cache to be not None."
-            q, k, k_rope = mla_quantize_and_rope_for_fp8(
+            quantize_rope_impl = (
+                mla_quantize_and_rope_for_fp8_native
+                if torch._dynamo.is_compiling()
+                else mla_quantize_and_rope_for_fp8
+            )
+            q, k, k_rope = quantize_rope_impl(
                 q,
                 q_rope,
                 k.squeeze(1),

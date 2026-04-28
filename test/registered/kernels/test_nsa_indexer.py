@@ -9,14 +9,20 @@ from sglang.test.ci.ci_register import register_cuda_ci
 
 # Patch DP-attention globals before importing backends
 _dp_attn.get_attention_tp_size = lambda: 1  # TP size = 1 for unit test
+_dp_attn.get_attention_cp_size = lambda: 1  # CP size = 1 for unit test
+_dp_attn.get_attention_cp_rank = lambda: 0  # CP rank = 0 for unit test
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.nsa_indexer import (
     BaseIndexerMetadata,
     Indexer,
     rotate_activation,
 )
-from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
+from sglang.srt.layers.attention.nsa_backend import (
+    NativeSparseAttnBackend,
+    TopkTransformMethod,
+)
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
@@ -327,7 +333,12 @@ class TestNSAIndexer(CustomTestCase):
         return indexer
 
     def _create_forward_batch(
-        self, mode, batch_size=None, seq_len=None, extend_len=None
+        self,
+        mode,
+        batch_size=None,
+        seq_len=None,
+        extend_len=None,
+        allow_fixed_native_compile_prefill_page_table=False,
     ):
         """Create a forward batch for testing."""
         batch_size = batch_size or self.batch_size
@@ -360,6 +371,7 @@ class TestNSAIndexer(CustomTestCase):
                 ),
                 extend_seq_lens=torch.tensor([q_len] * batch_size, device=self.device),
                 extend_seq_lens_cpu=torch.tensor([q_len] * batch_size, device="cpu"),
+                allow_fixed_native_compile_prefill_page_table=allow_fixed_native_compile_prefill_page_table,
                 attn_backend=self.backend,
             )
         else:  # ForwardMode.DECODE
@@ -379,6 +391,7 @@ class TestNSAIndexer(CustomTestCase):
                 req_pool_indices=torch.arange(batch_size, device=self.device),
                 seq_lens=torch.tensor([total_len] * batch_size, device=self.device),
                 seq_lens_cpu=torch.tensor([total_len] * batch_size, device="cpu"),
+                allow_fixed_native_compile_prefill_page_table=allow_fixed_native_compile_prefill_page_table,
                 attn_backend=self.backend,
             )
 
@@ -395,6 +408,64 @@ class TestNSAIndexer(CustomTestCase):
                     i * seq_length + j + page_size
                 )
 
+        return forward_batch
+
+    def _create_mixed_extend_forward_batch(
+        self,
+        seq_lens: List[int],
+        extend_seq_lens: List[int],
+        allow_fixed_native_compile_prefill_page_table=False,
+    ):
+        """Create a mixed-length extend batch for metadata equivalence tests."""
+        assert len(seq_lens) == len(extend_seq_lens)
+        assert all(q_len <= kv_len for q_len, kv_len in zip(extend_seq_lens, seq_lens))
+
+        batch_size = len(seq_lens)
+        seq_lens_gpu = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
+        extend_seq_lens_gpu = torch.tensor(
+            extend_seq_lens, dtype=torch.int64, device=self.device
+        )
+        extend_prefix_lens = [
+            kv_len - q_len for kv_len, q_len in zip(seq_lens, extend_seq_lens)
+        ]
+        extend_prefix_lens_gpu = torch.tensor(
+            extend_prefix_lens, dtype=torch.int64, device=self.device
+        )
+
+        req_to_token = self.model_runner.req_to_token_pool.req_to_token
+        next_token = self.model_runner.page_size
+        out_cache_locs = []
+        for i, (kv_len, q_len) in enumerate(zip(seq_lens, extend_seq_lens)):
+            row_tokens = torch.arange(
+                next_token,
+                next_token + kv_len,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            req_to_token[i, :kv_len] = row_tokens
+            out_cache_locs.append(row_tokens[kv_len - q_len : kv_len])
+            next_token += kv_len
+
+        forward_batch = ForwardBatch(
+            batch_size=batch_size,
+            input_ids=torch.randint(
+                0, 100, (sum(extend_seq_lens),), device=self.device
+            ),
+            out_cache_loc=torch.cat(out_cache_locs, dim=0),
+            seq_lens_sum=sum(seq_lens),
+            forward_mode=ForwardMode.EXTEND,
+            req_pool_indices=torch.arange(batch_size, device=self.device),
+            seq_lens=seq_lens_gpu,
+            seq_lens_cpu=torch.tensor(seq_lens, dtype=torch.int64, device="cpu"),
+            extend_prefix_lens=extend_prefix_lens_gpu,
+            extend_prefix_lens_cpu=extend_prefix_lens,
+            extend_seq_lens=extend_seq_lens_gpu,
+            extend_seq_lens_cpu=extend_seq_lens,
+            allow_fixed_native_compile_prefill_page_table=allow_fixed_native_compile_prefill_page_table,
+            attn_backend=self.backend,
+        )
+        forward_batch.req_to_token_pool = self.model_runner.req_to_token_pool
+        forward_batch.token_to_kv_pool = self.model_runner.token_to_kv_pool
         return forward_batch
 
     def _verify_topk_output(self, topk_indices, batch_size, q_len, topk):
@@ -416,6 +487,317 @@ class TestNSAIndexer(CustomTestCase):
             has_padding or topk_indices.shape[1] == topk,
             "Output should have padding or exact topk size",
         )
+
+    def test_short_isl_extend_prefill_metadata_keeps_runtime_page_table_without_compile_hint(
+        self,
+    ):
+        self._init_model_runner(
+            {
+                "max_bs": 4,
+                "context_len": 64,
+                "index_topk": 64,
+            }
+        )
+
+        forward_batch = self._create_forward_batch(
+            ForwardMode.EXTEND,
+            batch_size=2,
+            seq_len=48,
+            extend_len=4,
+            allow_fixed_native_compile_prefill_page_table=False,
+        )
+        self.backend.init_forward_metadata(forward_batch)
+        metadata = self.backend.forward_metadata
+
+        self.assertEqual(metadata.max_seq_len_k, 48)
+        self.assertEqual(metadata.page_table_1.shape, (2, 48))
+        self.assertEqual(metadata.real_page_table.shape, (2, 1))
+        self.assertEqual(list(metadata.nsa_extend_seq_lens_list), [4, 4])
+
+    def test_short_isl_extend_prefill_metadata_reuses_fixed_page_table_storage(self):
+        self._init_model_runner(
+            {
+                "max_bs": 4,
+                "context_len": 64,
+                "index_topk": 64,
+            }
+        )
+
+        first_batch = self._create_forward_batch(
+            ForwardMode.EXTEND,
+            batch_size=1,
+            seq_len=32,
+            extend_len=8,
+            allow_fixed_native_compile_prefill_page_table=True,
+        )
+        self.backend.init_forward_metadata(first_batch)
+        first_metadata = self.backend.forward_metadata
+
+        self.assertEqual(first_metadata.max_seq_len_k, 32)
+        self.assertEqual(first_metadata.page_table_1.shape, (4, 64))
+        self.assertTrue(
+            torch.equal(
+                first_metadata.page_table_1[0, :32],
+                self.model_runner.req_to_token_pool.req_to_token[0, :32],
+            )
+        )
+        self.assertTrue(torch.all(first_metadata.page_table_1[1:, :] == -1))
+        self.assertEqual(first_metadata.nsa_extend_seq_lens_list, [8, 0, 0, 0])
+
+        second_batch = self._create_forward_batch(
+            ForwardMode.EXTEND,
+            batch_size=3,
+            seq_len=48,
+            extend_len=4,
+            allow_fixed_native_compile_prefill_page_table=True,
+        )
+        self.backend.init_forward_metadata(second_batch)
+        second_metadata = self.backend.forward_metadata
+
+        self.assertIs(second_metadata.page_table_1, first_metadata.page_table_1)
+        self.assertEqual(second_metadata.max_seq_len_k, 48)
+        self.assertEqual(second_metadata.page_table_1.shape, (4, 64))
+        self.assertTrue(
+            torch.equal(
+                second_metadata.page_table_1[:3, :48],
+                self.model_runner.req_to_token_pool.req_to_token[:3, :48],
+            )
+        )
+        self.assertTrue(torch.all(second_metadata.page_table_1[3:, :] == -1))
+        self.assertEqual(second_metadata.nsa_extend_seq_lens_list, [4, 4, 4, 0])
+
+    def test_short_isl_extend_prefill_metadata_computes_real_page_table_once(self):
+        self._init_model_runner(
+            {
+                "max_bs": 4,
+                "context_len": 64,
+                "index_topk": 64,
+            }
+        )
+
+        forward_batch = self._create_forward_batch(
+            ForwardMode.EXTEND,
+            batch_size=2,
+            seq_len=48,
+            extend_len=4,
+            allow_fixed_native_compile_prefill_page_table=True,
+        )
+
+        with patch.object(
+            self.backend,
+            "_transform_table_1_to_real",
+            wraps=self.backend._transform_table_1_to_real,
+        ) as transform_mock:
+            self.backend.init_forward_metadata(forward_batch)
+
+        self.assertEqual(transform_mock.call_count, 1)
+
+    def test_short_isl_extend_prefill_metadata_marks_native_compile_indexer_ready(
+        self,
+    ):
+        self._init_model_runner(
+            {
+                "max_bs": 4,
+                "context_len": 64,
+                "index_topk": 64,
+            }
+        )
+
+        forward_batch = self._create_forward_batch(
+            ForwardMode.EXTEND,
+            batch_size=2,
+            seq_len=48,
+            extend_len=4,
+            allow_fixed_native_compile_prefill_page_table=True,
+        )
+        self.backend.init_forward_metadata(forward_batch)
+
+        self.assertTrue(self.backend.forward_metadata.native_compile_indexer_ready)
+
+    @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
+    def test_short_isl_extend_prefill_metadata_native_compile_guard_uses_metadata_flag(
+        self, mock_deep_gemm
+    ):
+        mock_deep_gemm.get_num_sms.return_value = 132
+
+        self._init_model_runner(
+            {
+                "max_bs": 4,
+                "context_len": 64,
+                "index_topk": 64,
+            }
+        )
+
+        forward_batch = self._create_forward_batch(
+            ForwardMode.EXTEND,
+            batch_size=2,
+            seq_len=48,
+            extend_len=4,
+            allow_fixed_native_compile_prefill_page_table=True,
+        )
+        self.backend.init_forward_metadata(forward_batch)
+        forward_batch.seq_lens_cpu = None
+
+        indexer = self._create_indexer(index_topk=64)
+        self.assertEqual(
+            indexer.get_native_compile_guard_state(
+                forward_batch, layer_id=self.config["layer_id"]
+            ),
+            (True, True),
+        )
+
+    @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
+    def test_short_isl_extend_prefill_metadata_forward_native_ignores_forward_batch_seq_lens_cpu(
+        self, mock_deep_gemm
+    ):
+        mock_deep_gemm.get_num_sms.return_value = 132
+
+        self._init_model_runner(
+            {
+                "max_bs": 4,
+                "context_len": 64,
+                "index_topk": 64,
+            }
+        )
+
+        forward_batch = self._create_forward_batch(
+            ForwardMode.EXTEND,
+            batch_size=2,
+            seq_len=48,
+            extend_len=4,
+        )
+        self.backend.init_forward_metadata(forward_batch)
+        forward_batch.seq_lens_cpu = None
+
+        indexer = self._create_indexer(index_topk=64)
+        sentinel = torch.full((1, 1), 7, device=self.device, dtype=torch.int32)
+        positions = torch.arange(8, device=self.device, dtype=torch.int64)
+        x = torch.randn(
+            8, self.config["hidden_size"], device=self.device, dtype=self.dtype
+        )
+        q_lora = torch.randn(
+            8, self.config["q_lora_rank"], device=self.device, dtype=self.dtype
+        )
+
+        with patch.object(
+            indexer, "_forward_native_k_only", return_value=sentinel
+        ) as mock_forward_native_k_only:
+            out = indexer.forward_native(
+                x=x,
+                q_lora=q_lora,
+                positions=positions,
+                forward_batch=forward_batch,
+                layer_id=self.config["layer_id"],
+            )
+
+        self.assertIs(out, sentinel)
+        mock_forward_native_k_only.assert_called_once()
+
+    @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
+    def test_short_isl_native_topk_matches_cuda_k_only_transform(self, mock_deep_gemm):
+        mock_deep_gemm.get_num_sms.return_value = 132
+
+        index_topk = 64
+        indexer = self._create_indexer(index_topk=index_topk)
+
+        cases = [
+            {
+                "name": "paged_prefill",
+                "seq_lens": [17, 48, 5],
+                "extend_seq_lens": [17, 48, 5],
+                "use_ragged": False,
+                "expected_method": TopkTransformMethod.PAGED,
+            },
+            {
+                "name": "paged_prefix_extend",
+                "seq_lens": [20, 48, 7],
+                "extend_seq_lens": [3, 11, 1],
+                "use_ragged": False,
+                "expected_method": TopkTransformMethod.PAGED,
+            },
+            {
+                "name": "ragged_prefill",
+                "seq_lens": [17, 48, 5],
+                "extend_seq_lens": [17, 48, 5],
+                "use_ragged": True,
+                "expected_method": TopkTransformMethod.RAGGED,
+            },
+            {
+                "name": "ragged_prefix_extend",
+                "seq_lens": [20, 48, 7],
+                "extend_seq_lens": [3, 11, 1],
+                "use_ragged": True,
+                "expected_method": TopkTransformMethod.RAGGED,
+            },
+        ]
+
+        for fuse_topk in [False, True]:
+            for case in cases:
+                with self.subTest(case=case["name"], fuse_topk=fuse_topk):
+                    self._init_model_runner(
+                        {
+                            "max_bs": 4,
+                            "context_len": index_topk,
+                            "index_topk": index_topk,
+                        }
+                    )
+                    self.backend.nsa_kv_cache_store_fp8 = case["use_ragged"]
+                    forward_batch = self._create_mixed_extend_forward_batch(
+                        seq_lens=case["seq_lens"],
+                        extend_seq_lens=case["extend_seq_lens"],
+                        allow_fixed_native_compile_prefill_page_table=True,
+                    )
+
+                    with envs.SGLANG_NSA_FUSE_TOPK.override(fuse_topk):
+                        self.backend.init_forward_metadata(forward_batch)
+                        metadata = self.backend.get_indexer_metadata(
+                            self.config["layer_id"], forward_batch
+                        )
+                        self.assertEqual(
+                            metadata.topk_transform_method, case["expected_method"]
+                        )
+                        self.assertLessEqual(
+                            self.backend.forward_metadata.max_seq_len_k, index_topk
+                        )
+
+                        seq_lens_expanded = metadata.get_seqlens_expanded()
+                        dummy_logits = torch.zeros(
+                            seq_lens_expanded.shape[0],
+                            index_topk,
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                        expected = metadata.topk_transform(dummy_logits, index_topk)
+                        actual = indexer._build_short_isl_topk_result_native(
+                            metadata, torch.device(self.device)
+                        )
+
+                    self.assertTrue(
+                        torch.equal(actual, expected),
+                        f"{case['name']} mismatch with fuse_topk={fuse_topk}",
+                    )
+
+    def test_long_isl_extend_prefill_metadata_keeps_runtime_page_table_shape(self):
+        self._init_model_runner(
+            {
+                "max_bs": 4,
+                "context_len": 128,
+                "index_topk": 16,
+            }
+        )
+
+        forward_batch = self._create_forward_batch(
+            ForwardMode.EXTEND,
+            batch_size=2,
+            seq_len=32,
+            extend_len=6,
+        )
+        self.backend.init_forward_metadata(forward_batch)
+        metadata = self.backend.forward_metadata
+
+        self.assertEqual(metadata.max_seq_len_k, 32)
+        self.assertEqual(metadata.page_table_1.shape, (2, 32))
+        self.assertEqual(len(metadata.nsa_extend_seq_lens_list), 2)
 
     @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
     def test_indexer_basic_creation(self, mock_deep_gemm):

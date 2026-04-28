@@ -13,6 +13,7 @@ from sglang.srt.layers.deep_gemm_wrapper.configurer import (  # noqa: F401
     ENABLE_JIT_DEEPGEMM,
 )
 from sglang.srt.server_args import ServerArgs
+from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 
@@ -103,11 +104,12 @@ def gemm_nt_f8f8bf16(
         )
 
 
+@register_custom_op(mutates_args=["out"])
 def gemm_nt_bf16bf16f32(
     lhs: torch.Tensor,
     rhs: torch.Tensor,
     out: torch.Tensor,
-):
+) -> None:
     m, k = lhs.shape
     n, _ = rhs.shape
     num_groups = 1
