@@ -1558,6 +1558,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         target_device = torch.device(self.device)
+        _check_model_weight_update_allowed(self.model)
         self.model_config.model_path = model_path
         load_config = LoadConfig(load_format=load_format)
 
@@ -1798,10 +1799,12 @@ class ModelRunner(ModelRunnerKVCacheMixin):
         )
 
         if load_format == "flattened_bucket":
+            _check_model_weight_update_allowed(self.model)
             return self._update_bucketed_weights_from_distributed(
                 names, dtypes, shapes, group_name
             )
         try:
+            _check_model_weight_update_allowed(self.model)
             weights = []
             handles = []
             for name, dtype, shape in zip(names, dtypes, shapes):
@@ -1871,6 +1874,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
     ):
         monkey_patch_torch_reductions()
         if load_format == "flattened_bucket":
+            _check_model_weight_update_allowed(self.model)
             # Handle flattened bucket format
             return self._update_weights_from_flattened_bucket(
                 flattened_tensor_bucket_dict=named_tensors
@@ -1884,6 +1888,7 @@ class ModelRunner(ModelRunnerKVCacheMixin):
             (name, _unwrap_tensor(tensor, tp_rank=self.tp_rank, device=infered_device))
             for name, tensor in named_tensors
         ]
+        _check_model_weight_update_allowed(self.model)
         if load_format == "direct":
             _model_load_weights_direct(self.model, named_tensors)
         elif load_format in self.server_args.custom_weight_loader:
@@ -3352,9 +3357,16 @@ class ModelRunner(ModelRunnerKVCacheMixin):
 
 
 def _model_load_weights_direct(model, named_tensors: List[Tuple[str, torch.Tensor]]):
+    _check_model_weight_update_allowed(model)
     params_dict = dict(model.named_parameters())
     for name, tensor in named_tensors:
         default_weight_loader(params_dict[name], tensor)
+
+
+def _check_model_weight_update_allowed(model):
+    check_weight_update_allowed = getattr(model, "check_weight_update_allowed", None)
+    if callable(check_weight_update_allowed):
+        check_weight_update_allowed()
 
 
 def _unwrap_tensor(tensor, tp_rank, device):

@@ -3232,14 +3232,19 @@ class DeepseekV2Model(nn.Module):
         forward_batch: ForwardBatch,
     ) -> bool:
         return (
+            self._is_experimental_prefill_layer_group_compile_enabled()
+            and forward_batch.forward_mode.is_extend_without_speculative()
+            and not forward_batch.can_run_tbo
+            and not nsa_use_prefill_cp(forward_batch)
+        )
+
+    def _is_experimental_prefill_layer_group_compile_enabled(self) -> bool:
+        return (
             _get_experimental_prefill_layer_compile_group_size() > 1
             and bool(self._get_experimental_prefill_layer_compile_groups())
             and _is_cuda
             and _experimental_prefill_compile_supports_moe_backend()
             and not self.layers_to_capture
-            and forward_batch.forward_mode.is_extend_without_speculative()
-            and not forward_batch.can_run_tbo
-            and not nsa_use_prefill_cp(forward_batch)
             and get_moe_a2a_backend().is_none()
         )
 
@@ -3620,8 +3625,21 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
     def end_layer(self):
         return self.model.end_layer
 
+    def check_weight_update_allowed(self) -> None:
+        compile_enabled = (
+            self.model._is_experimental_prefill_layer_group_compile_enabled()
+        )
+        if compile_enabled and getattr(self, "_deepseek_weight_load_complete", False):
+            raise RuntimeError(
+                "DeepSeek V2 experimental prefill compile is configured for static "
+                "inference and does not support in-process weight updates after the "
+                "initial weight load. Restart the engine with the new weights instead."
+            )
+
     def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]], is_nextn=False):
+        self.check_weight_update_allowed()
         self.do_load_weights(weights, is_nextn)
+        self._deepseek_weight_load_complete = True
 
     def get_embed_and_head(self):
         return self.model.embed_tokens.weight, self.lm_head.weight

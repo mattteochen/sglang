@@ -413,6 +413,10 @@ class DeepseekV2WeightLoaderMixin:
             is_nextn: Whether processing NextN weights
             weight_names: Optional list of loaded weight names to determine which layers to process
         """
+        check_weight_update_allowed = getattr(self, "check_weight_update_allowed", None)
+        if callable(check_weight_update_allowed):
+            check_weight_update_allowed()
+
         if is_nextn:
             layer_ids = [self.config.num_hidden_layers]
         else:
