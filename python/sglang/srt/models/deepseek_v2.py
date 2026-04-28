@@ -3576,10 +3576,15 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         return self.model.embed_tokens
 
     def prepare_attn_metadata_hints(self, forward_batch: ForwardBatch) -> None:
+        should_use_compile = getattr(
+            self.model,
+            "_should_use_experimental_prefill_layer_group_compile",
+            None,
+        )
         forward_batch.allow_fixed_native_compile_prefill_page_table = bool(
-            self.model._should_use_experimental_prefill_layer_group_compile(
-                forward_batch
-            )
+            should_use_compile(forward_batch)
+            if should_use_compile is not None
+            else False
         )
 
     @torch.no_grad()
@@ -3626,8 +3631,13 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         return self.model.end_layer
 
     def check_weight_update_allowed(self) -> None:
+        is_compile_enabled = getattr(
+            self.model,
+            "_is_experimental_prefill_layer_group_compile_enabled",
+            None,
+        )
         compile_enabled = (
-            self.model._is_experimental_prefill_layer_group_compile_enabled()
+            is_compile_enabled() if is_compile_enabled is not None else False
         )
         if compile_enabled and getattr(self, "_deepseek_weight_load_complete", False):
             raise RuntimeError(
