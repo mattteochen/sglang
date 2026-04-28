@@ -261,12 +261,14 @@ def _prewarm_flashinfer_lazy_modules_for_experimental_prefill_compile() -> None:
 
 
 def _get_experimental_prefill_compile_options() -> Dict[str, Any]:
-    return {
+    options = {
         "max_autotune": True,
-        "cpp_wrapper": True,
-        "combo_kernels": True,
-        # "trace.enabled": True,
     }
+    if hasattr(torch._inductor.config, "combo_kernels"):
+        options["combo_kernels"] = True
+    if hasattr(torch._inductor.config, "cpp_wrapper"):
+        options["cpp_wrapper"] = True
+    return options
 
 
 def _maybe_mark_dynamic_dim0(tensor: Optional[torch.Tensor]) -> None:
