@@ -13,12 +13,16 @@ _dp_attn.get_attention_cp_size = lambda: 1  # CP size = 1 for unit test
 _dp_attn.get_attention_cp_rank = lambda: 0  # CP rank = 0 for unit test
 
 from sglang.srt.configs.model_config import AttentionArch
+from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa.nsa_indexer import (
     BaseIndexerMetadata,
     Indexer,
     rotate_activation,
 )
-from sglang.srt.layers.attention.nsa_backend import NativeSparseAttnBackend
+from sglang.srt.layers.attention.nsa_backend import (
+    NativeSparseAttnBackend,
+    TopkTransformMethod,
+)
 from sglang.srt.layers.layernorm import LayerNorm
 from sglang.srt.layers.linear import LinearBase
 from sglang.srt.mem_cache.memory_pool import NSATokenToKVPool
@@ -406,6 +410,64 @@ class TestNSAIndexer(CustomTestCase):
 
         return forward_batch
 
+    def _create_mixed_extend_forward_batch(
+        self,
+        seq_lens: List[int],
+        extend_seq_lens: List[int],
+        allow_fixed_native_compile_prefill_page_table=False,
+    ):
+        """Create a mixed-length extend batch for metadata equivalence tests."""
+        assert len(seq_lens) == len(extend_seq_lens)
+        assert all(q_len <= kv_len for q_len, kv_len in zip(extend_seq_lens, seq_lens))
+
+        batch_size = len(seq_lens)
+        seq_lens_gpu = torch.tensor(seq_lens, dtype=torch.int64, device=self.device)
+        extend_seq_lens_gpu = torch.tensor(
+            extend_seq_lens, dtype=torch.int64, device=self.device
+        )
+        extend_prefix_lens = [
+            kv_len - q_len for kv_len, q_len in zip(seq_lens, extend_seq_lens)
+        ]
+        extend_prefix_lens_gpu = torch.tensor(
+            extend_prefix_lens, dtype=torch.int64, device=self.device
+        )
+
+        req_to_token = self.model_runner.req_to_token_pool.req_to_token
+        next_token = self.model_runner.page_size
+        out_cache_locs = []
+        for i, (kv_len, q_len) in enumerate(zip(seq_lens, extend_seq_lens)):
+            row_tokens = torch.arange(
+                next_token,
+                next_token + kv_len,
+                dtype=torch.int32,
+                device=self.device,
+            )
+            req_to_token[i, :kv_len] = row_tokens
+            out_cache_locs.append(row_tokens[kv_len - q_len : kv_len])
+            next_token += kv_len
+
+        forward_batch = ForwardBatch(
+            batch_size=batch_size,
+            input_ids=torch.randint(
+                0, 100, (sum(extend_seq_lens),), device=self.device
+            ),
+            out_cache_loc=torch.cat(out_cache_locs, dim=0),
+            seq_lens_sum=sum(seq_lens),
+            forward_mode=ForwardMode.EXTEND,
+            req_pool_indices=torch.arange(batch_size, device=self.device),
+            seq_lens=seq_lens_gpu,
+            seq_lens_cpu=torch.tensor(seq_lens, dtype=torch.int64, device="cpu"),
+            extend_prefix_lens=extend_prefix_lens_gpu,
+            extend_prefix_lens_cpu=extend_prefix_lens,
+            extend_seq_lens=extend_seq_lens_gpu,
+            extend_seq_lens_cpu=extend_seq_lens,
+            allow_fixed_native_compile_prefill_page_table=allow_fixed_native_compile_prefill_page_table,
+            attn_backend=self.backend,
+        )
+        forward_batch.req_to_token_pool = self.model_runner.req_to_token_pool
+        forward_batch.token_to_kv_pool = self.model_runner.token_to_kv_pool
+        return forward_batch
+
     def _verify_topk_output(self, topk_indices, batch_size, q_len, topk):
         """Verify the topk indices output shape and basic properties."""
         self.assertIsNotNone(topk_indices)
@@ -630,6 +692,90 @@ class TestNSAIndexer(CustomTestCase):
 
         self.assertIs(out, sentinel)
         mock_forward_native_k_only.assert_called_once()
+
+    @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
+    def test_short_isl_native_topk_matches_cuda_k_only_transform(self, mock_deep_gemm):
+        mock_deep_gemm.get_num_sms.return_value = 132
+
+        index_topk = 64
+        indexer = self._create_indexer(index_topk=index_topk)
+
+        cases = [
+            {
+                "name": "paged_prefill",
+                "seq_lens": [17, 48, 5],
+                "extend_seq_lens": [17, 48, 5],
+                "use_ragged": False,
+                "expected_method": TopkTransformMethod.PAGED,
+            },
+            {
+                "name": "paged_prefix_extend",
+                "seq_lens": [20, 48, 7],
+                "extend_seq_lens": [3, 11, 1],
+                "use_ragged": False,
+                "expected_method": TopkTransformMethod.PAGED,
+            },
+            {
+                "name": "ragged_prefill",
+                "seq_lens": [17, 48, 5],
+                "extend_seq_lens": [17, 48, 5],
+                "use_ragged": True,
+                "expected_method": TopkTransformMethod.RAGGED,
+            },
+            {
+                "name": "ragged_prefix_extend",
+                "seq_lens": [20, 48, 7],
+                "extend_seq_lens": [3, 11, 1],
+                "use_ragged": True,
+                "expected_method": TopkTransformMethod.RAGGED,
+            },
+        ]
+
+        for fuse_topk in [False, True]:
+            for case in cases:
+                with self.subTest(case=case["name"], fuse_topk=fuse_topk):
+                    self._init_model_runner(
+                        {
+                            "max_bs": 4,
+                            "context_len": index_topk,
+                            "index_topk": index_topk,
+                        }
+                    )
+                    self.backend.nsa_kv_cache_store_fp8 = case["use_ragged"]
+                    forward_batch = self._create_mixed_extend_forward_batch(
+                        seq_lens=case["seq_lens"],
+                        extend_seq_lens=case["extend_seq_lens"],
+                        allow_fixed_native_compile_prefill_page_table=True,
+                    )
+
+                    with envs.SGLANG_NSA_FUSE_TOPK.override(fuse_topk):
+                        self.backend.init_forward_metadata(forward_batch)
+                        metadata = self.backend.get_indexer_metadata(
+                            self.config["layer_id"], forward_batch
+                        )
+                        self.assertEqual(
+                            metadata.topk_transform_method, case["expected_method"]
+                        )
+                        self.assertLessEqual(
+                            self.backend.forward_metadata.max_seq_len_k, index_topk
+                        )
+
+                        seq_lens_expanded = metadata.get_seqlens_expanded()
+                        dummy_logits = torch.zeros(
+                            seq_lens_expanded.shape[0],
+                            index_topk,
+                            dtype=torch.float32,
+                            device=self.device,
+                        )
+                        expected = metadata.topk_transform(dummy_logits, index_topk)
+                        actual = indexer._build_short_isl_topk_result_native(
+                            metadata, torch.device(self.device)
+                        )
+
+                    self.assertTrue(
+                        torch.equal(actual, expected),
+                        f"{case['name']} mismatch with fuse_topk={fuse_topk}",
+                    )
 
     def test_long_isl_extend_prefill_metadata_keeps_runtime_page_table_shape(self):
         self._init_model_runner(
