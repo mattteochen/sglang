@@ -56,13 +56,9 @@ from sglang.srt.layers.activation import SiluAndMul
 from sglang.srt.layers.amx_utils import PackWeightMethod
 from sglang.srt.layers.attention.nsa.nsa_indexer import Indexer
 from sglang.srt.layers.attention.nsa.utils import (
-    can_cp_split,
-    cp_all_gather_rerange_output,
-    cp_split_and_rebuild_data,
-    cp_split_and_rebuild_position,
+    can_nsa_cp_split,
     is_nsa_enable_prefill_cp,
     nsa_use_prefill_cp,
-    prepare_input_dp_with_cp_dsa,
 )
 from sglang.srt.layers.communicator import (
     LayerCommunicator,
@@ -90,6 +86,7 @@ from sglang.srt.layers.logits_processor import LogitsProcessor
 from sglang.srt.layers.moe import (
     get_moe_a2a_backend,
     get_moe_runner_backend,
+    should_skip_post_experts_all_reduce,
     should_use_flashinfer_cutlass_moe_fp4_allgather,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
@@ -117,6 +114,12 @@ from sglang.srt.layers.quantization.fp8_utils import (
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import MultiPlatformOp, PPMissingLayer
+from sglang.srt.layers.utils.cp_utils import (
+    cp_all_gather_rerange_output,
+    cp_split_and_rebuild_data,
+    cp_split_and_rebuild_position,
+    prepare_context_parallel_metadata,
+)
 from sglang.srt.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -144,6 +147,7 @@ from sglang.srt.models.deepseek_common.utils import (
     _is_cuda,
     _is_gfx95_supported,
     _is_hip,
+    _is_musa,
     _is_npu,
     _is_xpu,
     _use_aiter,
@@ -186,6 +190,8 @@ elif _is_npu:
         forward_mla_core_npu,
         forward_mla_prepare_npu,
     )
+elif _is_musa:
+    from sgl_kernel import dsv3_fused_a_gemm, dsv3_router_gemm
 else:
     pass
 
@@ -299,15 +305,11 @@ def _mark_experimental_prefill_dynamic_inputs(
         "forward_metadata",
         None,
     )
-    _maybe_mark_dynamic_dim0(
-        getattr(forward_metadata, "nsa_seqlens_expanded", None)
-    )
+    _maybe_mark_dynamic_dim0(getattr(forward_metadata, "nsa_seqlens_expanded", None))
     _maybe_mark_dynamic_dim0(getattr(forward_metadata, "token_to_batch_idx", None))
     _maybe_mark_dynamic_dim0(getattr(forward_metadata, "page_table_1", None))
     _maybe_mark_dynamic_dim0(getattr(forward_metadata, "real_page_table", None))
-    _maybe_mark_dynamic_dim0(
-        getattr(forward_metadata, "page_table_1_flattened", None)
-    )
+    _maybe_mark_dynamic_dim0(getattr(forward_metadata, "page_table_1_flattened", None))
 
 
 def _deepseek_prefill_mlp_native_bf16_gemms_enabled() -> bool:
@@ -493,9 +495,7 @@ class DeepseekV2MLP(nn.Module):
             return False
         return self._is_supported_block_fp8_linear_native_compile_module(
             self.gate_up_proj
-        ) and self._is_supported_block_fp8_linear_native_compile_module(
-            self.down_proj
-        )
+        ) and self._is_supported_block_fp8_linear_native_compile_module(self.down_proj)
 
     def _forward_gate_up_proj_native_compile(self, x: torch.Tensor) -> torch.Tensor:
         return F.linear(
@@ -558,10 +558,7 @@ class DeepseekV2MLP(nn.Module):
         if (self.tp_size == 1) and x.shape[0] == 0:
             return x
 
-        if (
-            torch._dynamo.is_compiling()
-            and self._should_use_native_bf16_compile_path()
-        ):
+        if torch._dynamo.is_compiling() and self._should_use_native_bf16_compile_path():
             gate_up = self._forward_gate_up_proj_native_compile(x)
             x = self.act_fn(gate_up)
             return self._forward_down_proj_native_compile(
@@ -653,7 +650,7 @@ class MoEGate(nn.Module):
                 and (self.weight.shape[0] == 256 or self.weight.shape[0] == 384)
                 and _device_sm >= 90
             ):
-                if _device_sm == 100 and self.weight.shape[0] == 256:
+                if _device_sm in [100, 103] and self.weight.shape[0] == 256:
                     # router gemm output float32
                     logits = torch.empty(
                         hidden_states.shape[0],
@@ -978,16 +975,17 @@ class DeepseekV2MoE(nn.Module):
                 expert_location_dispatch_info=dispatch_info,
             )
             final_hidden_states = self.experts(hidden_states, topk_output)
-            if not _is_cuda or isinstance(self.experts.quant_method, KTEPWrapperMethod):
+            if not (_is_cuda or _is_musa) or isinstance(
+                self.experts.quant_method, KTEPWrapperMethod
+            ):
                 final_hidden_states *= self.routed_scaling_factor
 
         current_stream.wait_stream(self.alt_stream)
         final_hidden_states += shared_output
-        if (
-            self.tp_size > 1
-            and not should_allreduce_fusion
-            and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
@@ -1063,6 +1061,7 @@ class DeepseekV2MoE(nn.Module):
         )
         if (
             not _is_cuda
+            and not _is_musa
             and not _is_xpu
             and not _use_aiter
             or isinstance(self.experts.quant_method, KTEPWrapperMethod)
@@ -1071,11 +1070,10 @@ class DeepseekV2MoE(nn.Module):
             final_hidden_states *= self.routed_scaling_factor
         if shared_output is not None:
             final_hidden_states += shared_output
-        if (
-            self.tp_size > 1
-            and not should_allreduce_fusion
-            and not use_reduce_scatter
-            and not should_use_flashinfer_cutlass_moe_fp4_allgather()
+        if self.tp_size > 1 and not should_skip_post_experts_all_reduce(
+            is_tp_path=True,
+            use_reduce_scatter=use_reduce_scatter,
+            should_allreduce_fusion=should_allreduce_fusion,
         ):
             final_hidden_states = tensor_model_parallel_all_reduce(final_hidden_states)
         return final_hidden_states
@@ -2189,9 +2187,7 @@ class DeepseekV2AttentionMLA(
                 self.fused_qkv_a_proj_with_mqa
             )
         ):
-            return self._forward_fused_qkv_a_proj_with_mqa_native_compile(
-                hidden_states
-            )
+            return self._forward_fused_qkv_a_proj_with_mqa_native_compile(hidden_states)
         if (
             (not isinstance(hidden_states, tuple))
             and hidden_states.shape[0] >= 1
@@ -2459,7 +2455,7 @@ class DeepseekV2DecoderLayer(nn.Module):
             hidden_states,
             residual,
             forward_batch,
-            self._gfx95_quant_format,
+            getattr(self, "_gfx95_quant_format", ""),
             needs_allreduce_fusion=needs_allreduce_fusion,
         )
 
@@ -2514,9 +2510,7 @@ class DeepseekV2DecoderLayer(nn.Module):
         llama_4_scaling: Optional[torch.Tensor] = None,
         prev_topk_indices: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        needs_allreduce_fusion = _get_hidden_states_allreduce_fusion_flag(
-            hidden_states
-        )
+        needs_allreduce_fusion = _get_hidden_states_allreduce_fusion_flag(hidden_states)
         should_allreduce_fusion = (
             self.layer_communicator.should_fuse_mlp_allreduce_with_next_layer(
                 forward_batch
@@ -3086,7 +3080,7 @@ class DeepseekV2Model(nn.Module):
 
         self.alt_stream = (
             torch.cuda.Stream()
-            if _is_cuda or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
+            if _is_cuda or _is_musa or envs.SGLANG_NPU_USE_MULTI_STREAM.get()
             else None
         )
 
@@ -3206,13 +3200,10 @@ class DeepseekV2Model(nn.Module):
                 or group._experimental_prefill_compile_failed
                 for group in self._experimental_prefill_layer_compile_groups
             )
-            should_rebuild_groups = (
-                not has_active_group_state
-                and (
-                    self._experimental_prefill_layer_compile_group_size != group_size
-                    or self._experimental_prefill_layer_compile_group_start_cached
-                    != group_start_layer
-                )
+            should_rebuild_groups = not has_active_group_state and (
+                self._experimental_prefill_layer_compile_group_size != group_size
+                or self._experimental_prefill_layer_compile_group_start_cached
+                != group_start_layer
             )
         if not should_rebuild_groups:
             return self._experimental_prefill_layer_compile_groups
@@ -3233,9 +3224,7 @@ class DeepseekV2Model(nn.Module):
             group.start_layer: group for group in groups
         }
         self._experimental_prefill_layer_compile_group_size = group_size
-        self._experimental_prefill_layer_compile_group_start_cached = (
-            group_start_layer
-        )
+        self._experimental_prefill_layer_compile_group_start_cached = group_start_layer
         return groups
 
     def _should_use_experimental_prefill_layer_group_compile(
@@ -3354,8 +3343,8 @@ class DeepseekV2Model(nn.Module):
             while i < normal_end_layer:
                 layer_group = None
                 if use_experimental_prefill_layer_group_compile:
-                    layer_group = self._experimental_prefill_layer_compile_groups_by_start.get(
-                        i
+                    layer_group = (
+                        self._experimental_prefill_layer_compile_groups_by_start.get(i)
                     )
                     if (
                         layer_group is not None
@@ -3379,9 +3368,7 @@ class DeepseekV2Model(nn.Module):
                 ctx = (
                     nullcontext()
                     if not get_global_server_args().disable_piecewise_cuda_graph
-                    else get_global_expert_distribution_recorder().with_current_layer(
-                        i
-                    )
+                    else get_global_expert_distribution_recorder().with_current_layer(i)
                 )
                 with ctx:
                     if i in self.layers_to_capture:
@@ -3549,12 +3536,15 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
             or self.config.n_shared_experts != 1
         ):
             disable_reason = "Config does not support fused shared expert(s)."
-        elif (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0)) and (
-            not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
+        elif (
+            (not _is_cuda or torch.cuda.get_device_capability("cuda") < (8, 0))
+            and (not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4))
+            and (not _is_musa or torch.musa.get_device_capability("musa") < (3, 1))
         ):
             disable_reason = (
                 "Only Deepseek V3/R1 on NV-platform with capability >= 80 "
                 "or AMD-platform with capability >= gfx942(MI30x) can use shared experts fusion optimization."
+                "or MT-platform with capability >= 31 can use shared experts fusion optimization."
             )
         elif get_moe_expert_parallel_world_size() > 1 and (
             not _is_hip or torch.cuda.get_device_capability("cuda") < (9, 4)
@@ -3597,8 +3587,10 @@ class DeepseekV2ForCausalLM(nn.Module, DeepseekV2WeightLoaderMixin):
         pp_proxy_tensors: Optional[PPProxyTensors] = None,
     ) -> torch.Tensor:
         if self.nsa_enable_prefill_cp:
-            if can_cp_split(len(input_ids), self.cp_size, self.use_nsa, forward_batch):
-                forward_batch.nsa_cp_metadata = prepare_input_dp_with_cp_dsa(
+            if can_nsa_cp_split(
+                len(input_ids), self.cp_size, self.use_nsa, forward_batch
+            ):
+                forward_batch.attn_cp_metadata = prepare_context_parallel_metadata(
                     len(input_ids),
                     self.cp_rank,
                     self.cp_size,

@@ -26,7 +26,7 @@ from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMo
 from sglang.srt.server_args import ServerArgs, set_global_server_args_for_scheduler
 from sglang.test.test_utils import CustomTestCase
 
-register_cuda_ci(est_time=15, suite="stage-b-test-1-gpu-large")
+register_cuda_ci(est_time=18, suite="stage-b-test-1-gpu-large")
 
 # Global configuration for all indexer tests
 DEFAULT_CONFIG = {
@@ -610,10 +610,16 @@ class TestNSAIndexer(CustomTestCase):
         indexer = self._create_indexer(index_topk=64)
         sentinel = torch.full((1, 1), 7, device=self.device, dtype=torch.int32)
         positions = torch.arange(8, device=self.device, dtype=torch.int64)
-        x = torch.randn(8, self.config["hidden_size"], device=self.device, dtype=self.dtype)
-        q_lora = torch.randn(8, self.config["q_lora_rank"], device=self.device, dtype=self.dtype)
+        x = torch.randn(
+            8, self.config["hidden_size"], device=self.device, dtype=self.dtype
+        )
+        q_lora = torch.randn(
+            8, self.config["q_lora_rank"], device=self.device, dtype=self.dtype
+        )
 
-        with patch.object(indexer, "_forward_native_k_only", return_value=sentinel) as mock_forward_native_k_only:
+        with patch.object(
+            indexer, "_forward_native_k_only", return_value=sentinel
+        ) as mock_forward_native_k_only:
             out = indexer.forward_native(
                 x=x,
                 q_lora=q_lora,

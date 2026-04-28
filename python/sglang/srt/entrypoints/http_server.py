@@ -647,12 +647,29 @@ async def server_info():
 
 @app.get("/get_load")
 async def get_load():
-    """Get load metrics (deprecated - use /v1/loads instead)."""
+    """Get load metrics (deprecated - use /v1/loads instead).
+
+    Legacy shim backed by /v1/loads. Projects GetLoadsReqOutput down to the
+    historical field shape (dp_rank, num_reqs, num_waiting_reqs, num_tokens,
+    num_pending_tokens, ts_tic) so existing clients keep working.
+    """
     logger.warning(
         "Endpoint '/get_load' is deprecated and will be removed in a future version. "
         "Please use '/v1/loads' instead."
     )
-    return await _global_state.tokenizer_manager.get_load()
+    load_results = await _global_state.tokenizer_manager.get_loads(include=["core"])
+    ts = time.perf_counter()
+    return [
+        {
+            "dp_rank": r.dp_rank,
+            "num_reqs": r.num_running_reqs + r.num_waiting_reqs,
+            "num_waiting_reqs": r.num_waiting_reqs,
+            "num_tokens": r.num_total_tokens,
+            "num_pending_tokens": r.num_total_tokens - r.num_used_tokens,
+            "ts_tic": ts,
+        }
+        for r in load_results
+    ]
 
 
 # example usage:
@@ -1903,10 +1920,7 @@ def _get_explicit_startup_warmup_descriptions(server_args: ServerArgs) -> List[s
     descriptions = []
     if server_args.warmup_input_lens:
         descriptions.extend(
-            [
-                f"prompt_len={prompt_len}"
-                for prompt_len in server_args.warmup_input_lens
-            ]
+            [f"prompt_len={prompt_len}" for prompt_len in server_args.warmup_input_lens]
         )
     if server_args.warmup_batch_input_lens:
         descriptions.extend(
@@ -1921,10 +1935,7 @@ def _get_explicit_startup_warmup_descriptions(server_args: ServerArgs) -> List[s
 def _get_explicit_startup_warmup_payloads(
     server_args: ServerArgs, request_name: str
 ) -> Optional[List[Dict[str, Any]]]:
-    if (
-        not server_args.warmup_input_lens
-        and not server_args.warmup_batch_input_lens
-    ):
+    if not server_args.warmup_input_lens and not server_args.warmup_batch_input_lens:
         return None
 
     if server_args.debug_tensor_dump_input_file:
@@ -2073,9 +2084,7 @@ def _execute_server_warmup(server_args: ServerArgs):
                     _get_explicit_startup_warmup_descriptions(server_args),
                     explicit_warmup_payloads,
                 ):
-                    logger.info(
-                        "Running startup warmup request with %s.", description
-                    )
+                    logger.info("Running startup warmup request with %s.", description)
                     res = requests.post(
                         url + request_name,
                         json=warmup_payload,
