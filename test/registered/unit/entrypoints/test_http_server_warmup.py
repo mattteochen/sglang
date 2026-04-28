@@ -7,11 +7,12 @@ from sglang.srt.entrypoints.http_server import (
     _get_explicit_startup_warmup_payloads,
 )
 from sglang.test.ci.ci_register import register_cpu_ci
+from sglang.test.test_utils import CustomTestCase
 
 register_cpu_ci(est_time=3, suite="stage-a-test-cpu")
 
 
-class TestHttpServerWarmup(unittest.TestCase):
+class TestHttpServerWarmup(CustomTestCase):
     def test_build_generate_payloads_for_single_dp(self):
         server_args = SimpleNamespace(dp_size=1)
 
