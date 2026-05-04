@@ -784,23 +784,27 @@ class PiecewiseCudaGraphRunner:
     ) -> Union[LogitsProcessorOutput, PPProxyTensors, EmbeddingPoolerOutput]:
         with enable_piecewise_cuda_graph():
             static_forward_batch = self.replay_prepare(forward_batch, **kwargs)
+            language_model = getattr(
+                self.model_runner.model, "language_model", self.model_runner.model
+            )
             # Replay
-            with set_forward_context(
-                static_forward_batch,
-                self.attention_layers,
-                self.quant_config,
-                self.moe_layers,
-                self.moe_fusions,
-                nsa_indexers=self.nsa_indexers,
-            ):
-                # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
-                self.model_runner.attn_backend.init_forward_metadata(forward_batch)
-                output = self.model_runner.model.forward(
-                    static_forward_batch.input_ids,
-                    static_forward_batch.positions,
+            with patch_model(language_model.model, self.compile_config.compiler):
+                with set_forward_context(
                     static_forward_batch,
-                    **kwargs,
-                )
+                    self.attention_layers,
+                    self.quant_config,
+                    self.moe_layers,
+                    self.moe_fusions,
+                    nsa_indexers=self.nsa_indexers,
+                ):
+                    # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
+                    self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+                    output = self.model_runner.model.forward(
+                        static_forward_batch.input_ids,
+                        static_forward_batch.positions,
+                        static_forward_batch,
+                        **kwargs,
+                    )
                 if isinstance(output, LogitsProcessorOutput):
                     return LogitsProcessorOutput(
                         next_token_logits=output.next_token_logits[

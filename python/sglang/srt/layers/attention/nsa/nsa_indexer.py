@@ -321,6 +321,10 @@ class Indexer(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
+    def enter_torch_compile(self, num_tokens: int):
+        # Keep NSA Indexer on its CUDA/custom-op path under piecewise Inductor.
+        return
+
     @contextlib.contextmanager
     def _with_real_sm_count(self):
         # When pipeline parallelism is enabled, each PP rank initiates a recv operation after the _pp_launch_batch
