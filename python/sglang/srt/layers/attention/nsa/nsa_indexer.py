@@ -240,6 +240,12 @@ def rotate_activation(x: torch.Tensor) -> torch.Tensor:
 
 
 class Indexer(MultiPlatformOp):
+    # Keep child ops such as RoPE and LayerNorm on their CUDA/custom-op paths
+    # when the piecewise CUDA graph runner patches modules for torch.compile.
+
+    # RoPE might need to be patched separately as it might be cached by get_rope_wrapper.
+    _skip_torch_compile_submodules = True
+
     def __init__(
         self,
         hidden_size: int,

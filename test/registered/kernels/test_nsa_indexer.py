@@ -432,6 +432,29 @@ class TestNSAIndexer(CustomTestCase):
         self.assertEqual(indexer.layer_id, self.config["layer_id"])
 
     @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
+    def test_compile_patch_keeps_indexer_cuda_path(self, mock_deep_gemm):
+        """Indexer submodules should not switch to forward_native for PCG compile."""
+        from sglang.srt.model_executor.piecewise_cuda_graph_runner import patch_model
+
+        mock_deep_gemm.get_num_sms.return_value = 132
+
+        wrapper = torch.nn.Module()
+        wrapper.indexer = self._create_indexer()
+        wrapper.outside_norm = LayerNorm(self.config["index_head_dim"]).to(
+            device=self.device
+        )
+        # RoPE instances are cached/shared, so make sure a direct traversal path
+        # still cannot switch the Indexer RoPE to forward_native.
+        wrapper.shared_rope = wrapper.indexer.rotary_emb
+
+        with patch_model(wrapper, compiler="inductor"):
+            self.assertFalse(wrapper.indexer.is_torch_compile)
+            self.assertFalse(wrapper.indexer.k_norm.is_torch_compile)
+            self.assertFalse(wrapper.indexer.rotary_emb.is_torch_compile)
+            self.assertFalse(wrapper.shared_rope.is_torch_compile)
+            self.assertTrue(wrapper.outside_norm.is_torch_compile)
+
+    @patch("sglang.srt.layers.attention.nsa.nsa_indexer.deep_gemm")
     @patch("sglang.srt.layers.attention.nsa.triton_kernel.act_quant")
     def test_forward_extend_mode(self, mock_act_quant, mock_deep_gemm):
         """Test indexer forward pass in extend mode."""

@@ -401,12 +401,14 @@ def freeze_gc(enable_cudagraph_gc: bool):
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
     for sub in model._modules.values():
+        skip_submodules = False
         if isinstance(sub, MultiPlatformOp):
             if reverse:
                 sub.leave_torch_compile()
             else:
                 sub.enter_torch_compile(num_tokens=num_tokens)
-        if isinstance(sub, torch.nn.Module):
+            skip_submodules = sub._skip_torch_compile_submodules
+        if isinstance(sub, torch.nn.Module) and not skip_submodules:
             _to_torch(sub, reverse, num_tokens)
 
 

@@ -106,6 +106,11 @@ class RotaryEmbedding(MultiPlatformOp):
             )
         self.position_cos, self.position_sin = None, None
 
+    def enter_torch_compile(self, num_tokens: int):
+        # Keep RoPE on the platform/custom kernel path under piecewise Inductor.
+        # TODO (mattteochen): Add a flag to enable/disable this.
+        return
+
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
         # __setattr__ in nn.Module (called by `self.cos_sin_cache = ...`)
         # is expensive, so avoid calling it if possible

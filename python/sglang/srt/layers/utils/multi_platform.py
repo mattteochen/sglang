@@ -27,6 +27,7 @@ class MultiPlatformOp(nn.Module):
 
     # OOT forward registry: maps dispatch_key -> {op_cls -> forward_fn}
     _oot_forward_registry: ClassVar[dict[str, dict[type, Callable]]] = {}
+    _skip_torch_compile_submodules: ClassVar[bool] = False
 
     @classmethod
     def register_oot_forward(cls, op_cls: type, fn: Callable, platform_key: str):
