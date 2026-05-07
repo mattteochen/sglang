@@ -635,6 +635,33 @@ def cutlass_w8a8_block_fp8_linear_with_fallback(
     return output.to(dtype=input_2d.dtype).view(*output_shape)
 
 
+# Keep dynamic quantization, scale layout, and DeepGEMM as one opaque op under
+# torch.compile. Eager treats the intervening scale views as metadata-only, while
+# Inductor otherwise materializes them as extra Triton glue kernels.
+@register_custom_op(mutates_args=["output"])
+def deepgemm_dynamic_quant_matmul_out(
+    input: torch.Tensor,
+    weight: torch.Tensor,
+    weight_scale: torch.Tensor,
+    output: torch.Tensor,
+    block_k: int,
+    scale_ue8m0: bool,
+) -> None:
+    input_2d = input.view(-1, input.shape[-1])
+    output_2d = output.view(-1, output.shape[-1])
+
+    q_input, x_scale = sglang_per_token_group_quant_fp8(
+        input_2d,
+        block_k,
+        column_major_scales=True,
+        scale_tma_aligned=True,
+        scale_ue8m0=scale_ue8m0,
+    )
+    deep_gemm_wrapper.gemm_nt_f8f8bf16(
+        (q_input, x_scale), (weight, weight_scale), output_2d
+    )
+
+
 def deepgemm_w8a8_block_fp8_linear_with_fallback(
     input: torch.Tensor,
     weight: torch.Tensor,
@@ -666,6 +693,18 @@ def deepgemm_w8a8_block_fp8_linear_with_fallback(
 
     input_2d = input.view(-1, input.shape[-1])
     output_shape = [*input.shape[:-1], weight.shape[0]]
+
+    if torch.compiler.is_compiling() and bias is None:
+        output = torch.empty(output_shape, device=input.device, dtype=output_dtype)
+        deepgemm_dynamic_quant_matmul_out(
+            input,
+            weight,
+            weight_scale,
+            output,
+            block_size[1],
+            deep_gemm_wrapper.DEEPGEMM_SCALE_UE8M0,
+        )
+        return output
 
     q_input, x_scale = sglang_per_token_group_quant_fp8(
         input_2d,
