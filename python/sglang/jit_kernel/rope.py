@@ -35,6 +35,7 @@ def _jit_fused_rope_module(is_neox: bool, rope_dim: int, dtype: torch.dtype) -> 
         cuda_files=["elementwise/rope.cuh"],
         cuda_wrappers=[
             ("run_rope", f"FusedRopeKernel<{args}>::run"),
+            ("run_rope_one", f"FusedRopeKernel<{args}>::run_one"),
             ("run_rope_store", f"FusedRopeKernel<{args}>::run_fused"),
         ],
     )
@@ -135,6 +136,27 @@ def apply_rope_inplace(
     rope_dim = rope_dim or cos_sin_cache.size(-1)
     module = _jit_fused_rope_module(is_neox, rope_dim, q.dtype)
     module.run_rope(q, k, cos_sin_cache, positions)
+
+
+@register_custom_op(mutates_args=["x"])
+def apply_rope_to_tensor_inplace(
+    x: torch.Tensor,
+    cos_sin_cache: torch.Tensor,
+    positions: torch.Tensor,
+    *,
+    is_neox: bool,
+    rope_dim: int = 0,
+) -> None:
+    """
+    Fused inplace rotary position embedding for one tensor.
+
+    The tensor may include non-rotary trailing channels; only ``[..., :rope_dim]``
+    is passed to the fused RoPE kernel.
+    """
+    rope_dim = rope_dim or cos_sin_cache.size(-1)
+    x_rope = x[..., :rope_dim].view(x.shape[0], -1, rope_dim)
+    module = _jit_fused_rope_module(is_neox, rope_dim, x.dtype)
+    module.run_rope_one(x_rope, cos_sin_cache, positions)
 
 
 @register_custom_op(mutates_args=["q", "k", "k_cache", "v_cache"])

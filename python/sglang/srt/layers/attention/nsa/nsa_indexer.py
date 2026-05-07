@@ -11,6 +11,7 @@ from sglang.jit_kernel.fused_store_index_cache import (
     can_use_nsa_fused_store,
     fused_store_index_k_cache,
 )
+from sglang.jit_kernel.rope import apply_rope_to_tensor_inplace
 from sglang.srt.compilation.piecewise_context_manager import (
     get_forward_context,
     is_in_piecewise_cuda_graph,
@@ -532,12 +533,20 @@ class Indexer(MultiPlatformOp):
         # Compute only key, skip query
         key, _ = self.wk(x)
         key = self.k_norm(key)
-        k_rope, _ = torch.split(
-            key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
-        )
-
-        _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
-        self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
+        if _is_cuda and not getattr(self.rotary_emb, "use_fallback_kernel", False):
+            apply_rope_to_tensor_inplace(
+                key,
+                self.rotary_emb.cos_sin_cache,
+                positions,
+                is_neox=self.rotary_emb.is_neox_style,
+                rope_dim=self.rope_head_dim,
+            )
+        else:
+            k_rope, _ = torch.split(
+                key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
+            )
+            _, k_rope = self.rotary_emb(positions, k_rope, k_rope)
+            self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
         key = rotate_activation(key)
 
         return key
