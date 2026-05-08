@@ -112,9 +112,12 @@ def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
 
 @contextmanager
 def patch_model(model: torch.nn.Module, compiler: str):
+    if compiler == "eager":
+        yield model
+        return
+
     try:
-        if compiler != "eager":
-            _to_torch(model, reverse=False, num_tokens=16)
+        _to_torch(model, reverse=False, num_tokens=16)
         yield model
     finally:
         _to_torch(model, reverse=True, num_tokens=16)
@@ -792,9 +795,17 @@ class PiecewiseCudaGraphRunner:
                 self.moe_layers,
                 self.moe_fusions,
                 nsa_indexers=self.nsa_indexers,
+                extend_num_tokens_gpu=self.buffers.extend_num_tokens_gpu,
+                nsa_metadata_buffers=self.buffers.nsa_metadata_buffers,
             ):
                 # Due to the dispatch kernel for MLA model, we init the metadata with original forward_batch
                 self.model_runner.attn_backend.init_forward_metadata(forward_batch)
+                # Stage live NSA metadata into stable-address slots (no-op if no NSA).
+                self._stage_nsa_metadata_if_present(
+                    forward_batch,
+                    bs=static_forward_batch.batch_size,
+                    num_tokens=self.raw_num_tokens,
+                )
                 output = self.model_runner.model.forward(
                     static_forward_batch.input_ids,
                     static_forward_batch.positions,
