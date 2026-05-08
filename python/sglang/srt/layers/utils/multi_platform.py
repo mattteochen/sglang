@@ -3,6 +3,7 @@ from typing import Callable, ClassVar
 from torch import nn
 
 from sglang.kernel_api_logging import debug_kernel_api
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.platforms import current_platform
 from sglang.srt.utils import (
     cpu_has_amx_support,
@@ -38,19 +39,10 @@ class MultiPlatformOp(nn.Module):
         self._forward_method: Callable = self.dispatch_forward()
 
         # States for torch.compile
-        self._original_forward_method = None
+        self._torch_compile_forward_method = None
         self.is_torch_compile = False
 
-    def enter_torch_compile(self, num_tokens: int):
-        # Skip if Op is already entered compile mode.
-        # NOTE(alcanderian): Some Ops(for example RotaryEmbedding) will be reused
-        # among layers and `enter_torch_compile` will be called many times.
-        # We should prevent `self._original_forward_method` from being overridden when
-        # it is not the first time `enter_torch_compile` called.
-        if self.is_torch_compile:
-            return
-
-        self._original_forward_method = self._forward_method
+    def _resolve_torch_compile_forward_method(self, num_tokens: int):
         # NOTE: Temporarily workaround MoE
         # The performance of torch.compile on this layer is not always good when bs > 1,
         # so we decide to only use torch.compile when bs=1
@@ -60,12 +52,24 @@ class MultiPlatformOp(nn.Module):
                     fused_moe_forward_native,
                 )
 
-                self._forward_method = fused_moe_forward_native
+                return fused_moe_forward_native
         elif "TopK" in self.__class__.__name__:
             if num_tokens == 1:
-                self._forward_method = self.forward_native
+                return self.forward_native
         else:
-            self._forward_method = self.forward_native
+            return self.forward_native
+        return self._forward_method
+
+    def enter_torch_compile(self, num_tokens: int):
+        # Skip if Op is already entered compile mode.
+        # NOTE(alcanderian): Some Ops(for example RotaryEmbedding) will be reused
+        # among layers and `enter_torch_compile` will be called many times.
+        if self.is_torch_compile:
+            return
+
+        self._torch_compile_forward_method = self._resolve_torch_compile_forward_method(
+            num_tokens
+        )
         self.is_torch_compile = True
 
     def leave_torch_compile(self):
@@ -73,13 +77,17 @@ class MultiPlatformOp(nn.Module):
         if not self.is_torch_compile:
             return
 
-        self._forward_method = self._original_forward_method
-        self._original_forward_method = None
         self.is_torch_compile = False
 
-    # Please do not override this method, because `self._forward_method` can change when in torch compile mode
+    # Please do not override this method, because dispatch can change in torch compile mode.
     @debug_kernel_api
     def forward(self, *args, **kwargs):
+        if is_in_piecewise_cuda_graph():
+            if self._torch_compile_forward_method is not None:
+                return self._torch_compile_forward_method(*args, **kwargs)
+        elif self.is_torch_compile:
+            if self._torch_compile_forward_method is not None:
+                return self._torch_compile_forward_method(*args, **kwargs)
         return self._forward_method(*args, **kwargs)
 
     def forward_native(self, *args, **kwargs):
