@@ -167,6 +167,8 @@ def test_rope_position_dtypes(dtype: torch.dtype) -> None:
 @pytest.mark.parametrize("rope_dim", PARTIAL_ROPE_DIM_LIST)
 @pytest.mark.parametrize("head_dim", HEAD_DIM_LIST)
 def test_partial_rope(batch_size: int, is_neox: bool, rope_dim: int, head_dim: int):
+    from sglang.jit_kernel.rope import apply_rope_inplace
+
     if head_dim < rope_dim:
         pytest.skip("Invalid config: head_dim must be >= rope_dim.")
     num_qo_heads, num_kv_heads = 8, 2
@@ -178,14 +180,26 @@ def test_partial_rope(batch_size: int, is_neox: bool, rope_dim: int, head_dim: i
 
     q_fi, k_fi = q.clone(), k.clone()
     q_jit, k_jit = q.clone(), k.clone()
+    q_full, k_full = q.clone().view(batch_size, -1), k.clone().view(batch_size, -1)
     rope = ..., slice(rope_dim)  # NOTE: flashinfer by default apply to first rope_dim
 
     flashinfer_rope(q_fi, k_fi, cos_sin_cache, positions.long(), is_neox)
     sglang_jit_rope(q_jit[rope], k_jit[rope], cos_sin_cache, positions, is_neox)
+    apply_rope_inplace(
+        q_full,
+        k_full,
+        cos_sin_cache,
+        positions,
+        is_neox=is_neox,
+        rope_dim=rope_dim,
+        head_dim=head_dim,
+    )
 
     atol = rtol = 1e-2
     triton.testing.assert_close(q_fi, q_jit, atol=atol, rtol=rtol)
     triton.testing.assert_close(k_fi, k_jit, atol=atol, rtol=rtol)
+    triton.testing.assert_close(q_fi, q_full.view_as(q), atol=atol, rtol=rtol)
+    triton.testing.assert_close(k_fi, k_full.view_as(k), atol=atol, rtol=rtol)
 
 
 @pytest.mark.parametrize("batch_size", BS_LIST)
