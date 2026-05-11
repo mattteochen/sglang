@@ -11,6 +11,7 @@ from sglang.jit_kernel.fused_store_index_cache import (
     can_use_nsa_fused_store,
     fused_store_index_k_cache,
 )
+from sglang.jit_kernel.rope import apply_rope_inplace
 from sglang.srt.compilation.piecewise_context_manager import (
     get_forward_context,
     is_in_piecewise_cuda_graph,
@@ -212,6 +213,29 @@ if _is_cuda:
             device=x.device,
         )
 
+    def _logits_head_gate_pcg_matmul_fake_impl(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> torch.Tensor:
+        return torch.empty(
+            (x.shape[0], weight.shape[0]),
+            dtype=torch.float32,
+            device=x.device,
+        )
+
+    @register_custom_op(fake_impl=_logits_head_gate_pcg_matmul_fake_impl)
+    def logits_head_gate_pcg_matmul(
+        x: torch.Tensor,
+        weight: torch.Tensor,
+    ) -> torch.Tensor:
+        from sglang.srt.layers.deep_gemm_wrapper import entrypoint as deep_gemm_wrapper
+
+        out = torch.empty(
+            (x.shape[0], weight.shape[0]), dtype=torch.float32, device=x.device
+        )
+        deep_gemm_wrapper.gemm_nt_bf16bf16f32(x, weight, out)
+        return out
+
     @register_custom_op(fake_impl=_logits_head_gate_pcg_fake_impl)
     def logits_head_gate_pcg(
         x: torch.Tensor,
@@ -399,6 +423,12 @@ class Indexer(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
+    def _resolve_torch_compile_forward_method(self, num_tokens: int):
+        # The NSA indexer has no generic native path. Let Dynamo trace the
+        # selected platform implementation so the surrounding tensor plumbing is
+        # compiled while custom ops in that path remain opaque graph nodes.
+        return self._forward_method
+
     @contextlib.contextmanager
     def _with_real_sm_count(self):
         # When pipeline parallelism is enabled, each PP rank initiates a recv operation after the _pp_launch_batch
@@ -472,6 +502,12 @@ class Indexer(MultiPlatformOp):
         enable_dual_stream: bool,
         forward_batch: ForwardBatch,
     ):
+        use_full_tensor_rope = (
+            _is_cuda
+            and torch.compiler.is_compiling()
+            and is_in_piecewise_cuda_graph()
+            and not getattr(self.rotary_emb, "use_fallback_kernel", False)
+        )
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
             self.alt_stream.wait_stream(current_stream)
@@ -480,40 +516,60 @@ class Indexer(MultiPlatformOp):
                 self.half_device_sm_count
             ):
                 query, _ = self.wq_b(q_lora)
+                if not use_full_tensor_rope:
+                    query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
+                    q_rope, _ = torch.split(
+                        query,
+                        [self.rope_head_dim, self.head_dim - self.rope_head_dim],
+                        dim=-1,
+                    )
+            with torch.cuda.stream(self.alt_stream):
+                # TODO we should also put DeepGEMM half SM here?
+                key, _ = self.wk(x)
+                key = self.k_norm(key)
+
+                if not use_full_tensor_rope:
+                    k_rope, _ = torch.split(
+                        key,
+                        [self.rope_head_dim, self.head_dim - self.rope_head_dim],
+                        dim=-1,
+                    )
+
+            current_stream.wait_stream(self.alt_stream)
+        else:
+            query, _ = self.wq_b(q_lora)
+            if not use_full_tensor_rope:
                 query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
                 q_rope, _ = torch.split(
                     query,
                     [self.rope_head_dim, self.head_dim - self.rope_head_dim],
                     dim=-1,
                 )
-            with torch.cuda.stream(self.alt_stream):
-                # TODO we should also put DeepGEMM half SM here?
-                key, _ = self.wk(x)
-                key = self.k_norm(key)
-
+            key, _ = self.wk(x)
+            key = self.k_norm(key)
+            if not use_full_tensor_rope:
                 k_rope, _ = torch.split(
                     key,
                     [self.rope_head_dim, self.head_dim - self.rope_head_dim],
                     dim=-1,
                 )
 
-            current_stream.wait_stream(self.alt_stream)
-        else:
-            query, _ = self.wq_b(q_lora)
+        if use_full_tensor_rope:
+            apply_rope_inplace(
+                query,
+                key,
+                self.rotary_emb.cos_sin_cache,
+                positions,
+                is_neox=self.rotary_emb.is_neox_style,
+                rope_dim=self.rope_head_dim,
+                head_dim=self.head_dim,
+            )
             query = rearrange(query, "l (h d) -> l h d", d=self.head_dim)
-            q_rope, _ = torch.split(
-                query, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
-            )
-            key, _ = self.wk(x)
-            key = self.k_norm(key)
-            k_rope, _ = torch.split(
-                key, [self.rope_head_dim, self.head_dim - self.rope_head_dim], dim=-1
-            )
+        else:
+            q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
 
-        q_rope, k_rope = self.rotary_emb(positions, q_rope, k_rope)
-
-        self._update_rope_guarded(query[..., : self.rope_head_dim], q_rope)
-        self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
+            self._update_rope_guarded(query[..., : self.rope_head_dim], q_rope)
+            self._update_rope_guarded(key[..., : self.rope_head_dim], k_rope)
 
         if enable_dual_stream:
             current_stream = torch.cuda.current_stream()
@@ -1449,13 +1505,24 @@ class Indexer(MultiPlatformOp):
                 x_for_gate = x
 
             if is_in_piecewise_cuda_graph():
-                weights = logits_head_gate_pcg(
-                    x_for_gate,
-                    self.weights_proj.weight,
-                    self.n_heads**-0.5,
-                    self.softmax_scale,
-                    q_scale,
-                )
+                if torch.compiler.is_compiling():
+                    weights = logits_head_gate_pcg_matmul(
+                        x_for_gate,
+                        self.weights_proj.weight,
+                    )
+                    weights = (
+                        weights.unsqueeze(-1)
+                        * q_scale
+                        * (self.n_heads**-0.5 * self.softmax_scale)
+                    )
+                else:
+                    weights = logits_head_gate_pcg(
+                        x_for_gate,
+                        self.weights_proj.weight,
+                        self.n_heads**-0.5,
+                        self.softmax_scale,
+                        q_scale,
+                    )
             else:
                 weights = self._get_logits_head_gate(x_for_gate, q_scale)
 

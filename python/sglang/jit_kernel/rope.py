@@ -118,21 +118,29 @@ def apply_rope_inplace(
     *,
     is_neox: bool,
     rope_dim: int = 0,
+    head_dim: int = 0,
 ) -> None:
     """
     Fused inplace rotary position embedding for query and key tensors.
 
     Args:
-        q: Query tensor of shape [num_tokens, num_qo_heads, rope_dim].
-        k: Key tensor of shape [num_tokens, num_kv_heads, rope_dim].
+        q: Query tensor of shape [num_tokens, num_qo_heads, rope_dim], or a
+            full tensor with trailing dimension divisible by ``head_dim``.
+        k: Key tensor of shape [num_tokens, num_kv_heads, rope_dim], or a full
+            tensor with trailing dimension divisible by ``head_dim``.
         cos_sin_cache: Cosine/sine cache of shape [max_position, rope_dim],
             where the first half along dim=-1 is cos and the second half is sin.
             Must be float32.
         positions: Position indices of shape [num_tokens], int32 or int64.
         is_neox: Whether to use GPT-NeoX style (True) or GPT-J interleaved style (False).
         rope_dim: Rotary embedding dimension. Defaults to cos_sin_cache.size(-1).
+        head_dim: If non-zero, q/k are treated as full tensors and only the
+            leading ``rope_dim`` channels of each ``head_dim`` group are rotated.
     """
     rope_dim = rope_dim or cos_sin_cache.size(-1)
+    if head_dim:
+        q = q.view(q.shape[0], -1, head_dim)[..., :rope_dim]
+        k = k.view(k.shape[0], -1, head_dim)[..., :rope_dim]
     module = _jit_fused_rope_module(is_neox, rope_dim, q.dtype)
     module.run_rope(q, k, cos_sin_cache, positions)
 
