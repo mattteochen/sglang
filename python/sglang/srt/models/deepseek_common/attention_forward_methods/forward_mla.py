@@ -33,6 +33,8 @@ if TYPE_CHECKING:
 if _is_cuda:
     from sgl_kernel import bmm_fp8 as _raw_bmm_fp8
 
+    from sglang.srt.compilation.compilation_config import register_split_op
+    from sglang.srt.layers.radix_attention import unified_attention_with_output
     from sglang.srt.utils.custom_op import register_custom_op
 
     # TODO(yuwei): remove this wrapper after sgl-kernel registers its own fake/meta impl
@@ -57,6 +59,66 @@ if _is_cuda:
             )
         _bmm_fp8_op(A, B, out, A_scale, B_scale)
         return out
+
+    # NSA + MLA composite split op.
+    #
+    # In the NSA-regular prefill path the q-side bf16 BMM (`q_nope @ w_kc`) sits
+    # between two existing PCG split ops: `k_cache_and_topk_result` (indexer)
+    # and `unified_attention_with_output` (attention). Left as a normal FX node,
+    # the BMM lands in its own 1-kernel compile subgraph whose ~7us
+    # cudaGraphLaunch overhead dominates the ~5us kernel. Even if we exposed
+    # the BMM as its own split op, the FX dispatcher + custom-op hops *between*
+    # the bmm and the attention still cost a few microseconds per layer.
+    #
+    # This composite folds the bmm AND the attention into a single eager
+    # split-op region, so the FX graph between the indexer split and the
+    # downstream block looks like:
+    #
+    #     [submod_0 (upstream)] -> [mla_bmm_then_unified_attention] -> [submod_N (downstream)]
+    #
+    # i.e. one boundary in/one boundary out, no in-between view-only subgraph,
+    # and no Python dispatcher hop between the bmm and the attention.
+    #
+    # Contract (caller is responsible):
+    #   * `q_nope_out_buf` is shape (H, M, kv_lora_rank), pre-allocated upstream
+    #     so it lives in the PCG memory pool.
+    #   * `q_nope_out_view` is `q_nope_out_buf.transpose(0, 1)` (same storage,
+    #     (M, H, kv_lora_rank) layout) and is the q-input to the attention.
+    #   * `attn_output_buf` is shape (M, num_local_heads * kv_lora_rank),
+    #     pre-allocated upstream, also in the PCG memory pool.
+    @register_custom_op(mutates_args=["q_nope_out_buf", "attn_output_buf"])
+    @register_split_op()
+    def mla_bmm_then_unified_attention(
+        q_nope_t: torch.Tensor,
+        w_kc: torch.Tensor,
+        q_nope_out_buf: torch.Tensor,
+        q_nope_out_view: torch.Tensor,
+        k_nope: torch.Tensor,
+        attn_output_buf: torch.Tensor,
+        save_kv_cache: bool,
+        layer_id: int,
+        q_pe: torch.Tensor,
+        k_pe: torch.Tensor,
+        cos_sin_cache: Optional[torch.Tensor] = None,
+        is_neox: Optional[bool] = None,
+        llama_4_scaling: Optional[torch.Tensor] = None,
+        topk_indices: Optional[torch.Tensor] = None,
+    ) -> None:
+        torch.bmm(q_nope_t, w_kc, out=q_nope_out_buf)
+        unified_attention_with_output(
+            q_nope_out_view,
+            k_nope,
+            k_nope,
+            attn_output_buf,
+            save_kv_cache,
+            layer_id,
+            q_rope=q_pe,
+            k_rope=k_pe,
+            cos_sin_cache=cos_sin_cache,
+            is_neox=is_neox,
+            llama_4_scaling=llama_4_scaling,
+            topk_indices=topk_indices,
+        )
 
 
 if _use_aiter:
@@ -84,6 +146,37 @@ class DeepseekMLAForwardMixin:
             get_global_server_args().flashinfer_mla_disable_ragged
         )
 
+    def _can_fuse_bmm_into_attention(
+        self: DeepseekV2AttentionMLA, forward_batch: ForwardBatch
+    ) -> bool:
+        """Whether this layer's q-bmm + attention can be merged into one
+        `mla_bmm_then_unified_attention` PCG split-op region.
+
+        Conditions match the exact code path we observed in the GLM-5-FP8
+        Blackwell prefill trace where the un-fused q-bmm becomes a 1-kernel
+        CUDA graph. Any other path falls back to the original code unchanged.
+        """
+        if not (_is_cuda and is_in_piecewise_cuda_graph()):
+            return False
+        if not self.use_nsa:
+            return False
+        if self.use_deep_gemm_bmm or _is_hip:
+            return False
+        # Only the bf16 fallback BMM is the one that gets isolated into a
+        # 1-kernel graph; the fp8 branch already runs inside larger fused
+        # subgraphs.
+        if self.w_kc.dtype == torch.float8_e4m3fn:
+            return False
+        # Composite call replaces self.attn_mqa(...) which lives inside
+        # FORWARD_ABSORB_CORE_ATTENTION_BACKENDS standard branch.
+        if self.current_attention_backend not in FORWARD_ABSORB_CORE_ATTENTION_BACKENDS:
+            return False
+        # The fused QK-rope-cache path replaces both the BMM input layout and
+        # the attention call itself; it is incompatible with this composite.
+        if self._skip_rope_for_nsa_tilelang_fused() and self.rotary_emb is not None:
+            return False
+        return True
+
     def forward_absorb_prepare(
         self: DeepseekV2AttentionMLA,
         positions: torch.Tensor,
@@ -97,6 +190,15 @@ class DeepseekMLAForwardMixin:
 
         q_lora = None
         topk_indices = None
+        # State for the `mla_bmm_then_unified_attention` composite split op.
+        # When the gate fires we hoist q.split / k_pe / output-buffer alloc
+        # *above* the indexer so that NO FX node sits between any pair of
+        # split ops; otherwise these stay None and we take the original code
+        # path (separate bf16 bmm + separate `self.attn_mqa(...)` call).
+        q_nope_out_buf: Optional[torch.Tensor] = None
+        q_nope_out_view: Optional[torch.Tensor] = None
+        q_nope_t: Optional[torch.Tensor] = None
+        attn_output_buf: Optional[torch.Tensor] = None
         if self.q_lora_rank is not None:
             q, latent_cache = (
                 get_attn_tp_context()
@@ -197,6 +299,43 @@ class DeepseekMLAForwardMixin:
             else:
                 k_nope = k_nope.unsqueeze(1)
                 q = self.q_b_proj(q)[0].view(-1, self.num_local_heads, self.qk_head_dim)
+
+                # Stage A gate: when we can fuse the q-bmm + attention into
+                # one split-op region, all of these tensors MUST be available
+                # to the downstream split op AND must be FX nodes upstream of
+                # the indexer split op. Hoist them here so the only FX nodes
+                # between the indexer split and the composite split are... none.
+                if self._can_fuse_bmm_into_attention(forward_batch):
+                    q_nope, q_pe = q.split(
+                        [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+                    )
+                    k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+                    q_nope_out_buf = q.new_empty(
+                        (
+                            self.num_local_heads,
+                            q.shape[0],
+                            self.kv_lora_rank,
+                        )
+                    )
+                    # Transposed view of the same storage; mla_bmm_then_unified_attention
+                    # mutates `q_nope_out_buf` (H, M, K) and the attention reads
+                    # `q_nope_out_view` (M, H, K).
+                    q_nope_out_view = q_nope_out_buf.transpose(0, 1)
+                    # `unified_attention_with_output` mutates this buffer; pre-
+                    # allocate so it lives in the PCG memory pool and no alloc
+                    # node sits between the indexer split and the composite split.
+                    attn_output_buf = q.new_empty(
+                        (
+                            q.shape[0],
+                            self.num_local_heads * self.kv_lora_rank,
+                        )
+                    )
+                    # Hoist `q_nope.transpose(0, 1)` too; if we left it inline at
+                    # the composite call site (`...(q_nope.transpose(0, 1), ...)`)
+                    # the partitioner would produce a 1-view-only subgraph
+                    # between the indexer split and the composite split.
+                    q_nope_t = q_nope.transpose(0, 1)
+
                 if q_lora is not None:
                     if not self.skip_topk or prev_topk_indices is None:
                         topk_indices = self.indexer(
@@ -216,10 +355,21 @@ class DeepseekMLAForwardMixin:
             k_nope = latent_cache[..., : self.kv_lora_rank]
             k_nope = self.kv_a_layernorm(k_nope).unsqueeze(1)
 
-        q_nope, q_pe = q.split([self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1)
-        k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
+        if q_nope_out_buf is None:
+            # Composite path already computed these upstream so no FX node
+            # sits between the indexer split and the composite split.
+            q_nope, q_pe = q.split(
+                [self.qk_nope_head_dim, self.qk_rope_head_dim], dim=-1
+            )
+            k_pe = latent_cache[..., self.kv_lora_rank :].unsqueeze(1)
 
-        if self.use_deep_gemm_bmm:
+        if q_nope_out_buf is not None:
+            # bf16 BMM runs inside the composite split op in forward_absorb_core.
+            # q_nope_out_view aliases q_nope_out_buf in (M, H, kv_lora_rank)
+            # layout, which is exactly what the downstream code expects (so we
+            # also skip the trailing transpose below).
+            q_nope_out = q_nope_out_view
+        elif self.use_deep_gemm_bmm:
             q_nope_val, q_nope_scale, masked_m, expected_m, aligned_m = (
                 per_token_group_quant_mla_deep_gemm_masked_fp8(q_nope.transpose(0, 1))
             )
@@ -297,7 +447,11 @@ class DeepseekMLAForwardMixin:
         else:
             q_nope_out = torch.bmm(q_nope.transpose(0, 1), self.w_kc)
 
-        q_nope_out = q_nope_out.transpose(0, 1)
+        if q_nope_out_buf is None:
+            # Composite path already set q_nope_out = q_nope_out_view which is
+            # already in (M, H, kv_lora_rank) layout; only the H-other paths
+            # above produce (H, M, kv_lora_rank) and need the trailing transpose.
+            q_nope_out = q_nope_out.transpose(0, 1)
 
         skip_rope_for_nsa_tilelang_fused = self._skip_rope_for_nsa_tilelang_fused()
         if (
@@ -324,6 +478,10 @@ class DeepseekMLAForwardMixin:
             positions,
             topk_indices,
             llama_4_scaling,
+            # Composite split-op state (all None when the gate does not fire).
+            q_nope_t,
+            q_nope_out_buf,
+            attn_output_buf,
         )
 
     def forward_absorb_core(
@@ -337,6 +495,9 @@ class DeepseekMLAForwardMixin:
         positions,
         topk_indices,
         llama_4_scaling,
+        q_nope_t: Optional[torch.Tensor] = None,
+        q_nope_out_buf: Optional[torch.Tensor] = None,
+        attn_output_buf: Optional[torch.Tensor] = None,
     ):
         save_kv_cache = True
 
@@ -390,20 +551,44 @@ class DeepseekMLAForwardMixin:
                         "is_neox": self.rotary_emb.is_neox_style,
                         "llama_4_scaling": llama_4_scaling,
                     }
-                attn_output = self.attn_mqa(
-                    q_nope_out,
-                    k_nope,
-                    k_nope,
-                    forward_batch,
-                    q_rope=q_pe,
-                    k_rope=k_pe,
-                    **extra_args,
-                    **(
-                        dict(topk_indices=topk_indices)
-                        if topk_indices is not None
-                        else {}
-                    ),
-                )
+                if q_nope_out_buf is not None:
+                    # Stage A composite: fold the q-side bf16 BMM and the
+                    # unified attention call into ONE split-op region.
+                    # `q_nope_out` here is `q_nope_out_view` from prepare
+                    # (transposed alias of q_nope_out_buf), which is what the
+                    # attention will read after the bmm has filled the buffer.
+                    mla_bmm_then_unified_attention(
+                        q_nope_t,
+                        self.w_kc,
+                        q_nope_out_buf,
+                        q_nope_out,
+                        k_nope,
+                        attn_output_buf,
+                        save_kv_cache,
+                        self.layer_id,
+                        q_pe,
+                        k_pe,
+                        cos_sin_cache=extra_args.get("cos_sin_cache"),
+                        is_neox=extra_args.get("is_neox"),
+                        llama_4_scaling=extra_args.get("llama_4_scaling"),
+                        topk_indices=topk_indices,
+                    )
+                    attn_output = attn_output_buf
+                else:
+                    attn_output = self.attn_mqa(
+                        q_nope_out,
+                        k_nope,
+                        k_nope,
+                        forward_batch,
+                        q_rope=q_pe,
+                        k_rope=k_pe,
+                        **extra_args,
+                        **(
+                            dict(topk_indices=topk_indices)
+                            if topk_indices is not None
+                            else {}
+                        ),
+                    )
         else:
             if _use_aiter_gfx95:
                 cos = self.rotary_emb.cos_cache

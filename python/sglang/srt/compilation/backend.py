@@ -4,7 +4,6 @@
 import ast
 import dataclasses
 import logging
-import operator
 import os
 import pprint
 import time
@@ -218,67 +217,6 @@ class SplitItem:
     graph: fx.GraphModule
 
 
-# ---------------------------------------------------------------------------
-# Whitelist of FX-node targets we can safely fold into an adjacent eager
-# (split-op) submodule. The motivation: when only a small amount of compute
-# sits between two split ops, that compute often ends up in a 1-or-2-kernel
-# CUDA graph whose host overhead exceeds its benefit. Folding those nodes
-# into the surrounding eager submodule (a) eliminates the tiny CUDA graph,
-# (b) lets the partitioner merge the two split ops into a single
-# ``GraphModule.__call__``, and (c) collapses the wrapper-graph
-# ``getitem`` tuple-unpacks that would otherwise sit between two eager
-# submodule calls.
-#
-# ``split_graph`` runs on the *Dynamo*-level FX graph (before
-# AOTAutograd), so node targets fall into three buckets:
-#
-#   * ``call_function`` - a Python callable (``operator.getitem``,
-#     ``torch.bmm``, ...). Whitelisted in
-#     ``_MERGEABLE_CALL_FUNCTION_TARGETS``.
-#   * ``call_method`` - a string method name (``"view"``,
-#     ``"transpose"``, ``"new_empty"``, ...). Whitelisted in
-#     ``_MERGEABLE_METHOD_NAMES``.
-#   * ``get_attr`` - model parameter/buffer reads. Always foldable:
-#     they only materialise an attribute and launch no work.
-#
-# When an out-flowing fresh allocation (``new_empty``) gets folded into
-# an eager submodule its ``data_ptr()`` would drift across CUDA-graph
-# replays. ``_hoist_eager_buffer_allocations`` rewrites every such
-# alloc to read from a pre-allocated persistent buffer so the address
-# is stable by construction.
-# ---------------------------------------------------------------------------
-# Kept intentionally minimal: only the targets actually seen sitting
-# between two split ops in shipped split-op layouts (today, strictly the
-# MLA prefill / decode bridge). Extend these sets if a new bridge pattern
-# starts producing tiny standalone compiled submodules between split ops.
-_MERGEABLE_CALL_FUNCTION_TARGETS: frozenset = frozenset(
-    {
-        operator.getitem,
-        torch.bmm,
-    }
-)
-_MERGEABLE_METHOD_NAMES: frozenset[str] = frozenset(
-    {
-        "split",
-        "transpose",
-        "unsqueeze",
-        "view",
-        "new_empty",
-    }
-)
-
-
-def _is_mergeable_node(node: fx.Node) -> bool:
-    """Whether ``node`` can be folded into an adjacent eager submodule."""
-    if node.op == "call_function":
-        return node.target in _MERGEABLE_CALL_FUNCTION_TARGETS
-    if node.op == "call_method":
-        return node.target in _MERGEABLE_METHOD_NAMES
-    if node.op == "get_attr":
-        return True
-    return False
-
-
 def split_graph(
     graph: fx.GraphModule, ops: list[str]
 ) -> tuple[fx.GraphModule, list[SplitItem]]:
@@ -289,46 +227,26 @@ def split_graph(
     # State machine that walks the FX nodes in original order and decides
     # which ``subgraph_id`` each node belongs to.
     #
-    # The base policy is: every split-op call lives in its own eager
-    # submodule; every other node lives in the surrounding compiled
-    # submodule.
+    # Base policy: every split-op call lives in its own eager submodule;
+    # every other node lives in the surrounding compiled submodule.
     #
-    # The merge policy on top is: whenever we are still "in the wake of"
-    # a split op (i.e. since the last split op every intervening node has
-    # passed ``_is_mergeable_node``), any subsequent split op joins the
-    # same eager submodule as the previous one, and the whitelisted
-    # nodes in between are folded into that same eager submodule too.
-    #
-    # Concretely this collapses patterns like
-    #
-    #     split_op_A -> [views / bmm / new_empty / ...] -> split_op_B
-    #
-    # into one eager submodule containing all of them, eliminating both
-    # the in-between compiled submodule (and its potential tiny CUDA
-    # graph) and the extra ``GraphModule.__call__`` host hop between the
-    # two split ops.
+    # On top of that, two strictly adjacent split-op calls (no FX node
+    # between them) share a single eager submodule. This collapses the
+    # tiny ``GraphModule.__call__`` host hop that would otherwise sit
+    # between back-to-back split ops (e.g. NSA indexer immediately
+    # followed by the MLA composite split op).
     last_split_id: Optional[int] = None
-    pending_mergeable: list[fx.Node] = []
     num_adjacent_split_op_merges = 0
-    num_mergeable_nodes_absorbed = 0
     for node in graph.graph.nodes:
         if node.op in ("output", "placeholder"):
             continue
         is_split_op = node.op == "call_function" and str(node.target) in ops
         if is_split_op:
             if last_split_id is not None:
-                # Strictly adjacent or whitelist-bridged split op. Reuse
-                # the previous eager submodule id and fold all bridging
-                # nodes into it. Order is preserved by
-                # ``keep_original_order=True`` below, so any in-place
-                # mutation by the first call is correctly visible to the
-                # bridging nodes and the second call (e.g. an indexer
-                # mutating ``topk_result`` followed by an attention call
-                # that reads it via ``topk_indices``).
-                for p in pending_mergeable:
-                    node_to_subgraph_id[p] = last_split_id
-                num_mergeable_nodes_absorbed += len(pending_mergeable)
-                pending_mergeable.clear()
+                # Strictly adjacent split op: reuse the previous eager
+                # submodule id. ``keep_original_order=True`` below
+                # preserves FX order, so any in-place mutation by the
+                # first call is correctly visible to the second one.
                 node_to_subgraph_id[node] = last_split_id
                 num_adjacent_split_op_merges += 1
             else:
@@ -337,42 +255,16 @@ def split_graph(
                 split_op_graphs.append(subgraph_id)
                 last_split_id = subgraph_id
                 subgraph_id += 1
-            # Stay merge-eligible: a subsequent split op (with only
-            # mergeable nodes between) should still fold.
         else:
-            if last_split_id is not None and _is_mergeable_node(node):
-                # Provisionally hold this node; we don't know yet whether
-                # the next split op is reachable through whitelist-only
-                # nodes. If it is, this node will be absorbed into the
-                # eager submodule above; if not, we flush it into the
-                # next compiled submodule below.
-                pending_mergeable.append(node)
-            else:
-                if last_split_id is not None:
-                    # Flush any pending nodes into the next compiled
-                    # submodule (they all sit before this non-mergeable
-                    # node in FX order, so they belong to the same
-                    # subgraph_id as it).
-                    for p in pending_mergeable:
-                        node_to_subgraph_id[p] = subgraph_id
-                    pending_mergeable.clear()
-                    last_split_id = None
-                node_to_subgraph_id[node] = subgraph_id
+            # Any non-split node breaks the merge run.
+            last_split_id = None
+            node_to_subgraph_id[node] = subgraph_id
 
-    # Tail: if the FX node stream ended on a run of mergeable nodes after
-    # a split op, those nodes form a trailing compiled subgraph of their
-    # own (there is no following node to share with).
-    if pending_mergeable:
-        for p in pending_mergeable:
-            node_to_subgraph_id[p] = subgraph_id
-        pending_mergeable.clear()
-
-    if num_adjacent_split_op_merges or num_mergeable_nodes_absorbed:
+    if num_adjacent_split_op_merges:
         logger.info(
             "split_graph merged %d adjacent split-op call(s) into shared "
-            "eager submodules and absorbed %d whitelisted bridging node(s)",
+            "eager submodules",
             num_adjacent_split_op_merges,
-            num_mergeable_nodes_absorbed,
         )
 
     # `keep_original_order` is important!
@@ -501,185 +393,6 @@ def set_model_tag(tag: str):
         model_tag = old_tag
 
 
-# ---------------------------------------------------------------------------
-# Eager-submodule allocation hoisting
-# ---------------------------------------------------------------------------
-# After ``split_graph`` (and the whitelist-based merging it performs), an
-# eager submodule may end up containing a fresh-tensor allocation - most
-# commonly the attention output buffer:
-#
-#     output = q.new_empty((s72, 4096))
-#     unified_attention_with_output(..., output, ...)   # mutates in-place
-#     ... returned to the wrapper graph, consumed by the next compiled
-#     submodule as input.
-#
-# That ``output`` tensor flows into a captured CUDA graph downstream.
-# PCG replay reads straight from the ``data_ptr()`` recorded at capture,
-# so the eager allocation must land at the same address every forward.
-# The CUDA caching allocator is *not* guaranteed to provide that, and in
-# practice the first replay does drift versus capture.
-#
-# Because the set of captured shapes is finite and known at compile time
-# (``compile_config.get_capture_sizes()``), we can statically resolve the
-# problem: pre-allocate one max-sized buffer per drifting alloc as a
-# persistent attribute on the eager submodule, and rewrite the FX graph
-# to read ``buf.narrow(sym_axis, 0, runtime_dim)`` instead of allocating
-# fresh. ``narrow`` returns a view at the same ``data_ptr()`` as the
-# underlying buffer (offset 0), so every replay observes the captured
-# address regardless of token count.
-# ---------------------------------------------------------------------------
-
-def _node_reaches(start: fx.Node, targets: set[fx.Node]) -> bool:
-    """Return True if any of ``targets`` is a transitive user of ``start``."""
-    if start in targets:
-        return True
-    seen: set[fx.Node] = {start}
-    stack: list[fx.Node] = list(start.users)
-    while stack:
-        n = stack.pop()
-        if n in seen:
-            continue
-        seen.add(n)
-        if n in targets:
-            return True
-        stack.extend(n.users)
-    return False
-
-
-def _classify_alloc_shape(
-    size_arg: Any,
-) -> Optional[tuple[int, list[Any]]]:
-    """Pick the single dynamic dim of an alloc shape.
-
-    Returns ``(sym_axis, dims_with_sym_node_at_sym_axis)`` where the dim
-    at ``sym_axis`` is an ``fx.Node`` and every other dim is a Python
-    int. Returns ``None`` if more than one (or zero) dims are dynamic.
-    """
-    if not isinstance(size_arg, (list, tuple)):
-        return None
-    sym_axis: Optional[int] = None
-    dims: list[Any] = []
-    for i, d in enumerate(size_arg):
-        if isinstance(d, fx.Node):
-            if sym_axis is not None:
-                return None  # multiple sym dims not supported
-            sym_axis = i
-            dims.append(d)
-        elif isinstance(d, int):
-            dims.append(d)
-        else:
-            return None
-    if sym_axis is None:
-        return None
-    return sym_axis, dims
-
-
-def _replace_alloc_with_static_buffer(
-    submod: fx.GraphModule, alloc: fx.Node, max_capture_size: int
-) -> bool:
-    """Rewrite ``alloc`` to read from a pre-allocated persistent buffer.
-
-    Returns ``True`` on success, ``False`` if the node shape is one we
-    don't handle yet (so the caller can move on without aborting).
-    """
-    example = alloc.meta.get("example_value")
-    if example is None or not isinstance(example, torch.Tensor):
-        return False
-    if example.device.type != "cuda":
-        return False
-    # For ``t.new_empty(size, ...)`` Dynamo emits ``args = (t, size)``.
-    if len(alloc.args) < 2:
-        return False
-    classified = _classify_alloc_shape(alloc.args[1])
-    if classified is None:
-        return False
-    sym_axis, dims = classified
-    sym_node = dims[sym_axis]
-    assert isinstance(sym_node, fx.Node)
-
-    buf_shape = list(dims)
-    buf_shape[sym_axis] = max_capture_size
-    buf = torch.empty(tuple(buf_shape), dtype=example.dtype, device=example.device)
-
-    buf_name = f"_pcg_hoisted_buf_{alloc.name}"
-    submod.register_buffer(buf_name, buf, persistent=False)
-
-    g = submod.graph
-    with g.inserting_before(alloc):
-        attr_node = g.get_attr(buf_name)
-        attr_node.meta["example_value"] = buf
-        view_node = g.call_method(
-            "narrow", args=(attr_node, sym_axis, 0, sym_node)
-        )
-        view_node.meta["example_value"] = example
-    alloc.replace_all_uses_with(view_node)
-    g.erase_node(alloc)
-    return True
-
-
-def _hoist_outflowing_allocs_in_submod(
-    submod: fx.GraphModule, max_capture_size: int
-) -> int:
-    g = submod.graph
-    output_node = next(n for n in g.nodes if n.op == "output")
-    output_set: set[fx.Node] = set()
-    output_args = output_node.args[0] if output_node.args else ()
-    if not isinstance(output_args, (list, tuple)):
-        output_args = (output_args,)
-    for a in output_args:
-        if isinstance(a, fx.Node):
-            output_set.add(a)
-    if not output_set:
-        return 0
-
-    to_hoist: list[fx.Node] = []
-    for node in list(g.nodes):
-        # Only ``t.new_empty(...)`` is safe to hoist: its contract is "any
-        # contents", so reusing the same physical slot across replays
-        # preserves semantics (downstream always writes before reads).
-        # ``new_zeros`` / ``new_ones`` / ``new_full`` would additionally
-        # require a runtime fill we don't synthesize.
-        if node.op != "call_method" or node.target != "new_empty":
-            continue
-        if _node_reaches(node, output_set):
-            to_hoist.append(node)
-
-    hoisted = 0
-    for alloc in to_hoist:
-        if _replace_alloc_with_static_buffer(submod, alloc, max_capture_size):
-            hoisted += 1
-    if hoisted:
-        g.lint()
-        submod.recompile()
-    return hoisted
-
-
-def _hoist_eager_buffer_allocations(
-    split_gm: fx.GraphModule,
-    piecewise_graphs: list[SplitItem],
-    max_capture_size: int,
-) -> tuple[int, int]:
-    """Hoist out-flowing allocs in every eager submodule.
-
-    Returns ``(num_eager_submods_touched, num_allocs_replaced)``.
-    """
-    if not torch.cuda.is_available():
-        return 0, 0
-    if max_capture_size <= 0:
-        return 0, 0
-    touched = 0
-    replaced = 0
-    for item in piecewise_graphs:
-        if not item.is_splitting_graph:
-            continue
-        submod = getattr(split_gm, item.submod_name)
-        n = _hoist_outflowing_allocs_in_submod(submod, max_capture_size)
-        if n:
-            touched += 1
-            replaced += n
-    return touched, replaced
-
-
 class SGLangBackend:
 
     graph_pool: Any
@@ -770,26 +483,6 @@ class SGLangBackend:
             self.compile_config,
             self,
         ).run(*example_inputs)
-
-        # Stabilise eager-submodule tensors that flow into downstream
-        # captured CUDA graphs by replacing in-eager fresh allocations
-        # with views of pre-allocated persistent buffers. Done after
-        # ``PiecewiseCompileInterpreter.run`` so the rewrite runs on
-        # real tensors (not under fake mode), and before the wrapper
-        # graph is returned so the captures see the rewritten forwards.
-        capture_sizes = self.compile_config.get_capture_sizes()
-        if capture_sizes:
-            touched, replaced = _hoist_eager_buffer_allocations(
-                self.split_gm, self.piecewise_graphs, max(capture_sizes)
-            )
-            if replaced:
-                logger.info(
-                    "Hoisted %d out-flowing allocation(s) across %d eager "
-                    "submodule(s) to persistent buffers (stable across "
-                    "CUDA-graph replays)",
-                    replaced,
-                    touched,
-                )
 
         rank = torch.distributed.get_rank()
 
