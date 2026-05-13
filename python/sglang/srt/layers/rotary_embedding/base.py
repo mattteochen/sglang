@@ -6,6 +6,7 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple, Union
 
 import torch
 
+from sglang.srt.compilation.piecewise_context_manager import is_in_piecewise_cuda_graph
 from sglang.srt.layers.rotary_embedding.utils import apply_rotary_emb
 from sglang.srt.layers.utils import MultiPlatformOp
 from sglang.srt.server_args import get_global_server_args
@@ -105,6 +106,14 @@ class RotaryEmbedding(MultiPlatformOp):
                 apply_rotary_emb
             )
         self.position_cos, self.position_sin = None, None
+
+    def enter_torch_compile(self, num_tokens: int):
+        # RoPE modules can be cached and shared with the NSA indexer; under PCG
+        # the indexer split-op should keep the fused CUDA RoPE path.
+        # TODO: remove this once NSA indexer has a compile-friendly native path.
+        if is_in_piecewise_cuda_graph():
+            return
+        super().enter_torch_compile(num_tokens)
 
     def _match_cos_sin_cache_dtype(self, query: torch.Tensor) -> None:
         # __setattr__ in nn.Module (called by `self.cos_sin_cache = ...`)

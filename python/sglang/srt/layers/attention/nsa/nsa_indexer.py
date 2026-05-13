@@ -399,6 +399,18 @@ class Indexer(MultiPlatformOp):
         self.scale_fmt = scale_fmt
         self.softmax_scale = self.head_dim**-0.5
 
+    def _skip_torch_compile_children_in_pcg(self) -> bool:
+        # The PCG split-op body calls child MultiPlatformOps (LayerNorm/RoPE)
+        # directly; switching them to forward_native regresses the tuned CUDA path.
+        # TODO: replace this opt-out with a compile-friendly NSA indexer path.
+        return True
+
+    def _resolve_torch_compile_forward_method(self, num_tokens: int):
+        # The NSA indexer has no generic native path. Keep the selected
+        # platform implementation so torch.compile can trace its tensor
+        # plumbing while custom ops remain opaque graph nodes.
+        return self._forward_method
+
     @contextlib.contextmanager
     def _with_real_sm_count(self):
         # When pipeline parallelism is enabled, each PP rank initiates a recv operation after the _pp_launch_batch

@@ -32,6 +32,7 @@ from sglang.srt.compilation.compile import install_torch_compiled
 from sglang.srt.compilation.piecewise_context_manager import (
     enable_piecewise_cuda_graph,
     enable_piecewise_cuda_graph_compile,
+    is_in_piecewise_cuda_graph,
     set_forward_context,
     set_pcg_capture_stream,
 )
@@ -101,11 +102,22 @@ def freeze_gc(enable_cudagraph_gc: bool):
 
 def _to_torch(model: torch.nn.Module, reverse: bool, num_tokens: int):
     for sub in model._modules.values():
+        skip_children = False
         if isinstance(sub, MultiPlatformOp):
             if reverse:
                 sub.leave_torch_compile()
             else:
                 sub.enter_torch_compile(num_tokens=num_tokens)
+            skip_torch_compile_children = getattr(
+                sub, "_skip_torch_compile_children_in_pcg", None
+            )
+            skip_children = (
+                is_in_piecewise_cuda_graph()
+                and skip_torch_compile_children is not None
+                and skip_torch_compile_children()
+            )
+        if skip_children:
+            continue
         if isinstance(sub, torch.nn.Module):
             _to_torch(sub, reverse, num_tokens)
 
