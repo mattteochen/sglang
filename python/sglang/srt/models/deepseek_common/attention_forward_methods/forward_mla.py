@@ -54,6 +54,20 @@ _SGLANG_EXPERIMENTAL_LORA_OPTI = envs.SGLANG_EXPERIMENTAL_LORA_OPTI.get()
 if TYPE_CHECKING:
     from sglang.srt.models.deepseek_v2 import DeepseekV2AttentionMLA
 
+
+@torch.compile(
+    dynamic=None,
+    options={"triton.enable_pdl": True, "combo_kernels": True},
+)
+def _native_qk_rmsnorm(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    q_norm,
+    k_norm,
+):
+    return q_norm.forward_native(q), k_norm.forward_native(k)
+
+
 if _is_cuda:
     from sgl_kernel import bmm_fp8 as _raw_bmm_fp8
 
@@ -228,8 +242,16 @@ class DeepseekMLAForwardMixin:
                             self.kv_a_layernorm.variance_epsilon,
                         )
                     else:
-                        q = self.q_a_layernorm(q)
-                        k_nope = self.kv_a_layernorm(k_nope)
+                        if _is_cuda and q.is_cuda and k_nope.is_cuda:
+                            q, k_nope = _native_qk_rmsnorm(
+                                q,
+                                k_nope,
+                                self.q_a_layernorm,
+                                self.kv_a_layernorm,
+                            )
+                        else:
+                            q = self.q_a_layernorm(q)
+                            k_nope = self.kv_a_layernorm(k_nope)
 
             # q_lora needed by indexer
             if self.use_dsa:
