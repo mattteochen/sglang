@@ -69,7 +69,7 @@ if TYPE_CHECKING:
 
 
 @torch.compile(
-    dynamic=None,
+    dynamic=False,
     options={"triton.enable_pdl": True, "combo_kernels": True},
 )
 def _native_qk_rmsnorm(
@@ -326,7 +326,14 @@ class DeepseekMLAForwardMixin:
                             self.kv_a_layernorm.variance_epsilon,
                         )
                     else:
-                        if _is_cuda and q.is_cuda and k_nope.is_cuda:
+                        # Inductor fusion is used only for static shapes under BCG
+                        if (
+                            _is_cuda
+                            and q.is_cuda
+                            and k_nope.is_cuda
+                            and forward_batch.forward_mode.is_extend()
+                            and is_in_breakable_cuda_graph()
+                        ):
                             q, k_nope = _native_qk_rmsnorm(
                                 q,
                                 k_nope,
