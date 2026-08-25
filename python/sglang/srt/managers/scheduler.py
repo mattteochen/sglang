@@ -305,7 +305,10 @@ from sglang.srt.utils.hf_transformers_utils import (
 )
 from sglang.srt.utils.msgspec_utils import msgspec_to_builtins
 from sglang.srt.utils.numa_utils import get_numa_node_if_available, numa_bind_to_node
-from sglang.srt.utils.nvtx_utils import scheduler_nvtx_method
+from sglang.srt.utils.nvtx_utils import (
+    scheduler_nvtx_method,
+    scheduler_stage_nvtx_method,
+)
 from sglang.srt.utils.tensor_bridge import use_mlx
 from sglang.srt.utils.torch_memory_saver_adapter import TorchMemorySaverAdapter
 from sglang.utils import TypeBasedDispatcher, get_exception_traceback
@@ -3524,7 +3527,7 @@ class Scheduler(
             else:
                 batch.sampling_info = sched_sampling_info
 
-    @scheduler_nvtx_method("scheduler.run_batch")
+    @scheduler_stage_nvtx_method
     def run_batch(
         self,
         batch: ScheduleBatch,

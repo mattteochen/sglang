@@ -18,8 +18,9 @@ A span has two independent emitters:
 * ``record_function`` -- emitted whenever a torch profiler is active, so spans
   show up in torch/Perfetto traces for free (no env, no extra package).
 * ``nvtx`` range -- emitted only when the caller opts in via ``nvtx_enabled``
-  (wired to a per-subsystem ``SGLANG_ENABLE_NVTX_*`` gate) and the ``nvtx``
-  package is importable, for Nsight Systems timelines.
+  (wired to a per-subsystem ``SGLANG_ENABLE_NVTX_*`` gate), for Nsight Systems
+  timelines. The optional ``nvtx`` package provides colors when installed;
+  otherwise the CUDA build of PyTorch provides a dependency-free fallback.
 
 Decoupling the two lets every annotation site -- scheduler stages, batch-overlap
 ops, and the speculative-decoding / forward spans -- share one primitive.
@@ -39,19 +40,34 @@ logger = logging.getLogger(__name__)
 _SCHEDULER_NVTX = envs.SGLANG_ENABLE_NVTX_SCHEDULER.get()
 _OPERATIONS_NVTX = envs.SGLANG_ENABLE_NVTX_OPERATIONS.get()
 
+# CPU-only PyTorch also exposes the ``torch.cuda.nvtx`` stub, but entering one
+# of its ranges raises at runtime. Require a CUDA build before using it as the
+# dependency-free fallback.
+_TORCH_NVTX_AVAILABLE = (
+    getattr(torch.version, "cuda", None) is not None
+    and hasattr(torch.cuda, "nvtx")
+    and hasattr(torch.cuda.nvtx, "range")
+)
 _nvtx_module = None
 if _SCHEDULER_NVTX or _OPERATIONS_NVTX:
     try:
         import nvtx as _nvtx_module  # type: ignore
     except ImportError:
-        logger.warning(
-            "An SGLANG_ENABLE_NVTX_* flag is set, but the `nvtx` package is "
-            "missing. NVTX markers are disabled; torch profiler spans still emit."
-        )
+        if _TORCH_NVTX_AVAILABLE:
+            logger.info(
+                "An SGLANG_ENABLE_NVTX_* flag is set, but the optional `nvtx` "
+                "package is missing. Falling back to torch.cuda.nvtx ranges "
+                "without colors."
+            )
+        else:
+            logger.warning(
+                "An SGLANG_ENABLE_NVTX_* flag is set, but neither the optional "
+                "`nvtx` package nor CUDA-enabled torch.cuda.nvtx is available. "
+                "NVTX markers are disabled."
+            )
 
-NVTX_AVAILABLE = _nvtx_module is not None
-# Per-subsystem nvtx gates: emit nvtx ranges only when the flag is set AND the
-# package is importable. The record_function path is independent of both.
+NVTX_AVAILABLE = _nvtx_module is not None or _TORCH_NVTX_AVAILABLE
+# Per-subsystem nvtx gates. The record_function path is independent of both.
 NVTX_SCHEDULER_ENABLED = _SCHEDULER_NVTX and NVTX_AVAILABLE
 NVTX_OPERATIONS_ENABLED = _OPERATIONS_NVTX and NVTX_AVAILABLE
 
@@ -67,6 +83,12 @@ _NVTX_COLOR_MAP = {
 _NULL_CONTEXT = nullcontext()
 
 
+def _nvtx_range(debug_name: str, color: Optional[str]):
+    if _nvtx_module is not None:
+        return _nvtx_module.annotate(debug_name, color=color)
+    return torch.cuda.nvtx.range(debug_name)
+
+
 @contextmanager
 def _profile_range_impl(
     debug_name: str, color: Optional[str], record: bool, nvtx_enabled: bool
@@ -77,7 +99,7 @@ def _profile_range_impl(
         if nvtx_enabled:
             if color is None:
                 color = _NVTX_COLOR_MAP.get(debug_name)
-            stack.enter_context(_nvtx_module.annotate(debug_name, color=color))
+            stack.enter_context(_nvtx_range(debug_name, color))
         yield
 
 
@@ -111,6 +133,45 @@ def profile_method(
         return wrapper
 
     return decorator
+
+
+def _scheduler_stage_name(batch) -> str:
+    """Return a truthful, stable stage name for a scheduler batch.
+
+    MIXED is kept separate because chunked prefill can contain both extend and
+    decode work. Speculative target verification and draft extension are decode
+    work if this helper is ever reused below the top-level scheduler boundary.
+    """
+    mode = batch.forward_mode
+    if mode.is_decode() or mode.is_target_verify() or mode.is_draft_extend_v2():
+        stage = "decode"
+    elif mode.is_mixed():
+        stage = "mixed"
+    elif mode.is_extend_without_speculative():
+        stage = "prefill"
+    elif mode.is_idle():
+        stage = "idle"
+    elif mode.is_prebuilt():
+        stage = "prebuilt"
+    else:
+        stage = getattr(mode, "name", str(mode)).lower()
+    return f"sglang.stage.{stage}"
+
+
+def scheduler_stage_nvtx_method(func):
+    """Annotate a whole scheduler forward with its dynamic batch stage."""
+
+    @wraps(func)
+    def wrapper(self, batch, *args, **kwargs):
+        record = torch.autograd._profiler_enabled()
+        if not record and not NVTX_SCHEDULER_ENABLED:
+            return func(self, batch, *args, **kwargs)
+        with _profile_range_impl(
+            _scheduler_stage_name(batch), None, record, NVTX_SCHEDULER_ENABLED
+        ):
+            return func(self, batch, *args, **kwargs)
+
+    return wrapper
 
 
 # Pre-bound per-subsystem helpers: torch spans always (under a profiler), nvtx
