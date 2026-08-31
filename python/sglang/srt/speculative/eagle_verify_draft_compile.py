@@ -21,6 +21,16 @@ logger = logging.getLogger(__name__)
 _activation_logged = False
 _variant_keys_logged = set()
 _log_variant_keys = envs.SGLANG_LOG_MTP_VERIFY_DRAFT_COMPILE_VARIANTS.get()
+_variant_log_calls_remaining = 20_000 if _log_variant_keys else 0
+_compile_options = {"triton.cudagraphs": False}
+_combo_kernels_enabled = envs.SGLANG_ENABLE_MTP_VERIFY_DRAFT_COMBO_KERNELS.get()
+if _combo_kernels_enabled:
+    _compile_options.update(
+        {
+            "combo_kernels": True,
+            "benchmark_combo_kernel": True,
+        }
+    )
 
 
 @register_custom_op(
@@ -160,7 +170,7 @@ def _functionalize_simulated_acceptance(
 @torch.compile(
     fullgraph=True,
     dynamic=True,
-    options={"triton.cudagraphs": False},
+    options=_compile_options,
 )
 def _compiled_verify_draft_tensor_graph(
     next_token_logits: torch.Tensor,
@@ -407,7 +417,7 @@ def run_compiled_verify_draft_tensor_graph(
     simulate_real_draft_tokens: bool,
     functional_simulation: bool,
 ) -> EagleVerifyDraftTensorPlan:
-    global _activation_logged
+    global _activation_logged, _variant_log_calls_remaining
     if functional_simulation and draft_token_num != max_tree_depth:
         raise ValueError(
             "Functional simulated acceptance currently requires the top-k=1 "
@@ -422,7 +432,8 @@ def run_compiled_verify_draft_tensor_graph(
             "min(draft_token_num, max_tree_depth), got "
             f"{simulated_accept_len}, {draft_token_num}, {max_tree_depth}."
         )
-    if _log_variant_keys:
+    if _variant_log_calls_remaining > 0:
+        _variant_log_calls_remaining -= 1
         tensor_inputs = (
             next_token_logits,
             temperatures,
@@ -466,6 +477,18 @@ def run_compiled_verify_draft_tensor_graph(
                 variant_key[3],
             )
             _variant_keys_logged.add(variant_key)
+        if _variant_log_calls_remaining == 0:
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            logger.info(
+                "MTP_VERIFY_DRAFT_COMPILE_VARIANT_LOG_COMPLETE rank=%d "
+                "signatures=%d",
+                rank,
+                len(_variant_keys_logged),
+            )
     values = _compiled_verify_draft_tensor_graph(
         next_token_logits,
         temperatures,
@@ -491,11 +514,14 @@ def run_compiled_verify_draft_tensor_graph(
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
         logger.info(
             "MTP_VERIFY_DRAFT_COMPILE_ACTIVE rank=%d tp_world_size=%d "
-            "draft_token_num=%d max_tree_depth=%d",
+            "draft_token_num=%d max_tree_depth=%d functional_simulation=%s "
+            "combo_kernels=%s",
             rank,
             tp_world_size,
             draft_token_num,
             max_tree_depth,
+            functional_simulation,
+            _combo_kernels_enabled,
         )
         _activation_logged = True
     return EagleVerifyDraftTensorPlan(

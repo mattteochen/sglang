@@ -703,6 +703,8 @@ class Envs:
     SGLANG_ENABLE_MTP_VERIFY_DRAFT_COMPILE = EnvBool(False)
     # Replace benchmark simulated-accept mutations with functional tensor ops.
     SGLANG_ENABLE_MTP_VERIFY_DRAFT_FUNCTIONAL_SIM = EnvBool(False)
+    # Let Inductor co-launch compatible kernels in the private EAGLE graph.
+    SGLANG_ENABLE_MTP_VERIFY_DRAFT_COMBO_KERNELS = EnvBool(False)
     # Log first-seen private graph signatures while diagnosing recompilations.
     SGLANG_LOG_MTP_VERIFY_DRAFT_COMPILE_VARIANTS = EnvBool(False)
 
