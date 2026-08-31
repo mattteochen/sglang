@@ -301,9 +301,13 @@ class EagleDraftExtendInput(SpecInput):
     req_pool_indices: torch.Tensor = None
 
     #   - positions: shape `[total_accepted]`.
+    #   - extend_seq_lens_tensor: optional GPU per-request draft width. CUDA
+    #     graph replay replaces this with its staged buffer; eager draft extend
+    #     can consume a precomputed tensor directly.
     #   - bonus_tokens: shape `[bs]`; read post-extend to populate next iter's
     #     `EagleDraftInput.bonus_tokens`.
     positions: Optional[torch.Tensor] = None
+    extend_seq_lens_tensor: Optional[torch.Tensor] = None
     bonus_tokens: Optional[torch.Tensor] = None
 
     capture_hidden_mode: CaptureHiddenMode = CaptureHiddenMode.LAST

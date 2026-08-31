@@ -65,6 +65,7 @@ def _compiled_tree_speculative_sampling_target_only(
 @dataclass
 class EagleVerifyDraftTensorPlan:
     predict: torch.Tensor
+    num_correct_drafts: torch.Tensor
     accept_lens: torch.Tensor
     accept_index: torch.Tensor
     new_seq_lens: torch.Tensor
@@ -232,6 +233,7 @@ def _compiled_verify_draft_tensor_graph(
     draft_seq_lens = seq_lens + draft_token_num
     return (
         predict,
+        num_correct_drafts,
         accept_lens,
         accept_index,
         new_seq_lens,
@@ -301,15 +303,16 @@ def run_compiled_verify_draft_tensor_graph(
         _activation_logged = True
     return EagleVerifyDraftTensorPlan(
         predict=values[0],
-        accept_lens=values[1],
-        accept_index=values[2],
-        new_seq_lens=values[3],
-        bonus_tokens=values[4],
-        last_correct_step_indices=values[5],
-        mamba_steps_to_track=(values[6] if mamba_track_interval is not None else None),
-        draft_select_index=values[7],
-        next_token_ids_i64=values[8],
-        draft_prefix_lens=values[9],
-        draft_extend_lens=values[10],
-        draft_seq_lens=values[11],
+        num_correct_drafts=values[1],
+        accept_lens=values[2],
+        accept_index=values[3],
+        new_seq_lens=values[4],
+        bonus_tokens=values[5],
+        last_correct_step_indices=values[6],
+        mamba_steps_to_track=(values[7] if mamba_track_interval is not None else None),
+        draft_select_index=values[8],
+        next_token_ids_i64=values[9],
+        draft_prefix_lens=values[10],
+        draft_extend_lens=values[11],
+        draft_seq_lens=values[12],
     )

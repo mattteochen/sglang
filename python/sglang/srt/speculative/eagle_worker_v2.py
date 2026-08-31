@@ -859,8 +859,15 @@ class EagleDraftWorker(EagleDraftWorkerBase):
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
             # accept_lens includes the bonus token; correct drafts exclude it.
-            num_correct_drafts=batch_result.accept_lens - 1,
+            num_correct_drafts=(
+                tensor_plan.num_correct_drafts
+                if tensor_plan is not None
+                else batch_result.accept_lens - 1
+            ),
             num_accept_tokens=batch_result.accept_lens,
+            extend_seq_lens_tensor=(
+                tensor_plan.draft_extend_lens if tensor_plan is not None else None
+            ),
             # Draft-extend fills the whole tree width (num_draft_tokens) per req,
             # not num_steps + 1, so DP MLP-sync padding stays consistent for topk > 1.
             num_tokens_per_req=self.speculative_num_draft_tokens,

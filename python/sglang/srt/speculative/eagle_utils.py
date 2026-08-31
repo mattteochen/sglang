@@ -17,7 +17,7 @@ from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
 from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
-from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_server_args, get_spec
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -745,6 +745,7 @@ def eagle_sample(
         and not sampling_info.need_top_p_sampling
         and verify_input.tree_topk == 1
         and not envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get()
+        and not get_server_args().enable_multi_layer_eagle
     ):
         from sglang.srt.distributed import get_tp_group
         from sglang.srt.layers.dp_attention import is_dp_attention_enabled
@@ -822,7 +823,7 @@ def eagle_sample(
         accept_index = compiled_tensor_plan.accept_index
         # Defined for the common tail below; the compiled return path uses the
         # already-produced accept_lens directly and launches no subtraction.
-        num_correct_drafts = compiled_tensor_plan.accept_lens
+        num_correct_drafts = compiled_tensor_plan.num_correct_drafts
         verify_input._verify_draft_tensor_plan = compiled_tensor_plan
     else:
         from sgl_kernel import (

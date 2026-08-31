@@ -1577,11 +1577,20 @@ class DeepseekSparseAttnBackend(
 
             # See target-verify note: fill on-device to avoid the blocking
             # pageable H2D from torch.tensor(list, device=cuda).
-            extend_seq_lens = torch.full(
-                (bs,),
-                self.speculative_num_draft_tokens,
-                dtype=torch.int32,
-                device=self.device,
+            staged_extend_seq_lens = (
+                getattr(spec_info, "extend_seq_lens_tensor", None)
+                if spec_info is not None
+                else None
+            )
+            extend_seq_lens = (
+                staged_extend_seq_lens[:bs]
+                if staged_extend_seq_lens is not None
+                else torch.full(
+                    (bs,),
+                    self.speculative_num_draft_tokens,
+                    dtype=torch.int32,
+                    device=self.device,
+                )
             )
 
             if is_cuda() and not _is_hip:

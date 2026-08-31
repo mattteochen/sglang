@@ -18,6 +18,7 @@ class TestEagleVerifyDraftCompile(unittest.TestCase):
 
         plan = SimpleNamespace(
             predict=torch.arange(5, dtype=torch.int32),
+            num_correct_drafts=torch.tensor([2], dtype=torch.int32),
             accept_lens=torch.tensor([3], dtype=torch.int32),
             accept_index=torch.tensor([[0, 1, 2, -1, -1]], dtype=torch.int32),
         )
@@ -61,6 +62,11 @@ class TestEagleVerifyDraftCompile(unittest.TestCase):
             mock.patch.object(eagle_utils, "_is_hip", False),
             mock.patch.object(eagle_utils, "_is_xpu", False),
             mock.patch.object(eagle_utils, "get_spec", return_value=spec),
+            mock.patch.object(
+                eagle_utils,
+                "get_server_args",
+                return_value=SimpleNamespace(enable_multi_layer_eagle=False),
+            ),
             mock.patch.object(
                 eagle_utils.envs.SGLANG_ENABLE_MTP_VERIFY_DRAFT_COMPILE,
                 "get",
@@ -224,6 +230,7 @@ class TestEagleVerifyDraftCompile(unittest.TestCase):
             mamba_steps = torch.empty((0,), dtype=torch.int32, device="cuda")
         return (
             predict,
+            correct,
             accept_lens,
             accept_index,
             seq_lens + accept_lens,
@@ -239,6 +246,7 @@ class TestEagleVerifyDraftCompile(unittest.TestCase):
             (1, 3, 0),
             (2, 4, 128),
             (1, 4, 128),
+            (2, 3, 128),
         ):
             inputs = self._inputs(bs)
             actual = _compiled_verify_draft_tensor_graph(
@@ -264,17 +272,17 @@ class TestEagleVerifyDraftCompile(unittest.TestCase):
             expected = self._reference(
                 inputs, simulated_accept_len, mamba_track_interval
             )
-            for got, want in zip(actual[:7], expected):
+            for got, want in zip(actual[:8], expected):
                 torch.testing.assert_close(got, want, rtol=0, atol=0)
             torch.testing.assert_close(
-                actual[7], expected[1].long() - 1 + torch.arange(bs, device="cuda") * 5
+                actual[8], expected[2].long() - 1 + torch.arange(bs, device="cuda") * 5
             )
-            torch.testing.assert_close(actual[8], expected[0].long())
-            torch.testing.assert_close(actual[9], inputs[8].int())
+            torch.testing.assert_close(actual[9], expected[0].long())
+            torch.testing.assert_close(actual[10], inputs[8].int())
             torch.testing.assert_close(
-                actual[10], torch.full((bs,), 5, dtype=torch.int32, device="cuda")
+                actual[11], torch.full((bs,), 5, dtype=torch.int32, device="cuda")
             )
-            torch.testing.assert_close(actual[11], inputs[8] + 5)
+            torch.testing.assert_close(actual[12], inputs[8] + 5)
 
 
 if __name__ == "__main__":
