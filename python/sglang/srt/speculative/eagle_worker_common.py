@@ -147,6 +147,11 @@ def prepare_for_draft_extend(
             )
     else:
         batch.input_ids = predict
+        if _tensor_plan is not None:
+            # The private plan supplies this pair together. ForwardBatch can then
+            # preserve generic extend metadata without launching compute_position.
+            draft_extend_input.positions = _tensor_plan.draft_positions
+            draft_extend_input.extend_start_loc = _tensor_plan.draft_extend_start_loc
     maybe_detect_oob(
         batch.input_ids,
         0,

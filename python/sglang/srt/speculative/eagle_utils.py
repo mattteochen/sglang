@@ -713,17 +713,18 @@ def eagle_sample(
         grammar_mask.apply(next_token_logits)
 
     candidates = verify_input.draft_token.reshape(bs, verify_input.draft_token_num)
-    predict_shape = list(next_token_logits.shape)[:-1]
-    predict = torch.zeros(predict_shape, dtype=torch.int32, device=device).flatten()
-    accept_index = torch.full(
-        (bs, verify_input.max_tree_depth), -1, dtype=torch.int32, device=device
-    )
-    num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
     # Sample tokens
     target_predict = None
     compiled_tensor_plan = None
     if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
+        predict = torch.zeros(
+            list(next_token_logits.shape)[:-1], dtype=torch.int32, device=device
+        ).flatten()
+        accept_index = torch.full(
+            (bs, verify_input.max_tree_depth), -1, dtype=torch.int32, device=device
+        )
+        num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
         predict, accept_index, num_correct_drafts = verify_tree_greedy_func(
@@ -837,6 +838,17 @@ def eagle_sample(
         )
 
         use_rejection_sampling = get_spec().speculative_use_rejection_sampling
+
+        # The compiled path owns these sampler outputs inside its full graph.
+        # Allocate them only for the eager samplers so it does not launch two
+        # redundant fill kernels before entering the compiled island.
+        predict = torch.zeros(
+            list(next_token_logits.shape)[:-1], dtype=torch.int32, device=device
+        ).flatten()
+        accept_index = torch.full(
+            (bs, verify_input.max_tree_depth), -1, dtype=torch.int32, device=device
+        )
+        num_correct_drafts = torch.empty((bs,), dtype=torch.int32, device=device)
 
         # Apply temperature and get target probs
         expanded_temperature = torch.repeat_interleave(

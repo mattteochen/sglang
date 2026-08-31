@@ -301,12 +301,15 @@ class EagleDraftExtendInput(SpecInput):
     req_pool_indices: torch.Tensor = None
 
     #   - positions: shape `[total_accepted]`.
+    #   - extend_start_loc: optional GPU per-request start offset paired with
+    #     positions. ForwardBatch adopts the pair without rebuilding either.
     #   - extend_seq_lens_tensor: optional GPU per-request draft width. CUDA
     #     graph replay replaces this with its staged buffer; eager draft extend
     #     can consume a precomputed tensor directly.
     #   - bonus_tokens: shape `[bs]`; read post-extend to populate next iter's
     #     `EagleDraftInput.bonus_tokens`.
     positions: Optional[torch.Tensor] = None
+    extend_start_loc: Optional[torch.Tensor] = None
     extend_seq_lens_tensor: Optional[torch.Tensor] = None
     bonus_tokens: Optional[torch.Tensor] = None
 

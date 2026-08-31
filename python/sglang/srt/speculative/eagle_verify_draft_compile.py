@@ -14,10 +14,13 @@ from typing import Optional
 import torch
 
 from sglang.srt.distributed.parallel_state import inplace_broadcast
+from sglang.srt.environ import envs
 from sglang.srt.utils.custom_op import register_custom_op
 
 logger = logging.getLogger(__name__)
 _activation_logged = False
+_variant_keys_logged = set()
+_log_variant_keys = envs.SGLANG_LOG_MTP_VERIFY_DRAFT_COMPILE_VARIANTS.get()
 
 
 @register_custom_op(
@@ -77,6 +80,8 @@ class EagleVerifyDraftTensorPlan:
     draft_prefix_lens: torch.Tensor
     draft_extend_lens: torch.Tensor
     draft_seq_lens: torch.Tensor
+    draft_positions: torch.Tensor
+    draft_extend_start_loc: torch.Tensor
 
 
 @torch.compile(
@@ -231,6 +236,15 @@ def _compiled_verify_draft_tensor_graph(
         (bs,), draft_token_num, dtype=torch.int32, device=seq_lens.device
     )
     draft_seq_lens = seq_lens + draft_token_num
+    draft_positions = (
+        seq_lens.clamp(min=0).unsqueeze(1)
+        + torch.arange(
+            draft_token_num, dtype=torch.int64, device=seq_lens.device
+        ).unsqueeze(0)
+    ).reshape(-1)
+    draft_extend_start_loc = (
+        torch.arange(bs, dtype=torch.int32, device=seq_lens.device) * draft_token_num
+    )
     return (
         predict,
         num_correct_drafts,
@@ -245,6 +259,8 @@ def _compiled_verify_draft_tensor_graph(
         draft_prefix_lens,
         draft_extend_lens,
         draft_seq_lens,
+        draft_positions,
+        draft_extend_start_loc,
     )
 
 
@@ -270,6 +286,48 @@ def run_compiled_verify_draft_tensor_graph(
     simulate_real_draft_tokens: bool,
 ) -> EagleVerifyDraftTensorPlan:
     global _activation_logged
+    if _log_variant_keys:
+        tensor_inputs = (
+            next_token_logits,
+            temperatures,
+            candidates,
+            retrieve_index,
+            retrieve_next_token,
+            retrieve_next_sibling,
+            coins,
+            coins_for_final_sampling,
+            seq_lens,
+        )
+        variant_key = (
+            simulated_accept_len,
+            mamba_track_interval,
+            tuple(
+                (
+                    tuple(x.shape),
+                    tuple(x.stride()),
+                    str(x.dtype),
+                    str(x.device),
+                    x.storage_offset(),
+                    x.is_contiguous(),
+                )
+                for x in tensor_inputs
+            ),
+        )
+        if variant_key not in _variant_keys_logged:
+            rank = (
+                torch.distributed.get_rank()
+                if torch.distributed.is_initialized()
+                else 0
+            )
+            logger.info(
+                "MTP_VERIFY_DRAFT_COMPILE_VARIANT rank=%d simulated_accept_len=%d "
+                "mamba_track_interval=%s tensors=%s",
+                rank,
+                simulated_accept_len,
+                mamba_track_interval,
+                variant_key[2],
+            )
+            _variant_keys_logged.add(variant_key)
     values = _compiled_verify_draft_tensor_graph(
         next_token_logits,
         temperatures,
@@ -315,4 +373,6 @@ def run_compiled_verify_draft_tensor_graph(
         draft_prefix_lens=values[10],
         draft_extend_lens=values[11],
         draft_seq_lens=values[12],
+        draft_positions=values[13],
+        draft_extend_start_loc=values[14],
     )

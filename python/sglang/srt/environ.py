@@ -701,6 +701,8 @@ class Envs:
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
     # Fuse the tensor-only EAGLE verify-to-draft-extend epilogue with Inductor.
     SGLANG_ENABLE_MTP_VERIFY_DRAFT_COMPILE = EnvBool(False)
+    # Log first-seen private graph signatures while diagnosing recompilations.
+    SGLANG_LOG_MTP_VERIFY_DRAFT_COMPILE_VARIANTS = EnvBool(False)
 
     # EPLB
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT = EnvBool(False)

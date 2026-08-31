@@ -283,6 +283,17 @@ class TestEagleVerifyDraftCompile(unittest.TestCase):
                 actual[11], torch.full((bs,), 5, dtype=torch.int32, device="cuda")
             )
             torch.testing.assert_close(actual[12], inputs[8] + 5)
+            expected_positions = (
+                inputs[8].clamp(min=0).unsqueeze(1)
+                + torch.arange(5, dtype=torch.int64, device="cuda").unsqueeze(0)
+            ).reshape(-1)
+            torch.testing.assert_close(actual[13], expected_positions)
+            torch.testing.assert_close(
+                actual[14],
+                torch.arange(bs, dtype=torch.int32, device="cuda") * 5,
+            )
+            self.assertTrue(actual[13].is_contiguous())
+            self.assertTrue(actual[14].is_contiguous())
 
 
 if __name__ == "__main__":
