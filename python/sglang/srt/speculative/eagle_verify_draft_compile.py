@@ -7,6 +7,7 @@ operations are explicit opaque mutation barriers inside that graph.
 
 from __future__ import annotations
 
+import logging
 from dataclasses import dataclass
 from typing import Optional
 
@@ -14,6 +15,9 @@ import torch
 
 from sglang.srt.distributed.parallel_state import inplace_broadcast
 from sglang.srt.utils.custom_op import register_custom_op
+
+logger = logging.getLogger(__name__)
+_activation_logged = False
 
 
 @register_custom_op(
@@ -263,6 +267,7 @@ def run_compiled_verify_draft_tensor_graph(
     simulated_accept_len: int,
     simulate_real_draft_tokens: bool,
 ) -> EagleVerifyDraftTensorPlan:
+    global _activation_logged
     values = _compiled_verify_draft_tensor_graph(
         next_token_logits,
         temperatures,
@@ -283,6 +288,17 @@ def run_compiled_verify_draft_tensor_graph(
         simulated_accept_len,
         simulate_real_draft_tokens,
     )
+    if not _activation_logged:
+        rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
+        logger.info(
+            "MTP_VERIFY_DRAFT_COMPILE_ACTIVE rank=%d tp_world_size=%d "
+            "draft_token_num=%d max_tree_depth=%d",
+            rank,
+            tp_world_size,
+            draft_token_num,
+            max_tree_depth,
+        )
+        _activation_logged = True
     return EagleVerifyDraftTensorPlan(
         predict=values[0],
         accept_lens=values[1],
