@@ -7,6 +7,7 @@ import torch
 from sgl_kernel import tree_speculative_sampling_target_only
 from sglang.srt.speculative.eagle_verify_draft_compile import (
     _compiled_verify_draft_tensor_graph,
+    _functionalize_simulated_acceptance,
 )
 from sglang.srt.speculative.eagle_utils import eagle_sample
 from sglang.srt.speculative.spec_utils import generate_simulated_accept_index
@@ -73,6 +74,11 @@ class TestEagleVerifyDraftCompile(unittest.TestCase):
                 return_value=True,
             ),
             mock.patch.object(
+                eagle_utils.envs.SGLANG_ENABLE_MTP_VERIFY_DRAFT_FUNCTIONAL_SIM,
+                "get",
+                return_value=True,
+            ),
+            mock.patch.object(
                 eagle_utils.envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM,
                 "get",
                 return_value=False,
@@ -111,6 +117,7 @@ class TestEagleVerifyDraftCompile(unittest.TestCase):
         self.assertEqual(compiled.call_args.kwargs["simulated_accept_len"], 3)
         self.assertEqual(compiled.call_args.kwargs["tp_world_size"], 8)
         self.assertTrue(compiled.call_args.kwargs["simulate_real_draft_tokens"])
+        self.assertTrue(compiled.call_args.kwargs["functional_simulation"])
         for actual, expected in zip(got, (plan.predict, plan.accept_lens, plan.accept_index)):
             torch.testing.assert_close(actual, expected)
 
@@ -155,7 +162,13 @@ class TestEagleVerifyDraftCompile(unittest.TestCase):
             torch.arange(126, 126 + bs, dtype=torch.int64, device="cuda"),
         )
 
-    def _reference(self, inputs, simulated_accept_len, mamba_track_interval):
+    def _reference(
+        self,
+        inputs,
+        simulated_accept_len,
+        mamba_track_interval,
+        simulate_real_draft_tokens=True,
+    ):
         (
             candidates,
             retrieve_index,
@@ -191,6 +204,13 @@ class TestEagleVerifyDraftCompile(unittest.TestCase):
             threshold_acc=1.0,
             deterministic=True,
         )
+        row_offsets = torch.arange(0, bs * width, width, device="cuda")
+        self.assertTrue(torch.all(accept_index[:, 0] >= row_offsets).item())
+        self.assertTrue(
+            torch.all(
+                accept_index[:, 0] + simulated_accept_len <= row_offsets + width
+            ).item()
+        )
         target_predict = torch.argmax(logits, dim=-1).reshape(bs, width)
         accept_index = generate_simulated_accept_index(
             accept_index,
@@ -202,7 +222,9 @@ class TestEagleVerifyDraftCompile(unittest.TestCase):
             4,
             simulate_acc_len=simulated_accept_len,
             simulate_acc_method="match-expected",
-            simulate_acc_token_mode="real-draft-token",
+            simulate_acc_token_mode=(
+                "real-draft-token" if simulate_real_draft_tokens else "fixed"
+            ),
         )
         accept_lens = correct + 1
         req_idx = torch.arange(bs, device="cuda")
@@ -241,59 +263,141 @@ class TestEagleVerifyDraftCompile(unittest.TestCase):
 
     @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
     def test_matches_eager_simulated_acceptance_bs1_bs2(self):
+        # This exhaustive static-argument matrix intentionally exceeds the
+        # serving default; production C2 uses only the bounded 5 variants
+        # documented by the profile. Restore the process default afterward.
+        old_recompile_limit = torch._dynamo.config.recompile_limit
+        torch._dynamo.config.recompile_limit = 64
+        self.addCleanup(
+            setattr, torch._dynamo.config, "recompile_limit", old_recompile_limit
+        )
         # 3.33 with match-expected produces both specializations in C2.
-        for bs, simulated_accept_len, mamba_track_interval in (
-            (1, 3, 0),
-            (2, 4, 128),
-            (1, 4, 128),
-            (2, 3, 128),
-        ):
-            inputs = self._inputs(bs)
-            actual = _compiled_verify_draft_tensor_graph(
-                inputs[4],
-                inputs[5],
-                inputs[0],
-                inputs[1],
-                inputs[2],
-                inputs[3],
-                inputs[6],
-                inputs[7],
-                inputs[8],
-                5,
-                5,
-                1.0,
-                1.0,
-                "",
-                1,
-                mamba_track_interval,
-                simulated_accept_len,
-                True,
+        for functional_simulation in (False, True):
+            for bs, simulated_accept_len, mamba_track_interval, real_tokens, seqs in (
+                (1, 3, 0, True, None),
+                (2, 4, 128, True, (120, 127)),
+                (1, 4, 128, True, None),
+                (2, 3, 128, True, (120, 127)),
+                (1, 3, 0, False, None),
+                (1, 1, 0, True, None),
+                (2, 5, 128, True, (120, 127)),
+                (2, 5, 0, False, None),
+                (2, 3, 0, True, (-2, 0)),
+            ):
+                inputs = self._inputs(bs)
+                if seqs is not None:
+                    inputs[8].copy_(torch.tensor(seqs, device="cuda"))
+                actual = _compiled_verify_draft_tensor_graph(
+                    inputs[4],
+                    inputs[5],
+                    inputs[0],
+                    inputs[1],
+                    inputs[2],
+                    inputs[3],
+                    inputs[6],
+                    inputs[7],
+                    inputs[8],
+                    5,
+                    5,
+                    1.0,
+                    1.0,
+                    "",
+                    1,
+                    mamba_track_interval,
+                    simulated_accept_len,
+                    real_tokens,
+                    functional_simulation,
+                )
+                expected = self._reference(
+                    inputs,
+                    simulated_accept_len,
+                    mamba_track_interval,
+                    real_tokens,
+                )
+                for got, want in zip(actual[:8], expected):
+                    torch.testing.assert_close(got, want, rtol=0, atol=0)
+                torch.testing.assert_close(
+                    actual[8],
+                    expected[2].long()
+                    - 1
+                    + torch.arange(bs, device="cuda") * 5,
+                )
+                torch.testing.assert_close(actual[9], expected[0].long())
+                torch.testing.assert_close(actual[10], inputs[8].clamp(min=0).int())
+                torch.testing.assert_close(
+                    actual[11],
+                    torch.full((bs,), 5, dtype=torch.int32, device="cuda"),
+                )
+                torch.testing.assert_close(actual[12], inputs[8] + 5)
+                expected_positions = (
+                    inputs[8].clamp(min=0).unsqueeze(1)
+                    + torch.arange(5, dtype=torch.int64, device="cuda").unsqueeze(0)
+                ).reshape(-1)
+                torch.testing.assert_close(actual[13], expected_positions)
+                torch.testing.assert_close(
+                    actual[14],
+                    torch.arange(bs, dtype=torch.int32, device="cuda") * 5,
+                )
+                self.assertTrue(actual[13].is_contiguous())
+                self.assertTrue(actual[14].is_contiguous())
+
+    @unittest.skipUnless(torch.cuda.is_available(), "requires CUDA")
+    def test_functional_simulation_preserves_arbitrary_off_path_values(self):
+        for bs in (1, 2):
+            candidates = torch.arange(
+                bs * 5, dtype=torch.int64, device="cuda"
+            ).reshape(bs, 5)
+            target_predict = candidates + 100
+            sampler_predict = torch.arange(
+                1000, 1000 + bs * 5, dtype=torch.int32, device="cuda"
             )
-            expected = self._reference(
-                inputs, simulated_accept_len, mamba_track_interval
+            sampler_accept_index = torch.full(
+                (bs, 5), -1, dtype=torch.int32, device="cuda"
             )
-            for got, want in zip(actual[:8], expected):
-                torch.testing.assert_close(got, want, rtol=0, atol=0)
+            sampler_accept_index[:, 0] = torch.arange(
+                0, bs * 5, 5, dtype=torch.int32, device="cuda"
+            )
             torch.testing.assert_close(
-                actual[8], expected[2].long() - 1 + torch.arange(bs, device="cuda") * 5
+                sampler_accept_index[:, 0],
+                torch.arange(0, bs * 5, 5, dtype=torch.int32, device="cuda"),
             )
-            torch.testing.assert_close(actual[9], expected[0].long())
-            torch.testing.assert_close(actual[10], inputs[8].int())
-            torch.testing.assert_close(
-                actual[11], torch.full((bs,), 5, dtype=torch.int32, device="cuda")
-            )
-            torch.testing.assert_close(actual[12], inputs[8] + 5)
-            expected_positions = (
-                inputs[8].clamp(min=0).unsqueeze(1)
-                + torch.arange(5, dtype=torch.int64, device="cuda").unsqueeze(0)
-            ).reshape(-1)
-            torch.testing.assert_close(actual[13], expected_positions)
-            torch.testing.assert_close(
-                actual[14],
-                torch.arange(bs, dtype=torch.int32, device="cuda") * 5,
-            )
-            self.assertTrue(actual[13].is_contiguous())
-            self.assertTrue(actual[14].is_contiguous())
+            for simulated_accept_len in (1, 3, 4, 5):
+                for real_tokens in (False, True):
+                    expected_predict = sampler_predict.clone()
+                    expected_correct = torch.empty(
+                        (bs,), dtype=torch.int32, device="cuda"
+                    )
+                    expected_accept_index = generate_simulated_accept_index(
+                        accept_index=sampler_accept_index,
+                        predict=expected_predict,
+                        num_correct_drafts=expected_correct,
+                        candidates=candidates,
+                        target_predict=target_predict,
+                        simulate_acc_len=simulated_accept_len,
+                        simulate_acc_method="match-expected",
+                        simulate_acc_token_mode=(
+                            "real-draft-token" if real_tokens else "fixed"
+                        ),
+                        bs=bs,
+                        spec_steps=4,
+                    )
+                    actual = _functionalize_simulated_acceptance(
+                        sampler_predict,
+                        sampler_accept_index,
+                        candidates,
+                        target_predict,
+                        simulated_accept_len,
+                        5,
+                        real_tokens,
+                    )
+                    torch.testing.assert_close(actual[0], expected_predict)
+                    torch.testing.assert_close(actual[1], expected_correct)
+                    torch.testing.assert_close(
+                        actual[2], expected_correct + 1
+                    )
+                    torch.testing.assert_close(actual[3], expected_accept_index)
+                    self.assertEqual(actual[0].dtype, torch.int32)
+                    self.assertEqual(actual[3].dtype, torch.int32)
 
 
 if __name__ == "__main__":

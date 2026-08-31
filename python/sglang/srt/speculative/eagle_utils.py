@@ -819,6 +819,9 @@ def eagle_sample(
             mamba_track_interval=mamba_track_interval,
             simulated_accept_len=simulated_accept_len,
             simulate_real_draft_tokens=(SIMULATE_ACC_TOKEN_MODE == "real-draft-token"),
+            functional_simulation=(
+                envs.SGLANG_ENABLE_MTP_VERIFY_DRAFT_FUNCTIONAL_SIM.get()
+            ),
         )
         predict = compiled_tensor_plan.predict
         accept_index = compiled_tensor_plan.accept_index

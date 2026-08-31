@@ -84,6 +84,79 @@ class EagleVerifyDraftTensorPlan:
     draft_extend_start_loc: torch.Tensor
 
 
+def _functionalize_simulated_acceptance(
+    sampler_predict: torch.Tensor,
+    sampler_accept_index: torch.Tensor,
+    candidates: torch.Tensor,
+    target_predict: torch.Tensor,
+    simulated_accept_len: int,
+    max_tree_depth: int,
+    simulate_real_draft_tokens: bool,
+):
+    """Build simulated top-k=1 outputs without serial index mutations.
+
+    The compiled-route top-k=1 tree contract has equal draft/tree widths and
+    places each accepted root at the start of its row in the flattened sampler
+    output, so the forced path remains inside that row.
+    """
+    bs, draft_token_num = candidates.shape
+    row_offsets = torch.arange(
+        0,
+        bs * draft_token_num,
+        step=draft_token_num,
+        dtype=torch.int64,
+        device=candidates.device,
+    )
+    base = sampler_accept_index[:, 0].to(torch.int64)
+    accept_columns = torch.arange(
+        max_tree_depth, dtype=torch.int64, device=candidates.device
+    ).unsqueeze(0)
+    accept_index = torch.where(
+        accept_columns < simulated_accept_len,
+        base.unsqueeze(1) + accept_columns,
+        -1,
+    ).to(torch.int32)
+    num_correct_drafts = torch.full(
+        (bs,),
+        simulated_accept_len - 1,
+        dtype=torch.int32,
+        device=candidates.device,
+    )
+    accept_lens = torch.full(
+        (bs,),
+        simulated_accept_len,
+        dtype=torch.int32,
+        device=candidates.device,
+    )
+
+    if simulate_real_draft_tokens:
+        predict_columns = torch.arange(
+            draft_token_num, dtype=torch.int64, device=candidates.device
+        ).unsqueeze(0)
+        local_base = base.unsqueeze(1) - row_offsets.unsqueeze(1)
+        path_delta = predict_columns - local_base
+        on_path = (path_delta >= 0) & (path_delta < simulated_accept_len)
+        candidate_columns = (path_delta + 1).clamp(0, draft_token_num - 1)
+        draft_values = candidates.gather(1, candidate_columns).to(torch.int32)
+        bonus_values = target_predict[
+            :, simulated_accept_len - 1 : simulated_accept_len
+        ].to(torch.int32)
+        replacements = torch.where(
+            path_delta == simulated_accept_len - 1,
+            bonus_values,
+            draft_values,
+        )
+        predict = torch.where(
+            on_path,
+            replacements,
+            sampler_predict.reshape(bs, draft_token_num),
+        ).reshape(-1)
+    else:
+        predict = torch.full_like(sampler_predict, 100)
+
+    return predict, num_correct_drafts, accept_lens, accept_index, row_offsets, base
+
+
 @torch.compile(
     fullgraph=True,
     dynamic=True,
@@ -108,6 +181,7 @@ def _compiled_verify_draft_tensor_graph(
     mamba_track_interval: int,
     simulated_accept_len: int,
     simulate_real_draft_tokens: bool,
+    functional_simulation: bool,
 ):
     bs = candidates.shape[0]
     expanded_temperature = torch.repeat_interleave(temperatures, draft_token_num, dim=0)
@@ -151,41 +225,61 @@ def _compiled_verify_draft_tensor_graph(
         inplace_broadcast(accept_index, tp_group_name, 0)
         inplace_broadcast(num_correct_drafts, tp_group_name, 0)
 
+    functional_simulation_active = functional_simulation and simulated_accept_len > 0
+    functional_row_offsets = None
+    functional_base = None
+    target_predict = None
     if simulated_accept_len > 0:
         # Preserve the benchmark-only simulated-acceptance policy, but let
         # Inductor fuse its many tiny fill/arange/index/update operations.
         target_predict = torch.argmax(next_token_logits, dim=-1).reshape(
             bs, draft_token_num
         )
-        simulated_accept_index = torch.full_like(accept_index, -1)
-        simulated_accept_index[:, :simulated_accept_len] = accept_index[
-            :, :1
-        ] + torch.arange(simulated_accept_len, device=accept_index.device)
-        num_correct_drafts.fill_(simulated_accept_len - 1)
-        if simulate_real_draft_tokens:
-            if simulated_accept_len > 1:
-                draft_node_indices = simulated_accept_index[
-                    :, : simulated_accept_len - 1
-                ].to(torch.int64)
-                predict[draft_node_indices] = candidates[:, 1:simulated_accept_len].to(
-                    predict.dtype
-                )
-            bonus_node_indices = simulated_accept_index[:, simulated_accept_len - 1].to(
-                torch.int64
+        if functional_simulation:
+            (
+                predict,
+                num_correct_drafts,
+                accept_lens,
+                accept_index,
+                functional_row_offsets,
+                functional_base,
+            ) = _functionalize_simulated_acceptance(
+                predict,
+                accept_index,
+                candidates,
+                target_predict,
+                simulated_accept_len,
+                max_tree_depth,
+                simulate_real_draft_tokens,
             )
-            predict[bonus_node_indices] = target_predict[
-                :, simulated_accept_len - 1
-            ].to(predict.dtype)
         else:
-            predict.fill_(100)
-        accept_index = simulated_accept_index
+            simulated_accept_index = torch.full_like(accept_index, -1)
+            simulated_accept_index[:, :simulated_accept_len] = accept_index[
+                :, :1
+            ] + torch.arange(simulated_accept_len, device=accept_index.device)
+            num_correct_drafts.fill_(simulated_accept_len - 1)
+            if simulate_real_draft_tokens:
+                if simulated_accept_len > 1:
+                    draft_node_indices = simulated_accept_index[
+                        :, : simulated_accept_len - 1
+                    ].to(torch.int64)
+                    predict[draft_node_indices] = candidates[
+                        :, 1:simulated_accept_len
+                    ].to(predict.dtype)
+                bonus_node_indices = simulated_accept_index[
+                    :, simulated_accept_len - 1
+                ].to(torch.int64)
+                predict[bonus_node_indices] = target_predict[
+                    :, simulated_accept_len - 1
+                ].to(predict.dtype)
+            else:
+                predict.fill_(100)
+            accept_index = simulated_accept_index
 
-    accept_lens = num_correct_drafts + 1
+    if not functional_simulation_active:
+        accept_lens = num_correct_drafts + 1
     new_seq_lens = seq_lens + accept_lens
     req_idx = torch.arange(bs, dtype=torch.int64, device=seq_lens.device)
-    bonus_column = (accept_lens - 1).to(torch.int64)
-    bonus_index = accept_index[req_idx, bonus_column]
-    bonus_tokens = predict[bonus_index]
 
     accept_indices_offset = torch.arange(
         0,
@@ -194,9 +288,23 @@ def _compiled_verify_draft_tensor_graph(
         dtype=accept_lens.dtype,
         device=accept_lens.device,
     )
-    last_correct_step_indices = (
-        accept_index[req_idx, bonus_column] - accept_indices_offset
-    )
+    if functional_simulation_active:
+        if simulate_real_draft_tokens:
+            bonus_tokens = target_predict[:, simulated_accept_len - 1].to(torch.int32)
+        else:
+            bonus_tokens = torch.full(
+                (bs,), 100, dtype=torch.int32, device=seq_lens.device
+            )
+        last_correct_step_indices = (
+            functional_base + simulated_accept_len - 1 - functional_row_offsets
+        ).to(torch.int32)
+    else:
+        bonus_column = (accept_lens - 1).to(torch.int64)
+        bonus_index = accept_index[req_idx, bonus_column]
+        bonus_tokens = predict[bonus_index]
+        last_correct_step_indices = (
+            accept_index[req_idx, bonus_column] - accept_indices_offset
+        )
     if mamba_track_interval > 0:
         seq_lens_post_verify = seq_lens + accept_lens
         to_track_mask = (
@@ -207,9 +315,19 @@ def _compiled_verify_draft_tensor_graph(
             seq_lens_post_verify // mamba_track_interval * mamba_track_interval
         )
         to_track_ith = torch.clamp(tracking_point - seq_lens - 1, min=0).to(torch.int64)
-        candidate_track_steps = (
-            accept_index[req_idx, to_track_ith] - accept_indices_offset
-        )
+        if functional_simulation_active:
+            tracked_global_step = torch.where(
+                to_track_ith < simulated_accept_len,
+                functional_base + to_track_ith,
+                torch.full_like(to_track_ith, -1),
+            )
+            candidate_track_steps = (
+                tracked_global_step - functional_row_offsets
+            ).to(torch.int32)
+        else:
+            candidate_track_steps = (
+                accept_index[req_idx, to_track_ith] - accept_indices_offset
+            )
         mamba_steps_to_track = torch.where(
             to_track_mask,
             candidate_track_steps,
@@ -220,16 +338,19 @@ def _compiled_verify_draft_tensor_graph(
             (0,), dtype=torch.int32, device=seq_lens.device
         )
 
-    draft_select_index = (
-        torch.arange(
-            0,
-            bs * draft_token_num,
-            step=draft_token_num,
-            device=seq_lens.device,
+    if functional_simulation_active:
+        draft_select_index = functional_row_offsets + simulated_accept_len - 1
+    else:
+        draft_select_index = (
+            torch.arange(
+                0,
+                bs * draft_token_num,
+                step=draft_token_num,
+                device=seq_lens.device,
+            )
+            + accept_lens
+            - 1
         )
-        + accept_lens
-        - 1
-    )
     next_token_ids_i64 = predict.to(torch.int64)
     draft_prefix_lens = (seq_lens - 0).clamp(min=0).to(torch.int32)
     draft_extend_lens = torch.full(
@@ -284,8 +405,23 @@ def run_compiled_verify_draft_tensor_graph(
     mamba_track_interval: Optional[int],
     simulated_accept_len: int,
     simulate_real_draft_tokens: bool,
+    functional_simulation: bool,
 ) -> EagleVerifyDraftTensorPlan:
     global _activation_logged
+    if functional_simulation and draft_token_num != max_tree_depth:
+        raise ValueError(
+            "Functional simulated acceptance currently requires the top-k=1 "
+            "draft width to equal max_tree_depth, got "
+            f"{draft_token_num} and {max_tree_depth}."
+        )
+    if functional_simulation and simulated_accept_len > min(
+        draft_token_num, max_tree_depth
+    ):
+        raise ValueError(
+            "Functional simulated acceptance requires simulated_accept_len <= "
+            "min(draft_token_num, max_tree_depth), got "
+            f"{simulated_accept_len}, {draft_token_num}, {max_tree_depth}."
+        )
     if _log_variant_keys:
         tensor_inputs = (
             next_token_logits,
@@ -301,6 +437,7 @@ def run_compiled_verify_draft_tensor_graph(
         variant_key = (
             simulated_accept_len,
             mamba_track_interval,
+            functional_simulation,
             tuple(
                 (
                     tuple(x.shape),
@@ -321,11 +458,12 @@ def run_compiled_verify_draft_tensor_graph(
             )
             logger.info(
                 "MTP_VERIFY_DRAFT_COMPILE_VARIANT rank=%d simulated_accept_len=%d "
-                "mamba_track_interval=%s tensors=%s",
+                "mamba_track_interval=%s functional_simulation=%s tensors=%s",
                 rank,
                 simulated_accept_len,
                 mamba_track_interval,
                 variant_key[2],
+                variant_key[3],
             )
             _variant_keys_logged.add(variant_key)
     values = _compiled_verify_draft_tensor_graph(
@@ -347,6 +485,7 @@ def run_compiled_verify_draft_tensor_graph(
         mamba_track_interval or 0,
         simulated_accept_len,
         simulate_real_draft_tokens,
+        functional_simulation,
     )
     if not _activation_logged:
         rank = torch.distributed.get_rank() if torch.distributed.is_initialized() else 0
