@@ -89,6 +89,10 @@ class GenerationBatchResult:
     # Next-iter seq_lens; published via on_publish.
     new_seq_lens: Optional[torch.Tensor] = None
 
+    # Private tensor-only plan shared by the opt-in EAGLE verify/draft Inductor
+    # island. Object/stream orchestration remains in the ordinary worker path.
+    _verify_draft_tensor_plan: Optional[Any] = None
+
     # relay path: forward stream -> next step forward
     next_draft_input: Optional[EagleDraftInput] = None
 

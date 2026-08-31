@@ -699,6 +699,8 @@ class Envs:
 
     # Torch Compile
     SGLANG_ENABLE_TORCH_COMPILE = EnvBool(False)
+    # Fuse the tensor-only EAGLE verify-to-draft-extend epilogue with Inductor.
+    SGLANG_ENABLE_MTP_VERIFY_DRAFT_COMPILE = EnvBool(False)
 
     # EPLB
     SGLANG_EXPERT_LOCATION_UPDATER_LOG_INPUT = EnvBool(False)

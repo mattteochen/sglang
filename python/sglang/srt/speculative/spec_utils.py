@@ -829,6 +829,10 @@ def commit_mamba_states_after_verify(
     accept_lens: torch.Tensor,
     accept_index: torch.Tensor,
     draft_token_num: int,
+    *,
+    _prepared_step_indices: Optional[
+        Tuple[torch.Tensor, Optional[torch.Tensor]]
+    ] = None,
 ) -> None:
     """Commit accepted per-step mamba states into the persistent caches.
 
@@ -872,11 +876,15 @@ def commit_mamba_states_after_verify(
 
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
-        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
-            batch=batch,
-            accept_index=accept_index,
-            accept_lens=accept_lens,
-            draft_token_num=draft_token_num,
+        last_correct_step_indices, mamba_steps_to_track = (
+            _prepared_step_indices
+            if _prepared_step_indices is not None
+            else _verify_commit_step_indices(
+                batch=batch,
+                accept_index=accept_index,
+                accept_lens=accept_lens,
+                draft_token_num=draft_token_num,
+            )
         )
         commit_gdn_replayssm_fold_after_verify(
             spec_state=spec_state,
@@ -920,11 +928,15 @@ def commit_mamba_states_after_verify(
         )
         # Roll back / commit the conv state to the last accepted draft step
         # (same logic as the recurrent commit, but conv-only).
-        last_correct_step_indices, _ = _verify_commit_step_indices(
-            batch=batch,
-            accept_index=accept_index,
-            accept_lens=accept_lens,
-            draft_token_num=draft_token_num,
+        last_correct_step_indices, _ = (
+            _prepared_step_indices
+            if _prepared_step_indices is not None
+            else _verify_commit_step_indices(
+                batch=batch,
+                accept_index=accept_index,
+                accept_lens=accept_lens,
+                draft_token_num=draft_token_num,
+            )
         )
         fused_conv_window_scatter_with_mask(
             spec_state.conv[0],
@@ -959,25 +971,28 @@ def commit_mamba_states_after_verify(
         spec_state = req_pool.get_speculative_mamba2_params_all_layers()
         bs = accept_lens.shape[0]
         state_batch_indices = req_pool.get_mamba_indices(batch.req_pool_indices)
-        accept_indices_offset = torch.arange(
-            0,
-            bs * draft_token_num,
-            step=draft_token_num,
-            dtype=accept_lens.dtype,
-            device=accept_lens.device,
-        )
-        req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
-        last_correct_step_indices = (
-            accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
-            - accept_indices_offset
-        )
+        if _prepared_step_indices is not None:
+            last_correct_step_indices, mamba_steps_to_track = _prepared_step_indices
+        else:
+            accept_indices_offset = torch.arange(
+                0,
+                bs * draft_token_num,
+                step=draft_token_num,
+                dtype=accept_lens.dtype,
+                device=accept_lens.device,
+            )
+            req_idx = torch.arange(bs, dtype=torch.int64, device=accept_lens.device)
+            last_correct_step_indices = (
+                accept_index[req_idx, (accept_lens - 1).to(torch.int64)]
+                - accept_indices_offset
+            )
+            mamba_steps_to_track = None
         # extra_buffer: the interval-crossing step whose state must snapshot into
         # the track ping-pong slot (mirrors the regular commit's
         # mamba_steps_to_track); commit_kda_replayssm_spec folds it in one pass, so
         # `temporal` stays current and no device-side force-flush is needed.
         mamba_track_indices = batch.mamba_track_indices
-        mamba_steps_to_track = None
-        if mamba_track_indices is not None:
+        if mamba_track_indices is not None and _prepared_step_indices is None:
             ti = get_exec().mamba.mamba_track_interval
             seq_pre = batch.seq_lens
             seq_post = batch.seq_lens + accept_lens
@@ -1006,11 +1021,15 @@ def commit_mamba_states_after_verify(
     bs = accept_lens.shape[0]
     # `accept_lens` already includes the bonus token (drafts + 1 per req).
     if not batch.forward_mode.is_idle() and accept_index.numel() > 0:
-        last_correct_step_indices, mamba_steps_to_track = _verify_commit_step_indices(
-            batch=batch,
-            accept_index=accept_index,
-            accept_lens=accept_lens,
-            draft_token_num=draft_token_num,
+        last_correct_step_indices, mamba_steps_to_track = (
+            _prepared_step_indices
+            if _prepared_step_indices is not None
+            else _verify_commit_step_indices(
+                batch=batch,
+                accept_index=accept_index,
+                accept_lens=accept_lens,
+                draft_token_num=draft_token_num,
+            )
         )
 
         if hasattr(attn_backend, "update_mamba_state_after_mtp_verify"):

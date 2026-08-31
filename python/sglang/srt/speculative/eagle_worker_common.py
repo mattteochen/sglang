@@ -113,6 +113,7 @@ def prepare_for_draft_extend(
     return_hidden_states_before_norm: bool,
     widened_out_cache_loc: Optional[torch.Tensor] = None,
     widened_positions: Optional[torch.Tensor] = None,
+    _tensor_plan: Optional[Any] = None,
 ):
     bs = len(batch.seq_lens)
     # Optional window widening (num_front_tokens=0 -> off): prepend that many
@@ -155,10 +156,19 @@ def prepare_for_draft_extend(
     # init_new requires both list or both Tensor;
     # gpu_only emits device tensors to skip H2D.
     if gpu_only:
-        batch.prefix_lens = (batch.seq_lens - front_offset).clamp(min=0).to(torch.int32)
-        batch.extend_lens = torch.full(
-            (bs,), num_window_tokens, dtype=torch.int32, device=batch.seq_lens.device
-        )
+        if _tensor_plan is not None:
+            batch.prefix_lens = _tensor_plan.draft_prefix_lens
+            batch.extend_lens = _tensor_plan.draft_extend_lens
+        else:
+            batch.prefix_lens = (
+                (batch.seq_lens - front_offset).clamp(min=0).to(torch.int32)
+            )
+            batch.extend_lens = torch.full(
+                (bs,),
+                num_window_tokens,
+                dtype=torch.int32,
+                device=batch.seq_lens.device,
+            )
     else:
         batch.prefix_lens = [
             max(int(x) - front_offset, 0) for x in batch.seq_lens_cpu.tolist()
@@ -183,7 +193,11 @@ def prepare_for_draft_extend(
     )
     # Forward sees post-write length (draft extend writes num_draft_tokens
     # slots); mutation stays on forward_batch to preserve SB.seq_lens.
-    forward_batch.seq_lens = forward_batch.seq_lens + num_draft_tokens
+    forward_batch.seq_lens = (
+        _tensor_plan.draft_seq_lens
+        if _tensor_plan is not None
+        else forward_batch.seq_lens + num_draft_tokens
+    )
     if not gpu_only:
         forward_batch.seq_lens_cpu = forward_batch.seq_lens_cpu + num_draft_tokens
         forward_batch.seq_lens_sum = int(forward_batch.seq_lens_cpu.sum())
@@ -586,7 +600,12 @@ def run_eagle_verify(
         accept_lens,
         accept_index,
     ) = eagle_sample(verify_input, batch, logits_output, grammar_mask)
-    new_seq_lens = batch.seq_lens + accept_lens
+    tensor_plan = getattr(verify_input, "_verify_draft_tensor_plan", None)
+    new_seq_lens = (
+        tensor_plan.new_seq_lens
+        if tensor_plan is not None
+        else batch.seq_lens + accept_lens
+    )
     clear_unaccepted_c128 = getattr(
         token_to_kv_pool_allocator.get_kvcache(),
         "clear_unaccepted_c128_draft_states",
@@ -607,20 +626,31 @@ def run_eagle_verify(
         accept_lens,
         accept_index,
         num_draft_tokens,
+        _prepared_step_indices=(
+            (
+                tensor_plan.last_correct_step_indices,
+                tensor_plan.mamba_steps_to_track,
+            )
+            if tensor_plan is not None
+            else None
+        ),
     )
 
     if not batch.forward_mode.is_idle():
-        accept_tokens = predict[accept_index]
-        bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
-        # stride = accept_tokens per-req width = accept_index.shape[1]
-        # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
-        fill_bonus_tokens_func(
-            accept_tokens,
-            accept_lens,
-            bonus_tokens,
-            accept_index.shape[1],
-            bs,
-        )
+        if tensor_plan is not None:
+            bonus_tokens = tensor_plan.bonus_tokens
+        else:
+            accept_tokens = predict[accept_index]
+            bonus_tokens = torch.empty_like(accept_lens, dtype=torch.int32)
+            # stride = accept_tokens per-req width = accept_index.shape[1]
+            # (spec_steps + 1); NOT num_draft_tokens, wrong for topk > 1 trees.
+            fill_bonus_tokens_func(
+                accept_tokens,
+                accept_lens,
+                bonus_tokens,
+                accept_index.shape[1],
+                bs,
+            )
     else:
         bonus_tokens = torch.empty((0,), device=device, dtype=torch.int32)
 
@@ -658,4 +688,5 @@ def run_eagle_verify(
         routed_experts_output=forward_batch_output.routed_experts_output,
         indexer_topk_output=forward_batch_output.indexer_topk_output,
         extra_keep_alive_refs=[verify_forward_batch],
+        _verify_draft_tensor_plan=tensor_plan,
     )

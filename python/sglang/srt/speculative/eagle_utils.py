@@ -14,9 +14,10 @@ from sglang.kernels.ops.speculative.spec_tree import (
 from sglang.srt.hardware_backend.npu.dsv4.dsv4_common_hooks import (
     maybe_build_dsv4_verify_bundle,
 )
+from sglang.srt.environ import envs
 from sglang.srt.mem_cache.allocation import alloc_for_spec_decode
 from sglang.srt.mem_cache.allocation_sizing import get_alloc_reserve_per_decode
-from sglang.srt.runtime_context import get_parallel, get_spec
+from sglang.srt.runtime_context import get_exec, get_parallel, get_spec
 from sglang.srt.utils import (
     is_cpu,
     is_cuda,
@@ -664,6 +665,7 @@ def eagle_sample(
     )
     from sglang.srt.speculative.spec_utils import (
         SIMULATE_ACC_LEN,
+        SIMULATE_ACC_METHOD,
         SIMULATE_ACC_TOKEN_MODE,
         generate_simulated_accept_index,
     )
@@ -720,6 +722,7 @@ def eagle_sample(
 
     # Sample tokens
     target_predict = None
+    compiled_tensor_plan = None
     if sampling_info.is_all_greedy or _is_cpu or _is_npu or _is_hip or _is_xpu:
         target_predict = torch.argmax(next_token_logits, dim=-1)
         target_predict = target_predict.reshape(bs, verify_input.draft_token_num)
@@ -734,6 +737,93 @@ def eagle_sample(
             target_predict=target_predict,
             topk=verify_input.tree_topk,
         )
+    elif (
+        envs.SGLANG_ENABLE_MTP_VERIFY_DRAFT_COMPILE.get()
+        and _is_cuda
+        and not get_spec().speculative_use_rejection_sampling
+        and not sampling_info.need_top_k_sampling
+        and not sampling_info.need_top_p_sampling
+        and verify_input.tree_topk == 1
+        and not envs.SGLANG_ENABLE_OVERLAP_PLAN_STREAM.get()
+    ):
+        from sglang.srt.distributed import get_tp_group
+        from sglang.srt.layers.dp_attention import is_dp_attention_enabled
+        from sglang.srt.speculative.eagle_verify_draft_compile import (
+            run_compiled_verify_draft_tensor_graph,
+        )
+        from sglang.srt.speculative.spec_utils import _sample_simulated_acc_len
+
+        if SIMULATE_ACC_LEN > 0 and SIMULATE_ACC_TOKEN_MODE not in (
+            "fixed",
+            "real-draft-token",
+        ):
+            raise ValueError(
+                "Invalid SGLANG_SIMULATE_ACC_TOKEN_MODE "
+                f"{SIMULATE_ACC_TOKEN_MODE!r}; expected 'fixed' or "
+                "'real-draft-token'."
+            )
+        if (
+            SIMULATE_ACC_LEN > 0
+            and SIMULATE_ACC_TOKEN_MODE == "real-draft-token"
+            and verify_input.tree_topk != 1
+        ):
+            raise ValueError(
+                "SGLANG_SIMULATE_ACC_LEN with real draft tokens currently "
+                "requires speculative_eagle_topk=1."
+            )
+        simulated_accept_len = (
+            _sample_simulated_acc_len(
+                SIMULATE_ACC_LEN,
+                SIMULATE_ACC_METHOD,
+                verify_input.max_tree_depth,
+            )
+            if SIMULATE_ACC_LEN > 0
+            else 0
+        )
+
+        coins, coins_for_final_sampling = _verify_coins(
+            sampling_info=sampling_info,
+            seq_lens=batch.seq_lens,
+            draft_token_num=verify_input.draft_token_num,
+            candidates=candidates,
+            device=device,
+        )
+        tp_group = (
+            get_parallel().attn_tp_group
+            if is_dp_attention_enabled()
+            else get_tp_group()
+        )
+        mamba_track_interval = (
+            get_exec().mamba.mamba_track_interval
+            if batch.mamba_track_indices is not None
+            else None
+        )
+        compiled_tensor_plan = run_compiled_verify_draft_tensor_graph(
+            next_token_logits=next_token_logits,
+            temperatures=sampling_info.temperatures,
+            candidates=candidates,
+            retrieve_index=verify_input.retrieve_index,
+            retrieve_next_token=verify_input.retrieve_next_token,
+            retrieve_next_sibling=verify_input.retrieve_next_sibling,
+            coins=coins,
+            coins_for_final_sampling=coins_for_final_sampling,
+            seq_lens=batch.seq_lens,
+            draft_token_num=verify_input.draft_token_num,
+            max_tree_depth=verify_input.max_tree_depth,
+            threshold_single=get_spec().speculative_accept_threshold_single,
+            threshold_acc=get_spec().speculative_accept_threshold_acc,
+            tp_group_name=tp_group.unique_name,
+            tp_world_size=tp_group.world_size,
+            mamba_track_interval=mamba_track_interval,
+            simulated_accept_len=simulated_accept_len,
+            simulate_real_draft_tokens=(SIMULATE_ACC_TOKEN_MODE == "real-draft-token"),
+        )
+        predict = compiled_tensor_plan.predict
+        accept_index = compiled_tensor_plan.accept_index
+        # Defined for the common tail below; the compiled return path uses the
+        # already-produced accept_lens directly and launches no subtraction.
+        num_correct_drafts = compiled_tensor_plan.accept_lens
+        verify_input._verify_draft_tensor_plan = compiled_tensor_plan
     else:
         from sgl_kernel import (
             top_k_renorm_prob,
@@ -835,7 +925,7 @@ def eagle_sample(
             tp_group.broadcast(accept_index, src=0)
             tp_group.broadcast(num_correct_drafts, src=0)
 
-    if SIMULATE_ACC_LEN > 0:
+    if SIMULATE_ACC_LEN > 0 and compiled_tensor_plan is None:
         # Do simulation. The helper builds (and returns) a replacement
         # accept_index of width spec_steps + 1, so pass max_tree_depth - 1
         # to keep the simulated width identical to the real one.
@@ -873,6 +963,8 @@ def eagle_sample(
     # `num_correct_drafts` stays drafts-only inside this function; the returned
     # tensor includes the trailing/bonus token via out-of-place +1 so the
     # name no longer flips semantics mid-function (naming doc C2).
+    if compiled_tensor_plan is not None:
+        return predict, compiled_tensor_plan.accept_lens, accept_index
     return predict, num_correct_drafts + 1, accept_index
 
 

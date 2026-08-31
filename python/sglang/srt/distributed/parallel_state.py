@@ -174,6 +174,17 @@ def inplace_all_reduce(tensor: torch.Tensor, group_name: str) -> None:
     group._all_reduce_in_place(tensor)
 
 
+@register_custom_op(mutates_args=["tensor"])
+def inplace_broadcast(tensor: torch.Tensor, group_name: str, src: int) -> None:
+    """Opaque in-place broadcast for tensor-only ``torch.compile`` regions."""
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    assert src < group.world_size, f"Invalid src rank ({src})"
+    torch.distributed.broadcast(tensor, src=group.ranks[src], group=group.device_group)
+
+
 @register_custom_op(out_shape="tensor")
 def outplace_all_reduce(
     tensor: torch.Tensor, group_name: str, outplace_all_reduce_method: str

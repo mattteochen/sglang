@@ -854,6 +854,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
     def _draft_extend_for_decode(
         self, batch: ScheduleBatch, batch_result: GenerationBatchResult
     ):
+        tensor_plan = batch_result._verify_draft_tensor_plan
         # Batch 2: Draft extend
         draft_extend_input = EagleDraftExtendInput(
             hidden_states=batch_result.logits_output.hidden_states,
@@ -866,19 +867,27 @@ class EagleDraftWorker(EagleDraftWorkerBase):
             num_tokens_for_logprob_per_req=self.speculative_num_draft_tokens,
         )
         select_index = (
-            torch.arange(
-                0,
-                len(batch.seq_lens) * self.speculative_num_draft_tokens,
-                self.speculative_num_draft_tokens,
-                device=self.device,
+            tensor_plan.draft_select_index
+            if tensor_plan is not None
+            else (
+                torch.arange(
+                    0,
+                    len(batch.seq_lens) * self.speculative_num_draft_tokens,
+                    self.speculative_num_draft_tokens,
+                    device=self.device,
+                )
+                + batch_result.accept_lens
+                - 1
             )
-            + batch_result.accept_lens
-            - 1
         )
 
         # Cast to int64 before entering plan stream to avoid cross-stream
         # synchronization issues with .to() inside the plan stream context.
-        next_token_ids = batch_result.next_token_ids.to(torch.int64)
+        next_token_ids = (
+            tensor_plan.next_token_ids_i64
+            if tensor_plan is not None
+            else batch_result.next_token_ids.to(torch.int64)
+        )
 
         # Prepare for draft extend in a separate stream
         with self.plan_stream_ctx:
@@ -890,6 +899,7 @@ class EagleDraftWorker(EagleDraftWorkerBase):
                 self.draft_runner,
                 self.cuda_graph_runner_for_draft_extend,
                 return_hidden_states_before_norm=False,
+                _tensor_plan=tensor_plan,
             )
 
         if self.plan_stream:
