@@ -58,6 +58,20 @@ at::Tensor fused_add_layernorm_cpu(
     const std::optional<at::Tensor>& bias,
     double eps);
 
+// fused_qk_norm (per-head, in place)
+void fused_qk_norm_cpu(
+    at::Tensor& q, at::Tensor& k, const at::Tensor& q_weight, const at::Tensor& k_weight, double eps);
+void fused_qk_norm_rope_cpu(
+    at::Tensor& q,
+    at::Tensor& k,
+    const at::Tensor& q_weight,
+    const at::Tensor& k_weight,
+    double eps,
+    bool is_neox,
+    const at::Tensor& position_ids,
+    const at::Tensor& cos_sin_cache,
+    int64_t rotary_dim);
+
 // fused_qk_rmsnorm
 std::tuple<at::Tensor, at::Tensor> fused_qk_rmsnorm_cpu(
     const at::Tensor& q, const at::Tensor& k, const at::Tensor& q_weight, const at::Tensor& k_weight, double eps);
@@ -501,6 +515,8 @@ void multimodal_rotary_embedding_cpu(
 // CPU and memory binding
 std::string init_cpu_threads_env(const std::string& cpu_ids);
 
+// murmur_hash32
+at::Tensor murmur_hash32_cpu(const at::Tensor& seed, const at::Tensor& positions, const at::Tensor& col_indices);
 // fused_sigmoid_gating_delta_rule_update
 at::Tensor fused_sigmoid_gating_delta_rule_update_cpu(
     const at::Tensor& A_log,
@@ -610,6 +626,12 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
       "fused_add_layernorm_cpu(Tensor input, Tensor residual, Tensor weight, Tensor? bias, float eps) -> "
       "Tensor");
   m.impl("fused_add_layernorm_cpu", torch::kCPU, &fused_add_layernorm_cpu);
+  m.def("fused_qk_norm_cpu(Tensor(a!) q, Tensor(b!) k, Tensor q_weight, Tensor k_weight, float eps) -> ()");
+  m.impl("fused_qk_norm_cpu", torch::kCPU, &fused_qk_norm_cpu);
+  m.def(
+      "fused_qk_norm_rope_cpu(Tensor(a!) q, Tensor(b!) k, Tensor q_weight, Tensor k_weight, float eps, "
+      "bool is_neox, Tensor position_ids, Tensor cos_sin_cache, int rotary_dim) -> ()");
+  m.impl("fused_qk_norm_rope_cpu", torch::kCPU, &fused_qk_norm_rope_cpu);
   m.def(
       "fused_qk_rmsnorm_cpu(Tensor q, Tensor k, Tensor q_weight, Tensor k_weight, float eps) -> "
       "(Tensor, Tensor)");
@@ -886,6 +908,10 @@ TORCH_LIBRARY_FRAGMENT(sgl_kernel, m) {
 
   // CPU and memory binding
   m.def("init_cpu_threads_env(str cpu_ids) -> str");
+
+  // murmur_hash32
+  m.def("murmur_hash32_cpu(Tensor seed, Tensor positions, Tensor col_indices) -> Tensor");
+  m.impl("murmur_hash32_cpu", torch::kCPU, &murmur_hash32_cpu);
 
   // fused_sigmoid_gating_delta_rule_update
   m.def(
